@@ -12,12 +12,12 @@
 # This ensures changing a .cpp file doesn't rebuild ggml
 
 # Alpine version pinned for reproducibility
-ARG ALPINE_VERSION=3.19
+ARG ALPINE_VERSION=3.21
 
 # ============================================
 # Stage 1: Dependency Builder (ggml cache layer)
 # ============================================
-FROM golang:1.23-alpine${ALPINE_VERSION} AS deps-builder
+FROM golang:1.24-alpine${ALPINE_VERSION} AS deps-builder
 
 RUN apk add --no-cache \
     git \
@@ -36,9 +36,9 @@ COPY core/CMakeLists.txt core/CMakeLists.txt
 COPY core/include/ core/include/
 
 # Create stub sources to satisfy CMake (will be replaced later)
-RUN mkdir -p core/src core/src/quantization core/src/pruning && \
+RUN mkdir -p core/src core/src/quantization core/src/pruning core/tests && \
     for f in engine worker inference model_types model_loader tokenizer kv_cache \
-    optimization_bridge save_model quantizer pruner quantize; do \
+    optimization_bridge save_model quantizer pruner quantize version tensor_utils; do \
     echo "" > core/src/${f}.cpp; \
     done && \
     for f in max_quantizer awq_quantizer smoothquant_quantizer; do \
@@ -46,6 +46,9 @@ RUN mkdir -p core/src core/src/quantization core/src/pruning && \
     done && \
     for f in depth_pruner width_pruner attention_pruner combined_pruner; do \
     echo "" > core/src/pruning/${f}.cpp; \
+    done && \
+    for f in test_simd_ops test_memory_pool test_kv_cache; do \
+    echo "" > core/tests/${f}.cpp; \
     done
 
 # Pre-build ggml (this is the slow part - now cached)

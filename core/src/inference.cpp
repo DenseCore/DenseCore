@@ -1,6 +1,10 @@
 #include "inference.h"
 #include "flash_attention.h"
 #include "ggml.h"     // Required for ggml_tensor definition
+
+#ifndef GGML_KQ_MASK_PAD
+#define GGML_KQ_MASK_PAD 32
+#endif
 #include "kv_cache.h" // Added for KV cache
 #include "memory_pool.h"
 #include "simd_ops.h"

@@ -7,7 +7,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/densecore?color=blue)](https://pypi.org/project/densecore/)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](python/)
-[![Go 1.22+](https://img.shields.io/badge/go-1.22+-00ADD8.svg)](server/)
+[![Go 1.24+](https://img.shields.io/badge/go-1.24+-00ADD8.svg)](server/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](Dockerfile)
 [![CI](https://github.com/Jake-Network/DenseCore/actions/workflows/ci.yml/badge.svg)](https://github.com/Jake-Network/DenseCore/actions)
 
