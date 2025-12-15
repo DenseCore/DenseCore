@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [2.0.0] - 2025-12-09
+## [0.1.0] - 2025-12-15
 
 ### Added
 
@@ -75,8 +75,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.0.0] - 2025-11-20 (Internal)
-
 ### Added
 
 - Initial C++ inference engine with GGML backend
@@ -118,25 +116,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Version History
 
-- **2.0.0** - Production release (2025-12-09)
-- **1.0.0** - Internal MVP (2025-11-20)
-- **0.x.x** - Pre-release development (2025-10-01 to 2025-11-19)
-
+- **0.1.0** - Production release (2025-12-15)
 ---
 
 ## Migration Guides
 
-### Migrating to 2.0.0
+### Migrating to 0.1.0
 
 **Python API Changes:**
 
 ```python
-# Old (1.0.0)
-from densecore import Engine
-engine = Engine("model.gguf")
-output = engine.infer("Hello", max_len=100)
-
-# New (2.0.0)
 from densecore import DenseCore
 model = DenseCore("model.gguf")
 output = model.generate("Hello", max_tokens=100)
