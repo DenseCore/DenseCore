@@ -1,0 +1,217 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: densecore
+  namespace: default
+  labels:
+    app.kubernetes.io/name: densecore
+    app.kubernetes.io/version: v1
+    app.kubernetes.io/component: inference-engine
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: densecore
+  template:
+    metadata:
+      labels:
+        app: densecore  # Required for Prometheus/KEDA selectors
+        app.kubernetes.io/name: densecore
+        app.kubernetes.io/version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # ============================================
+      # Node Affinity & Anti-Affinity
+      # ============================================
+      affinity:
+        # Prefer compute-optimized nodes (soft preference)
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: instance-type
+                    operator: In
+                    values:
+                      - compute-optimized
+                      - cpu-optimized
+        # Spread pods across nodes (avoid co-location)
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: densecore
+                topologyKey: kubernetes.io/hostname
+      
+      # ============================================
+      # Init Container: Download Model
+      # ============================================
+      # Uses pre-built image with huggingface_hub baked in to eliminate
+      # cold-start latency from runtime pip install.
+      # Build: docker build -f Dockerfile.downloader -t densecore/downloader:latest k8s/
+      # ============================================
+      initContainers:
+        - name: model-downloader
+          image: densecore/downloader:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: densecore-secrets
+                  key: HF_TOKEN
+                  optional: true
+            - name: MODEL_REPO
+              valueFrom:
+                configMapKeyRef:
+                  name: densecore-config
+                  key: MODEL_REPO
+                  optional: true
+            - name: MODEL_FILE
+              valueFrom:
+                configMapKeyRef:
+                  name: densecore-config
+                  key: MODEL_FILE
+                  optional: true
+          volumeMounts:
+            - name: model-volume
+              mountPath: /models
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+      
+      # ============================================
+      # Main Container
+      # ============================================
+      containers:
+        - name: densecore
+          # IMPORTANT: Use strict versioning in production
+          # Replace VERSION with actual semver tag (e.g., v1.2.3)
+          image: densecore:VERSION
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          
+          # Use ConfigMap for configuration
+          envFrom:
+            - configMapRef:
+                name: densecore-config
+          
+          # Specific environment variables
+          env:
+            - name: MAIN_MODEL_PATH
+              value: "/models/main_model.gguf"
+            - name: API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: densecore-secrets
+                  key: API_KEYS
+                  optional: true
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: densecore-secrets
+                  key: HF_TOKEN
+                  optional: true
+          
+          # Probes are critical for traffic management
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          
+          startupProbe:
+            httpGet:
+              path: /health/startup
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60  # Allow 5 mins for large model loading
+          
+          resources:
+            # Adjust based on model size (e.g. 7B needs ~8GB RAM)
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+          
+          volumeMounts:
+            - name: model-volume
+              mountPath: /models
+              readOnly: false  # initContainer needs write access
+      
+      # ============================================
+      # Volumes Configuration
+      # ============================================
+      # Choose ONE of the following volume types:
+      # 
+      # Option 1: emptyDir (default, ephemeral)
+      #   - Re-downloads model on every pod restart
+      #   - Fast local SSD, but no persistence
+      #
+      # Option 2: PVC (recommended for production)
+      #   - Persistent across restarts
+      #   - Use ReadWriteMany (NFS/EFS) for shared cache
+      #   - Create PVC first: kubectl apply -f pvc.yaml
+      #
+      # Option 3: hostPath (node-local caching)
+      #   - Fastest option (no network I/O)
+      #   - Requires node affinity pinning
+      #   - Risk: pod may schedule on node without cache
+      # ============================================
+      volumes:
+        - name: model-volume
+          # --------------------------------------
+          # OPTION 1: Ephemeral storage (default)
+          # --------------------------------------
+          emptyDir:
+            sizeLimit: 20Gi
+          
+          # --------------------------------------
+          # OPTION 2: Persistent Volume Claim
+          # Uncomment below and comment emptyDir above
+          # --------------------------------------
+          # persistentVolumeClaim:
+          #   claimName: densecore-models-pvc
+          
+          # --------------------------------------
+          # OPTION 3: HostPath (node-local cache)
+          # Uncomment below and comment emptyDir above
+          # WARNING: Requires node affinity configuration
+          # --------------------------------------
+          # hostPath:
+          #   path: /var/cache/densecore-models
+          #   type: DirectoryOrCreate
+

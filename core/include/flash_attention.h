@@ -1,0 +1,257 @@
+/**
+ * @file flash_attention.h
+ * @brief Memory-efficient Flash Attention for CPU
+ *
+ * Implements the Flash Attention algorithm (Dao et al., 2022) optimized for
+ * CPU:
+ * - Tiled computation to maximize L2 cache usage
+ * - Online softmax for O(n) memory instead of O(n²)
+ * - SIMD-optimized inner loops
+ *
+ * Reference: https://arxiv.org/abs/2205.14135
+ */
+
+#ifndef DENSECORE_FLASH_ATTENTION_H
+#define DENSECORE_FLASH_ATTENTION_H
+
+#include "simd_ops.h"
+#include <cmath>
+#include <cstdlib>
+#include <vector>
+
+namespace densecore {
+
+// Default tile sizes (tuned for typical L2 cache)
+constexpr int FLASH_ATTN_BLOCK_M = 64; // Query block size
+constexpr int FLASH_ATTN_BLOCK_N = 64; // Key/Value block size
+
+/**
+ * Flash Attention configuration
+ */
+struct FlashAttentionConfig {
+  int block_m = FLASH_ATTN_BLOCK_M;
+  int block_n = FLASH_ATTN_BLOCK_N;
+  float scale = 0.0f;  // If 0, will be set to 1/sqrt(head_dim)
+  bool causal = true;  // Causal masking
+  int num_threads = 1; // For parallel heads
+};
+
+/**
+ * Scratch buffer for Flash Attention computation
+ * Pre-allocate to avoid repeated allocations
+ */
+struct FlashAttentionScratch {
+  std::vector<float> qk_block; // [block_m, block_n]
+  std::vector<float> pv_block; // [block_m, head_dim]
+  std::vector<float> row_max;  // [block_m]
+  std::vector<float> row_sum;  // [block_m]
+  std::vector<float> new_max;  // [block_m]
+  std::vector<float> exp_diff; // [block_m]
+  std::vector<float> o_block;  // [block_m, head_dim]
+
+  void Resize(int block_m, int block_n, int head_dim) {
+    qk_block.resize(block_m * block_n);
+    pv_block.resize(block_m * head_dim);
+    row_max.resize(block_m);
+    row_sum.resize(block_m);
+    new_max.resize(block_m);
+    exp_diff.resize(block_m);
+    o_block.resize(block_m * head_dim);
+  }
+};
+
+/**
+ * Flash Attention forward pass for a single head
+ *
+ * @param Q Query tensor [seq_len_q, head_dim]
+ * @param K Key tensor [seq_len_kv, head_dim]
+ * @param V Value tensor [seq_len_kv, head_dim]
+ * @param O Output tensor [seq_len_q, head_dim]
+ * @param seq_len_q Query sequence length
+ * @param seq_len_kv Key/Value sequence length
+ * @param head_dim Head dimension
+ * @param config Configuration
+ * @param scratch Pre-allocated scratch buffer
+ */
+inline void FlashAttentionForward(const float *Q, const float *K,
+                                  const float *V, float *O, int seq_len_q,
+                                  int seq_len_kv, int head_dim,
+                                  const FlashAttentionConfig &config,
+                                  FlashAttentionScratch &scratch) {
+  const int Br = config.block_m; // Block rows (queries)
+  const int Bc = config.block_n; // Block cols (keys)
+
+  const float scale =
+      (config.scale > 0) ? config.scale : (1.0f / sqrtf((float)head_dim));
+
+  // Ensure scratch is sized
+  scratch.Resize(Br, Bc, head_dim);
+
+  // Initialize output to zero
+  memset(O, 0, seq_len_q * head_dim * sizeof(float));
+
+  // Initialize row_max to -inf, row_sum to 0
+  std::vector<float> L(seq_len_q, 0.0f);   // Cumulative sum of exp
+  std::vector<float> M(seq_len_q, -1e10f); // Max value seen so far
+
+  // Process in tiles
+  for (int j = 0; j < seq_len_kv; j += Bc) {
+    const int kv_end = std::min(j + Bc, seq_len_kv);
+    const int kv_len = kv_end - j;
+
+    // For each query block
+    for (int i = 0; i < seq_len_q; i += Br) {
+      const int q_end = std::min(i + Br, seq_len_q);
+      const int q_len = q_end - i;
+
+      // Apply causal mask: skip if all keys are after all queries
+      if (config.causal && j > i + q_len - 1) {
+        continue;
+      }
+
+      // Compute Q @ K^T for this tile
+      // S_ij = Q[i:i+Br] @ K[j:j+Bc]^T / sqrt(d)
+      for (int qi = 0; qi < q_len; qi++) {
+        for (int ki = 0; ki < kv_len; ki++) {
+          // Causal mask: skip future positions
+          if (config.causal && (j + ki) > (i + qi)) {
+            scratch.qk_block[qi * Bc + ki] = -1e10f;
+          } else {
+            float dot = simd::DotF32(Q + (i + qi) * head_dim,
+                                     K + (j + ki) * head_dim, head_dim);
+            scratch.qk_block[qi * Bc + ki] = dot * scale;
+          }
+        }
+      }
+
+      // Online softmax update
+      for (int qi = 0; qi < q_len; qi++) {
+        const int global_qi = i + qi;
+        float *qk_row = scratch.qk_block.data() + qi * Bc;
+
+        // Find local max
+        float local_max = simd::MaxF32(qk_row, kv_len);
+
+        // New global max
+        float m_new = std::max(M[global_qi], local_max);
+
+        // Compute exp(qk - new_max) and local sum
+        float local_sum = 0.0f;
+        for (int ki = 0; ki < kv_len; ki++) {
+          qk_row[ki] = expf(qk_row[ki] - m_new);
+          local_sum += qk_row[ki];
+        }
+
+        // Rescale factor for previous accumulator
+        float alpha = expf(M[global_qi] - m_new);
+
+        // Update running sum: L = alpha * L + local_sum
+        float L_new = alpha * L[global_qi] + local_sum;
+
+        // Compute P @ V for this tile
+        // pv[qi] = sum_ki(softmax[qi, ki] * V[j + ki])
+        float *pv_row = scratch.pv_block.data() + qi * head_dim;
+        memset(pv_row, 0, head_dim * sizeof(float));
+        for (int ki = 0; ki < kv_len; ki++) {
+          float p = qk_row[ki];
+          const float *v_row = V + (j + ki) * head_dim;
+          for (int d = 0; d < head_dim; d++) {
+            pv_row[d] += p * v_row[d];
+          }
+        }
+
+        // Update output: O = (alpha * L * O + pv) / L_new
+        float *o_row = O + global_qi * head_dim;
+        float factor =
+            (L[global_qi] > 0) ? (alpha * L[global_qi] / L_new) : 0.0f;
+        float pv_factor = 1.0f / L_new;
+
+        for (int d = 0; d < head_dim; d++) {
+          o_row[d] = factor * o_row[d] + pv_factor * pv_row[d];
+        }
+
+        // Update running stats
+        M[global_qi] = m_new;
+        L[global_qi] = L_new;
+      }
+    }
+  }
+}
+
+/**
+ * Flash Attention for batched multi-head attention
+ *
+ * @param Q Query [batch, n_head, seq_len_q, head_dim]
+ * @param K Key [batch, n_head, seq_len_kv, head_dim]
+ * @param V Value [batch, n_head, seq_len_kv, head_dim]
+ * @param O Output [batch, n_head, seq_len_q, head_dim]
+ */
+inline void FlashAttentionBatched(const float *Q, const float *K,
+                                  const float *V, float *O, int batch,
+                                  int n_head, int seq_len_q, int seq_len_kv,
+                                  int head_dim,
+                                  const FlashAttentionConfig &config) {
+  const int head_stride_q = seq_len_q * head_dim;
+  const int head_stride_kv = seq_len_kv * head_dim;
+  const int batch_stride_q = n_head * head_stride_q;
+  const int batch_stride_kv = n_head * head_stride_kv;
+
+  FlashAttentionScratch scratch;
+  scratch.Resize(config.block_m, config.block_n, head_dim);
+
+// Process each batch and head
+#pragma omp parallel for collapse(2) if (config.num_threads > 1)               \
+    firstprivate(scratch)
+  for (int b = 0; b < batch; b++) {
+    for (int h = 0; h < n_head; h++) {
+      const float *q_ptr = Q + b * batch_stride_q + h * head_stride_q;
+      const float *k_ptr = K + b * batch_stride_kv + h * head_stride_kv;
+      const float *v_ptr = V + b * batch_stride_kv + h * head_stride_kv;
+      float *o_ptr = O + b * batch_stride_q + h * head_stride_q;
+
+      FlashAttentionForward(q_ptr, k_ptr, v_ptr, o_ptr, seq_len_q, seq_len_kv,
+                            head_dim, config, scratch);
+    }
+  }
+}
+
+/**
+ * Flash Attention for GQA (Grouped Query Attention)
+ * Handles n_head_q != n_head_kv case
+ *
+ * @param n_head_q Number of query heads
+ * @param n_head_kv Number of key/value heads (must divide n_head_q)
+ */
+inline void FlashAttentionGQA(const float *Q, const float *K, const float *V,
+                              float *O, int batch, int n_head_q, int n_head_kv,
+                              int seq_len_q, int seq_len_kv, int head_dim,
+                              const FlashAttentionConfig &config) {
+  const int n_rep = n_head_q / n_head_kv; // KV head repetition factor
+  const int head_stride_q = seq_len_q * head_dim;
+  const int head_stride_kv = seq_len_kv * head_dim;
+  const int batch_stride_q = n_head_q * head_stride_q;
+  const int batch_stride_kv = n_head_kv * head_stride_kv;
+
+  FlashAttentionScratch scratch;
+  scratch.Resize(config.block_m, config.block_n, head_dim);
+
+#pragma omp parallel for collapse(2) if (config.num_threads > 1)               \
+    firstprivate(scratch)
+  for (int b = 0; b < batch; b++) {
+    for (int h = 0; h < n_head_q; h++) {
+      const int kv_head = h / n_rep; // Which KV head to use
+
+      const float *q_ptr = Q + b * batch_stride_q + h * head_stride_q;
+      const float *k_ptr = K + b * batch_stride_kv + kv_head * head_stride_kv;
+      const float *v_ptr = V + b * batch_stride_kv + kv_head * head_stride_kv;
+      float *o_ptr = O + b * batch_stride_q + h * head_stride_q;
+
+      FlashAttentionForward(q_ptr, k_ptr, v_ptr, o_ptr, seq_len_q, seq_len_kv,
+                            head_dim, config, scratch);
+    }
+  }
+}
+
+} // namespace densecore
+
+#endif // DENSECORE_FLASH_ATTENTION_H

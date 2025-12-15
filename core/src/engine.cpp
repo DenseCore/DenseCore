@@ -1,0 +1,626 @@
+#include "densecore.h"
+#include "embedding.h"
+#include "engine_internal.h"
+#include "inference.h"
+#include "kv_cache.h"
+#include "model_loader.h"
+#include "model_types.h"
+#include "simd_ops.h"
+#include "tokenizer.h"
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <cstring>
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <thread>
+
+// API implementations
+
+int SubmitEmbeddingRequest(DenseCoreHandle handle, const char *prompt,
+                           EmbeddingCallback callback, void *user_data) {
+  // Default: MEAN pooling with normalization
+  return SubmitEmbeddingRequestEx(handle, prompt, 0, 1, callback, user_data);
+}
+
+int SubmitEmbeddingRequestEx(DenseCoreHandle handle, const char *prompt,
+                             int pooling_type, int normalize,
+                             EmbeddingCallback callback, void *user_data) {
+  if (!handle)
+    return -1;
+  EngineState *state = (EngineState *)handle;
+
+  // Get model for tokenization
+  ModelEntry *model_entry = state->GetDefaultModel();
+  if (!model_entry || !model_entry->model) {
+    std::cerr << "[DenseCore] No model loaded for tokenization" << std::endl;
+    return -1;
+  }
+
+  Request *req = new Request();
+  static std::atomic<int> global_req_id{1};
+  req->id = global_req_id.fetch_add(1);
+
+  req->prompt = prompt;
+  req->max_tokens = 0; // No generation
+  req->is_embedding = true;
+  req->embedding_callback = callback;
+  req->user_data = user_data;
+
+  // Store pooling config
+  req->pooling_type = static_cast<densecore::PoolingStrategy>(pooling_type);
+  req->normalize_embedding = (normalize != 0);
+
+  // Tokenize immediately (outside hot path)
+  req->tokens = Tokenizer::Tokenize(model_entry->model.get(), prompt, true);
+
+  // Record arrival time
+  req->arrival_time = std::chrono::steady_clock::now();
+  req->priority = 50; // High priority for embeddings
+
+  {
+    std::lock_guard<std::mutex> lock(state->queue_mu);
+    state->pending_requests.push(req);
+  }
+  state->queue_cv.notify_one();
+
+  return req->id;
+}
+
+int SubmitBatchEmbeddingRequest(DenseCoreHandle handle, const char **prompts,
+                                int num_prompts, int pooling_type,
+                                int normalize, EmbeddingCallback callback,
+                                void *user_data) {
+  if (!handle || !prompts || num_prompts <= 0)
+    return -1;
+
+  // Submit each prompt as a separate request (batching happens in worker)
+  int first_id = -1;
+  for (int i = 0; i < num_prompts; i++) {
+    int id = SubmitEmbeddingRequestEx(handle, prompts[i], pooling_type,
+                                      normalize, callback, user_data);
+    if (i == 0)
+      first_id = id;
+  }
+
+  return first_id;
+}
+
+int GetEmbeddingDimension(DenseCoreHandle handle) {
+  if (!handle)
+    return -1;
+  EngineState *state = (EngineState *)handle;
+
+  ModelEntry *entry = state->GetDefaultModel();
+  if (entry && entry->model) {
+    return entry->model->hparams.n_embd;
+  }
+  return -1;
+}
+
+DenseCoreHandle InitEngine(const char *model_path, const char * /*reserved*/,
+                           int threads) {
+  try {
+    (void)threads; // Reserved for future use
+#ifdef _OPENMP
+    if (threads > 0) {
+      // omp_set_num_threads(threads);
+    }
+#endif
+
+    TransformerModel *model = LoadGGUFModel(model_path);
+    if (!model)
+      return nullptr;
+
+    EngineState *state = new EngineState();
+
+    // Calculate optimal KV cache size based on model dimensions
+    const int head_dim = model->hparams.n_embd / model->hparams.n_head;
+    const int n_head_kv = model->hparams.n_head_kv;
+    const int n_layer = model->hparams.n_layer;
+
+    // Bytes per token in KV cache (K + V, FP16)
+    size_t bytes_per_token =
+        (size_t)head_dim * n_head_kv * n_layer * 2 * sizeof(ggml_fp16_t);
+
+    // Target KV cache memory (512MB default)
+    size_t target_kv_memory = 512 * 1024 * 1024;
+
+    // Calculate optimal sequence length
+    int optimal_seq_len = target_kv_memory / bytes_per_token;
+    optimal_seq_len = std::max(256, std::min(optimal_seq_len, 4096));
+
+    // For very small models, allow larger context
+    if (bytes_per_token < 1024) {
+      optimal_seq_len = std::min(optimal_seq_len * 2, 8192);
+    }
+
+    std::cout << "[DenseCore] Auto-configured max_seq_len: " << optimal_seq_len
+              << " (KV cache: ~"
+              << (bytes_per_token * optimal_seq_len / 1024 / 1024) << " MB, "
+              << bytes_per_token << " bytes/token)" << std::endl;
+
+    // Log Flash Attention status based on CPU capabilities
+    densecore::simd::SimdLevel simd_level = densecore::simd::DetectSimdLevel();
+    if (simd_level >= densecore::simd::SimdLevel::AVX512) {
+      std::cout << "[DenseCore] Flash Attention Enabled ("
+                << densecore::simd::SimdLevelName(simd_level) << " detected)"
+                << std::endl;
+    } else {
+      std::cout << "[DenseCore] Flash Attention Disabled (requires AVX-512, "
+                << "detected: " << densecore::simd::SimdLevelName(simd_level)
+                << ")" << std::endl;
+    }
+
+    // Initialize Paged KV Cache
+    PagedKVCache *cache =
+        InitPagedKVCache(model, 1, optimal_seq_len, GGML_TYPE_F16);
+    if (!cache) {
+      delete model;
+      delete state;
+      return nullptr;
+    }
+
+    // Wrap model and cache into ModelEntry and add to pool
+    auto entry = std::make_unique<ModelEntry>();
+    entry->model_id = "default";
+    entry->model_path = model_path;
+    entry->model = std::unique_ptr<TransformerModel>(model);
+    entry->kv_cache = std::unique_ptr<PagedKVCache>(cache);
+    entry->last_used = std::chrono::steady_clock::now();
+    entry->is_loaded = true;
+
+    state->models["default"] = std::move(entry);
+    state->default_model_id = "default";
+
+    // Start background thread
+    state->status = EngineStatus::RUNNING;
+    state->worker_thread = std::thread(EngineLoop, state);
+
+    return (DenseCoreHandle)state;
+  } catch (const std::exception &e) {
+    std::cerr << "[DenseCore] Exception in InitEngine: " << e.what()
+              << std::endl;
+    return nullptr;
+  } catch (...) {
+    std::cerr << "[DenseCore] Unknown exception in InitEngine" << std::endl;
+    return nullptr;
+  }
+}
+
+int SubmitRequest(DenseCoreHandle handle, const char *prompt, int max_tokens,
+                  TokenCallback callback, void *user_data) {
+  if (!handle)
+    return -1;
+  EngineState *state = (EngineState *)handle;
+
+  // Get model for tokenization
+  ModelEntry *model_entry = state->GetDefaultModel();
+  if (!model_entry || !model_entry->model) {
+    std::cerr << "[DenseCore] No model loaded for tokenization" << std::endl;
+    return -1;
+  }
+
+  Request *req = state->request_pool.Acquire();
+  static std::atomic<int> global_req_id{1};
+  req->id = global_req_id.fetch_add(1);
+
+  req->prompt = prompt;
+  req->max_tokens = max_tokens;
+  req->callback = callback;
+  req->user_data = user_data;
+
+  // Tokenize immediately (outside hot path)
+  req->tokens = Tokenizer::Tokenize(model_entry->model.get(), prompt, true);
+
+  // Record arrival time for metrics
+  req->arrival_time = std::chrono::steady_clock::now();
+
+  // Priority based on actual token count (shorter = higher priority)
+  int n_tokens = req->tokens.size();
+  if (n_tokens < 100) {
+    req->priority = 50; // High priority for short requests
+  } else if (n_tokens < 500) {
+    req->priority = 100; // Normal priority
+  } else {
+    req->priority = 150; // Lower priority for long requests
+  }
+
+  // Enqueue with priority
+  {
+    std::lock_guard<std::mutex> lock(state->queue_mu);
+    state->pending_requests.push(req);
+  }
+  state->queue_cv.notify_one();
+
+  return req->id;
+}
+
+int SubmitRequestIds(DenseCoreHandle handle, const int *tokens, int n_tokens,
+                     int max_tokens, TokenCallback callback, void *user_data) {
+  if (!handle || !tokens || n_tokens <= 0)
+    return -1;
+  EngineState *state = (EngineState *)handle;
+
+  Request *req = state->request_pool.Acquire();
+  static std::atomic<int> global_req_id{1};
+  req->id = global_req_id.fetch_add(1);
+
+  // Copy tokens
+  req->tokens.assign(tokens, tokens + n_tokens);
+  req->prompt = ""; // No text prompt
+  req->max_tokens = max_tokens;
+  req->callback = callback;
+  req->user_data = user_data;
+
+  // Record arrival time
+  req->arrival_time = std::chrono::steady_clock::now();
+
+  // Priority based on length
+  if (n_tokens < 100) {
+    req->priority = 50;
+  } else if (n_tokens < 500) {
+    req->priority = 100;
+  } else {
+    req->priority = 150;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(state->queue_mu);
+    state->pending_requests.push(req);
+  }
+  state->queue_cv.notify_one();
+
+  return req->id;
+}
+
+int SubmitRequestWithFormat(DenseCoreHandle handle, const char *prompt,
+                            int max_tokens, int json_mode,
+                            TokenCallback callback, void *user_data) {
+  if (!handle)
+    return -1;
+  EngineState *state = (EngineState *)handle;
+
+  // Get model for tokenization
+  ModelEntry *model_entry = state->GetDefaultModel();
+  if (!model_entry || !model_entry->model) {
+    std::cerr << "[DenseCore] No model loaded for tokenization" << std::endl;
+    return -1;
+  }
+
+  Request *req = state->request_pool.Acquire();
+  static std::atomic<int> global_req_id{1};
+  req->id = global_req_id.fetch_add(1);
+
+  req->prompt = prompt;
+  req->max_tokens = max_tokens;
+  req->callback = callback;
+  req->user_data = user_data;
+  req->json_mode = (json_mode != 0);
+
+  // Initialize grammar constraint if JSON mode is enabled
+  if (req->json_mode) {
+    req->grammar.enabled = true;
+    req->grammar.is_json_mode = true;
+    req->grammar.state = JSONState::EXPECT_OBJECT_START;
+    if (!model_entry->model->vocab_tokens.empty()) {
+      InitGrammarConstraint(&req->grammar, model_entry->model->vocab_tokens);
+    }
+  }
+
+  // Tokenize immediately (outside hot path)
+  req->tokens = Tokenizer::Tokenize(model_entry->model.get(), prompt, true);
+
+  // Record arrival time for metrics
+  req->arrival_time = std::chrono::steady_clock::now();
+
+  // Priority based on actual token count
+  int n_tokens = req->tokens.size();
+  if (n_tokens < 100) {
+    req->priority = 50;
+  } else if (n_tokens < 500) {
+    req->priority = 100;
+  } else {
+    req->priority = 150;
+  }
+
+  // Enqueue with priority
+  {
+    std::lock_guard<std::mutex> lock(state->queue_mu);
+    state->pending_requests.push(req);
+  }
+  state->queue_cv.notify_one();
+
+  return req->id;
+}
+
+int CancelRequest(DenseCoreHandle handle, int request_id) {
+  if (!handle)
+    return -1;
+  EngineState *state = (EngineState *)handle;
+
+  std::lock_guard<std::mutex> lock(state->queue_mu);
+
+  // 1. Check active requests first
+  for (Request *req : state->active_requests) {
+    if (req->id == request_id) {
+      req->cancelled = true;
+      LOG_INFO("Marked active request ", request_id, " for cancellation.");
+      return 0; // Success
+    }
+  }
+
+  // 2. Check pending queue (need to rebuild to remove)
+  std::priority_queue<Request *, std::vector<Request *>,
+                      RequestPriorityComparator>
+      temp_queue;
+  bool found = false;
+
+  while (!state->pending_requests.empty()) {
+    Request *req = state->pending_requests.top();
+    state->pending_requests.pop();
+
+    if (req->id == request_id) {
+      found = true;
+      LOG_INFO("Removing cancelled request ", request_id,
+               " from pending queue.");
+      if (req->callback) {
+        req->callback("Error: Request cancelled", 1, req->user_data);
+      }
+      state->request_pool.Release(req);
+    } else {
+      temp_queue.push(req);
+    }
+  }
+
+  // Restore the queue
+  state->pending_requests = std::move(temp_queue);
+
+  return found ? 0 : -2; // -2 = not found
+}
+
+DenseCoreMetrics GetMetrics(DenseCoreHandle handle) {
+  DenseCoreMetrics m = {};
+  if (handle) {
+    EngineState *state = (EngineState *)handle;
+    m.active_requests = state->metrics.active_requests;
+    m.total_tokens_generated = state->metrics.total_tokens_generated;
+    // m.requests_per_second = ... calculation
+  }
+  return m;
+}
+
+DetailedMetrics GetDetailedMetrics(DenseCoreHandle handle) {
+  DetailedMetrics m = {};
+  if (!handle)
+    return m;
+
+  EngineState *state = (EngineState *)handle;
+
+  // Request metrics
+  m.active_requests = state->metrics.active_requests;
+  m.total_requests = state->metrics.total_requests;
+  m.completed_requests = state->metrics.completed_requests;
+  m.failed_requests = state->metrics.failed_requests;
+
+  // Count pending requests
+  {
+    std::lock_guard<std::mutex> lock(state->queue_mu);
+    m.pending_requests = state->pending_requests.size();
+    m.current_batch_size = state->active_requests.size();
+  }
+
+  // Token metrics
+  m.total_tokens_generated = state->metrics.total_tokens_generated;
+  m.total_prompt_tokens = state->metrics.total_prompt_tokens;
+
+  // Calculate TPS (tokens per second) - simple estimation
+  if (m.completed_requests > 0) {
+    m.tokens_per_second =
+        (float)m.total_tokens_generated / std::max(1L, m.completed_requests);
+  }
+
+  // Latency metrics from samples
+  {
+    std::lock_guard<std::mutex> lock(state->metrics.metrics_mu);
+
+    // TTFT metrics
+    m.avg_time_to_first_token =
+        state->metrics.CalculateAverage(state->metrics.ttft_samples);
+    m.p50_time_to_first_token =
+        state->metrics.CalculatePercentile(state->metrics.ttft_samples, 0.5f);
+    m.p90_time_to_first_token =
+        state->metrics.CalculatePercentile(state->metrics.ttft_samples, 0.9f);
+    m.p99_time_to_first_token =
+        state->metrics.CalculatePercentile(state->metrics.ttft_samples, 0.99f);
+
+    // ITL metrics
+    m.avg_inter_token_latency =
+        state->metrics.CalculateAverage(state->metrics.itl_samples);
+    m.p50_inter_token_latency =
+        state->metrics.CalculatePercentile(state->metrics.itl_samples, 0.5f);
+    m.p90_inter_token_latency =
+        state->metrics.CalculatePercentile(state->metrics.itl_samples, 0.9f);
+    m.p99_inter_token_latency =
+        state->metrics.CalculatePercentile(state->metrics.itl_samples, 0.99f);
+
+    // Queue wait time
+    m.avg_queue_wait_time =
+        state->metrics.CalculateAverage(state->metrics.queue_wait_samples);
+    m.p99_queue_wait_time = state->metrics.CalculatePercentile(
+        state->metrics.queue_wait_samples, 0.99f);
+  }
+
+  // KV Cache metrics
+  ModelEntry *entry = state->GetDefaultModel();
+  if (entry && entry->kv_cache && entry->kv_cache->block_manager) {
+    m.kv_cache_total_blocks = entry->kv_cache->block_manager->num_blocks;
+    int free_blocks = entry->kv_cache->block_manager->GetFreeBlockCount();
+    m.kv_cache_usage_blocks = m.kv_cache_total_blocks - free_blocks;
+    m.kv_cache_usage_percent =
+        (float)m.kv_cache_usage_blocks / m.kv_cache_total_blocks * 100.0f;
+  }
+
+  // Batch metrics
+  if (m.completed_requests > 0) {
+    m.avg_batch_size = (float)m.total_requests / m.completed_requests;
+  }
+
+  // Error metrics
+  m.oom_errors = state->metrics.oom_errors;
+  m.timeout_errors = state->metrics.timeout_errors;
+
+  return m;
+}
+
+void FreeEngine(DenseCoreHandle handle) {
+  if (handle) {
+    EngineState *state = (EngineState *)handle;
+    state->Shutdown(); // Graceful shutdown with draining
+    delete state;
+  }
+}
+
+// Multi-Model API implementations
+
+int LoadModel(DenseCoreHandle handle, const char *model_id,
+              const char *model_path, int /*threads*/) {
+  if (!handle || !model_id || !model_path)
+    return -1;
+
+  EngineState *state = (EngineState *)handle;
+
+  // Check if model already exists
+  {
+    std::lock_guard<std::mutex> lock(state->models_mu);
+    if (state->models.find(model_id) != state->models.end()) {
+      std::cerr << "[DenseCore] Model " << model_id << " already loaded"
+                << std::endl;
+      return -2; // Already exists
+    }
+  }
+
+// Load main model
+// Note: The user's provided snippet had a syntax error and type mismatch for
+// 'main_model' and 'return nullptr'. I've corrected it to use 'model' as in the
+// original code and return -3. Assuming LOG_INFO and LOG_ERROR are defined
+// elsewhere. If not, std::cerr will be used as a fallback for the error
+// message.
+#ifdef LOG_INFO
+  LOG_INFO("Loading model from: ", model_path);
+#endif
+  TransformerModel *model = LoadGGUFModel(model_path);
+  if (!model) {
+#ifdef LOG_ERROR
+    LOG_ERROR("Failed to load main model");
+#else
+    std::cerr << "[DenseCore] Failed to load model from " << model_path
+              << std::endl;
+#endif
+    return -3;
+  }
+
+  // Initialize KV cache for this model
+  // Note: max_num_seqs=4 to save memory (consumer laptop). 4 * 32k context is
+  // plenty for testing.
+  PagedKVCache *cache = InitPagedKVCache(model, 4, 8192, GGML_TYPE_F16);
+  if (!cache) {
+    delete model;
+    std::cerr << "[DenseCore] Failed to initialize KV cache for " << model_id
+              << std::endl;
+    return -4;
+  }
+
+  // Create model entry with unique_ptr ownership
+  auto entry = std::make_unique<ModelEntry>();
+  entry->model_id = model_id;
+  entry->model_path = model_path;
+  entry->model = std::unique_ptr<TransformerModel>(model);
+  entry->kv_cache = std::unique_ptr<PagedKVCache>(cache);
+  entry->last_used = std::chrono::steady_clock::now();
+  entry->is_loaded = true;
+
+  // Add to pool
+  {
+    std::lock_guard<std::mutex> lock(state->models_mu);
+    state->models[model_id] = std::move(entry);
+
+    // Set as default if no default exists
+    if (state->default_model_id.empty()) {
+      state->default_model_id = model_id;
+    }
+  }
+
+  return 0;
+}
+
+int UnloadModel(DenseCoreHandle handle, const char *model_id) {
+  if (!handle || !model_id)
+    return -1;
+
+  EngineState *state = (EngineState *)handle;
+
+  std::lock_guard<std::mutex> lock(state->models_mu);
+  auto it = state->models.find(model_id);
+  if (it == state->models.end()) {
+    return -2; // Not found
+  }
+
+  // Cannot unload default model if it's the only one
+  if (state->default_model_id == model_id && state->models.size() == 1) {
+    return -3; // Cannot unload last model
+  }
+
+  // Smart pointers automatically cleanup when erased
+  state->models.erase(it);
+
+  // Update default if needed
+  if (state->default_model_id == model_id) {
+    if (!state->models.empty()) {
+      state->default_model_id = state->models.begin()->first;
+    } else {
+      state->default_model_id = "";
+    }
+  }
+
+  return 0;
+}
+
+int ListModels(DenseCoreHandle handle, char *out_models, int buffer_size) {
+  if (!handle || !out_models || buffer_size <= 0)
+    return -1;
+
+  EngineState *state = (EngineState *)handle;
+  std::lock_guard<std::mutex> lock(state->models_mu);
+
+  std::stringstream ss;
+  for (auto it = state->models.begin(); it != state->models.end(); ++it) {
+    if (it != state->models.begin())
+      ss << ",";
+    ss << it->first;
+  }
+
+  std::string s = ss.str();
+  if (s.length() >= (size_t)buffer_size) {
+    return -2; // Buffer too small
+  }
+
+  strcpy(out_models, s.c_str());
+  return state->models.size();
+}
+
+int SetDefaultModel(DenseCoreHandle handle, const char *model_id) {
+  if (!handle || !model_id)
+    return -1;
+
+  EngineState *state = (EngineState *)handle;
+  std::lock_guard<std::mutex> lock(state->models_mu);
+
+  if (state->models.find(model_id) == state->models.end()) {
+    return -2; // Not found
+  }
+
+  state->default_model_id = model_id;
+  return 0;
+}

@@ -1,0 +1,78 @@
+{{- if and .Values.autoscaling.enabled (eq .Values.autoscaling.type "keda") }}
+# =============================================================================
+# KEDA ScaledObject - Queue/Prometheus-based Autoscaling
+# =============================================================================
+# This ScaledObject is created when autoscaling.type is set to "keda".
+# For standard CPU/Memory scaling, set autoscaling.type: "hpa"
+#
+# Prerequisites:
+#   1. Install KEDA: helm install keda kedacore/keda --namespace keda --create-namespace
+#   2. Ensure Prometheus is scraping densecore metrics at /metrics
+#   3. Configure prometheusServerAddress in values.yaml
+# =============================================================================
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "densecore.fullname" . }}-scaledobject
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "densecore.labels" . | nindent 4 }}
+    app.kubernetes.io/component: autoscaling
+spec:
+  # Target deployment to scale
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "densecore.fullname" . }}
+  
+  # Scaling bounds
+  minReplicaCount: {{ .Values.autoscaling.minReplicas }}
+  maxReplicaCount: {{ .Values.autoscaling.maxReplicas }}
+  
+  # Cooldown periods (seconds)
+  cooldownPeriod: {{ .Values.autoscaling.keda.cooldownPeriod }}
+  pollingInterval: {{ .Values.autoscaling.keda.pollingInterval }}
+  
+  # Advanced settings
+  advanced:
+    restoreToOriginalReplicaCount: false
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: {{ .Values.autoscaling.keda.scaleDownStabilizationSeconds }}
+          policies:
+            - type: Percent
+              value: 25
+              periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 30
+  
+  # Triggers - Prometheus metrics
+  triggers:
+    {{- if .Values.autoscaling.keda.triggers.pendingRequests.enabled }}
+    # Primary: Pending request queue depth
+    - type: prometheus
+      metadata:
+        serverAddress: {{ .Values.autoscaling.keda.prometheusServerAddress | quote }}
+        query: |
+          {{- /* Render the query template with dynamic release name */ -}}
+          sum(densecore_pending_requests{app="{{ include "densecore.fullname" . }}"}) or vector(0)
+        threshold: {{ .Values.autoscaling.keda.triggers.pendingRequests.threshold | quote }}
+        metricName: {{ include "densecore.fullname" . }}_pending_requests
+    {{- end }}
+    
+    {{- if .Values.autoscaling.keda.triggers.activeRequests.enabled }}
+    # Secondary: Active requests (for burst handling)
+    - type: prometheus
+      metadata:
+        serverAddress: {{ .Values.autoscaling.keda.prometheusServerAddress | quote }}
+        query: |
+          sum(densecore_active_requests{app="{{ include "densecore.fullname" . }}"}) or vector(0)
+        threshold: {{ .Values.autoscaling.keda.triggers.activeRequests.threshold | quote }}
+        metricName: {{ include "densecore.fullname" . }}_active_requests
+    {{- end }}
+{{- end }}

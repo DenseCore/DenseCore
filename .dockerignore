@@ -1,0 +1,49 @@
+# Git
+.git/
+.gitignore
+
+# IDEs
+.idea/
+.vscode/
+.headers/
+
+# Build artifacts
+build/
+bin/
+*.so
+*.a
+*.o
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+*.egg-info/
+
+# Go
+server/descore-server
+
+# Models (mount them at runtime, don't build them in)
+models/
+*.gguf
+
+# Docker
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# K8s
+k8s/
+
+# Documentation
+docs/
+examples/
+scripts/

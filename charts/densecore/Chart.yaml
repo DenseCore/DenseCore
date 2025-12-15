@@ -1,0 +1,18 @@
+apiVersion: v2
+name: densecore
+description: High-performance CPU Inference Engine for LLMs (OpenAI-compatible)
+type: application
+version: 0.1.0
+appVersion: "2.0.0"
+keywords:
+  - llm
+  - inference
+  - cpu
+  - ai
+  - huggingface
+home: https://github.com/Jake-Network/DenseCore
+sources:
+  - https://github.com/Jake-Network/DenseCore
+maintainers:
+  - name: densecore
+    email: contact@densecore.io

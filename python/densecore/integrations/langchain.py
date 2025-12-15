@@ -1,0 +1,1086 @@
+"""
+LangChain integration for DenseCore.
+
+This module provides LangChain-compatible wrappers for DenseCore,
+enabling seamless integration with LangChain chains, agents, and workflows.
+
+Features:
+- DenseCoreLLM: Standard LLM wrapper for text completion
+- DenseCoreChatModel: Chat model with tool calling support
+- bind_tools(): Bind tools to chat model for agent workflows
+- with_structured_output(): Force structured JSON output
+"""
+
+import asyncio
+import copy
+import json
+import logging
+import re
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from typing import Any, Optional
+
+try:
+    from langchain_core.callbacks import (
+        AsyncCallbackManagerForLLMRun,
+        CallbackManagerForLLMRun,
+    )
+    from langchain_core.language_models import LLM, BaseChatModel
+    from langchain_core.messages import (
+        AIMessage,
+        AIMessageChunk,
+        BaseMessage,
+        ChatMessage,
+        HumanMessage,
+        SystemMessage,
+        ToolMessage,
+    )
+    from langchain_core.outputs import (
+        ChatGeneration,
+        ChatGenerationChunk,
+        ChatResult,
+        Generation,
+        LLMResult,
+    )
+    from langchain_core.pydantic_v1 import BaseModel as PydanticV1BaseModel
+    from langchain_core.pydantic_v1 import Field, root_validator
+    from langchain_core.runnables import Runnable, RunnableConfig
+    from langchain_core.tools import BaseTool
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+except ImportError as e:
+    raise ImportError(
+        "LangChain integration requires langchain-core. "
+        "Install with: pip install densecore[langchain]"
+    ) from e
+
+try:
+    from pydantic import BaseModel as PydanticBaseModel
+except ImportError:
+    PydanticBaseModel = None  # type: ignore
+
+from ..engine import DenseCore, GenerationOutput
+from ..config import GenerationConfig, ModelConfig
+
+logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# Robust Tool Call Parsing Utilities
+# ==============================================================================
+
+
+def _extract_json_object(text: str, start: int = 0) -> tuple[Optional[str], int]:
+    """
+    Extract a complete JSON object from text, handling nested braces.
+
+    Args:
+        text: Text to extract from
+        start: Starting position
+
+    Returns:
+        Tuple of (json_string, end_position) or (None, -1) if not found
+    """
+    brace_start = text.find("{", start)
+    if brace_start == -1:
+        return None, -1
+
+    depth = 0
+    in_string = False
+    escape_next = False
+
+    for i in range(brace_start, len(text)):
+        char = text[i]
+
+        if escape_next:
+            escape_next = False
+            continue
+
+        if char == "\\":
+            escape_next = True
+            continue
+
+        if char == '"' and not escape_next:
+            in_string = not in_string
+            continue
+
+        if in_string:
+            continue
+
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[brace_start : i + 1], i + 1
+
+    # Unterminated JSON object
+    return None, -1
+
+
+def _repair_json(json_str: str) -> str:
+    """
+    Attempt to repair common JSON errors.
+
+    Handles:
+    - Trailing commas
+    - Single quotes instead of double quotes
+    - Unquoted keys
+    """
+    # Remove trailing commas before } or ]
+    import re
+
+    repaired = re.sub(r",\s*([}\]])", r"\1", json_str)
+
+    # Replace single quotes with double quotes (simple cases only)
+    # This is risky so we only do it if the string doesn't parse
+    try:
+        json.loads(repaired)
+        return repaired
+    except json.JSONDecodeError:
+        # Try replacing single quotes
+        repaired = re.sub(r"(?<!\\)'([^']*?)(?<!\\)'", r'"\1"', repaired)
+        return repaired
+
+
+def _safe_json_parse(text: str) -> Optional[dict]:
+    """Attempt to parse JSON with repair fallback."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            repaired = _repair_json(text)
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            return None
+
+
+class DenseCoreLLM(LLM):
+    """
+    LangChain LLM wrapper for DenseCore.
+
+    This class provides a LangChain-compatible interface for DenseCore's
+    text completion capabilities, supporting streaming, async operations,
+    and LangChain's callback system.
+
+    Example:
+        >>> from densecore.integrations import DenseCoreLLM
+        >>> llm = DenseCoreLLM(
+        ...     model_path="./model.gguf",
+        ...     hf_repo_id="Qwen/Qwen2.5-0.5B-Instruct",
+        ...     temperature=0.7,
+        ...     max_tokens=256
+        ... )
+        >>> response = llm("What is the capital of France?")
+        >>> print(response)
+
+        >>> # With LangChain chains
+        >>> from langchain.chains import LLMChain
+        >>> from langchain.prompts import PromptTemplate
+        >>>
+        >>> prompt = PromptTemplate(
+        ...     input_variables=["topic"],
+        ...     template="Write a short poem about {topic}"
+        ... )
+        >>> chain = LLMChain(llm=llm, prompt=prompt)
+        >>> result = chain.run(topic="AI")
+    """
+
+    # DenseCore specific parameters
+    model_path: Optional[str] = Field(default=None, description="Path to GGUF model file")
+    hf_repo_id: Optional[str] = Field(default=None, description="HuggingFace repo ID")
+    threads: int = Field(default=0, description="Number of threads (0=auto)")
+
+    # Generation parameters
+    temperature: float = Field(default=1.0, ge=0.0, description="Sampling temperature")
+    max_tokens: int = Field(default=256, gt=0, description="Maximum tokens to generate")
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0, description="Nucleus sampling probability")
+    top_k: int = Field(default=0, ge=0, description="Top-k sampling")
+    repetition_penalty: float = Field(default=1.0, ge=0.0, description="Repetition penalty")
+    stop: Optional[list[str]] = Field(default=None, description="Stop sequences")
+
+    # Internal state
+    _engine: Optional[DenseCore] = None
+
+    class Config:
+        """Pydantic config."""
+
+        extra = "forbid"
+        arbitrary_types_allowed = True
+
+    @root_validator(pre=False, skip_on_failure=True)
+    def validate_environment(cls, values: dict[str, Any]) -> dict[str, Any]:
+        """Validate that model path or repo ID is provided."""
+        if not values.get("model_path") and not values.get("hf_repo_id"):
+            raise ValueError("Either model_path or hf_repo_id must be provided")
+        return values
+
+    @property
+    def engine(self) -> DenseCore:
+        """Lazy initialization of DenseCore engine."""
+        if self._engine is None:
+            config = ModelConfig(
+                model_path=self.model_path or "",
+                threads=self.threads,
+            )
+            self._engine = DenseCore(
+                model_path=self.model_path,
+                threads=self.threads,
+                hf_repo_id=self.hf_repo_id,
+                config=config,
+                verbose=False,
+            )
+        return self._engine
+
+    @property
+    def _llm_type(self) -> str:
+        """Return type of LLM."""
+        return "densecore"
+
+    @property
+    def _identifying_params(self) -> dict[str, Any]:
+        """Get identifying parameters."""
+        return {
+            "model_path": self.model_path,
+            "hf_repo_id": self.hf_repo_id,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+        }
+
+    def _get_generation_config(self, **kwargs: Any) -> GenerationConfig:
+        """Create GenerationConfig from parameters."""
+        # Merge instance params with call-time kwargs
+        params = {
+            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+            "temperature": kwargs.get("temperature", self.temperature),
+            "top_p": kwargs.get("top_p", self.top_p),
+            "top_k": kwargs.get("top_k", self.top_k),
+            "repetition_penalty": kwargs.get("repetition_penalty", self.repetition_penalty),
+            "stop_sequences": kwargs.get("stop", self.stop) or [],
+        }
+        return GenerationConfig(**params)
+
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> str:
+        """
+        Call the DenseCore engine.
+
+        Args:
+            prompt: Input prompt
+            stop: Stop sequences
+            run_manager: Callback manager
+            **kwargs: Additional generation parameters
+
+        Returns:
+            Generated text
+        """
+        if stop:
+            kwargs["stop"] = stop
+
+        config = self._get_generation_config(**kwargs)
+
+        try:
+            result: GenerationOutput = self.engine.generate(
+                prompt=prompt,
+                max_tokens=config.max_tokens,
+                config=config,
+            )
+
+            # Notify callback if provided
+            if run_manager:
+                run_manager.on_llm_end(
+                    LLMResult(
+                        generations=[[Generation(text=result.text)]],
+                        llm_output={
+                            "tokens": result.tokens,
+                            "finish_reason": result.finish_reason,
+                            "generation_time": result.generation_time,
+                        },
+                    )
+                )
+
+            return result.text
+
+        except Exception as e:
+            logger.error(f"Error during generation: {e}")
+            if run_manager:
+                run_manager.on_llm_error(e)
+            raise
+
+    def _stream(
+        self,
+        prompt: str,
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> Iterator[str]:
+        """
+        Stream the output from DenseCore.
+
+        Args:
+            prompt: Input prompt
+            stop: Stop sequences
+            run_manager: Callback manager
+            **kwargs: Additional generation parameters
+
+        Yields:
+            Generated text chunks
+        """
+        if stop:
+            kwargs["stop"] = stop
+
+        config = self._get_generation_config(**kwargs)
+
+        try:
+            for token in self.engine.stream(
+                prompt=prompt,
+                max_tokens=config.max_tokens,
+                config=config,
+            ):
+                if run_manager:
+                    run_manager.on_llm_new_token(token)
+                yield token
+
+        except Exception as e:
+            logger.error(f"Error during streaming: {e}")
+            if run_manager:
+                run_manager.on_llm_error(e)
+            raise
+
+    async def _acall(
+        self,
+        prompt: str,
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> str:
+        """
+        Async call to DenseCore.
+
+        Args:
+            prompt: Input prompt
+            stop: Stop sequences
+            run_manager: Async callback manager
+            **kwargs: Additional generation parameters
+
+        Returns:
+            Generated text
+        """
+        if stop:
+            kwargs["stop"] = stop
+
+        config = self._get_generation_config(**kwargs)
+
+        try:
+            result: GenerationOutput = await self.engine.generate_async(
+                prompt=prompt,
+                max_tokens=config.max_tokens,
+                config=config,
+            )
+
+            if run_manager:
+                await run_manager.on_llm_end(
+                    LLMResult(
+                        generations=[[Generation(text=result.text)]],
+                        llm_output={
+                            "tokens": result.tokens,
+                            "finish_reason": result.finish_reason,
+                            "generation_time": result.generation_time,
+                        },
+                    )
+                )
+
+            return result.text
+
+        except Exception as e:
+            logger.error(f"Error during async generation: {e}")
+            if run_manager:
+                await run_manager.on_llm_error(e)
+            raise
+
+    async def _astream(
+        self,
+        prompt: str,
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[str]:
+        """
+        Async stream from DenseCore.
+
+        Args:
+            prompt: Input prompt
+            stop: Stop sequences
+            run_manager: Async callback manager
+            **kwargs: Additional generation parameters
+
+        Yields:
+            Generated text chunks
+        """
+        if stop:
+            kwargs["stop"] = stop
+
+        config = self._get_generation_config(**kwargs)
+
+        try:
+            async for token in self.engine.stream_async(
+                prompt=prompt,
+                max_tokens=config.max_tokens,
+                config=config,
+            ):
+                if run_manager:
+                    await run_manager.on_llm_new_token(token)
+                yield token
+
+        except Exception as e:
+            logger.error(f"Error during async streaming: {e}")
+            if run_manager:
+                await run_manager.on_llm_error(e)
+            raise
+
+
+class DenseCoreChatModel(BaseChatModel):
+    """
+    LangChain ChatModel wrapper for DenseCore.
+
+    This class provides a chat-oriented interface compatible with LangChain's
+    chat models, supporting conversation history and system messages.
+
+    Example:
+        >>> from densecore.integrations import DenseCoreChatModel
+        >>> from langchain_core.messages import HumanMessage, SystemMessage
+        >>>
+        >>> chat = DenseCoreChatModel(
+        ...     model_path="./model.gguf",
+        ...     hf_repo_id="Qwen/Qwen2.5-0.5B-Instruct",
+        ...     temperature=0.7
+        ... )
+        >>>
+        >>> messages = [
+        ...     SystemMessage(content="You are a helpful assistant."),
+        ...     HumanMessage(content="What is quantum computing?")
+        ... ]
+        >>> response = chat(messages)
+        >>> print(response.content)
+    """
+
+    # DenseCore specific parameters
+    model_path: Optional[str] = Field(default=None, description="Path to GGUF model file")
+    hf_repo_id: Optional[str] = Field(default=None, description="HuggingFace repo ID")
+    threads: int = Field(default=0, description="Number of threads (0=auto)")
+
+    # Generation parameters
+    temperature: float = Field(default=1.0, ge=0.0, description="Sampling temperature")
+    max_tokens: int = Field(default=256, gt=0, description="Maximum tokens to generate")
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0, description="Nucleus sampling")
+    top_k: int = Field(default=0, ge=0, description="Top-k sampling")
+    repetition_penalty: float = Field(default=1.0, ge=0.0, description="Repetition penalty")
+
+    # Internal state
+    _engine: Optional[DenseCore] = None
+
+    class Config:
+        """Pydantic config."""
+
+        extra = "forbid"
+        arbitrary_types_allowed = True
+
+    @root_validator(pre=False, skip_on_failure=True)
+    def validate_environment(cls, values: Dict) -> Dict:
+        """Validate that model path or repo ID is provided."""
+        if not values.get("model_path") and not values.get("hf_repo_id"):
+            raise ValueError("Either model_path or hf_repo_id must be provided")
+        return values
+
+    @property
+    def engine(self) -> DenseCore:
+        """Lazy initialization of DenseCore engine."""
+        if self._engine is None:
+            config = ModelConfig(
+                model_path=self.model_path or "",
+                threads=self.threads,
+            )
+            self._engine = DenseCore(
+                model_path=self.model_path,
+                threads=self.threads,
+                hf_repo_id=self.hf_repo_id,
+                config=config,
+                verbose=False,
+            )
+        return self._engine
+
+    @property
+    def _llm_type(self) -> str:
+        """Return type of chat model."""
+        return "densecore-chat"
+
+    @property
+    def _identifying_params(self) -> dict[str, Any]:
+        """Get identifying parameters for caching."""
+        return {
+            "model_path": self.model_path,
+            "hf_repo_id": self.hf_repo_id,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "tools": [t.get("function", {}).get("name") for t in getattr(self, "_bound_tools", [])],
+        }
+
+    def bind_tools(
+        self,
+        tools: list[Any],
+        *,
+        tool_choice: Optional[str] = None,
+        **kwargs: Any,
+    ) -> "DenseCoreChatModel":
+        """
+        Bind tools to the chat model for agent workflows.
+
+        This returns a new instance of the model with tools bound. When invoked,
+        the model will generate tool calls in its response if appropriate.
+
+        Args:
+            tools: List of tools to bind. Can be:
+                - LangChain BaseTool instances
+                - Pydantic models
+                - Python functions with type hints
+                - Dicts in OpenAI tool format
+            tool_choice: Optional tool choice strategy ('auto', 'required', or tool name)
+            **kwargs: Additional arguments
+
+        Returns:
+            New DenseCoreChatModel instance with tools bound
+
+        Example:
+            >>> from langchain_core.tools import tool
+            >>>
+            >>> @tool
+            ... def calculator(expression: str) -> str:
+            ...     '''Evaluate a math expression.'''
+            ...     return str(eval(expression))
+            >>>
+            >>> llm = DenseCoreChatModel(hf_repo_id="...")
+            >>> llm_with_tools = llm.bind_tools([calculator])
+            >>> response = llm_with_tools.invoke([HumanMessage("What is 2+2?")])
+        """
+        # Convert tools to OpenAI-compatible format
+        formatted_tools = []
+        for tool in tools:
+            if isinstance(tool, dict):
+                # Already in dict format
+                formatted_tools.append(tool)
+            elif hasattr(tool, "name") and hasattr(tool, "description"):
+                # LangChain BaseTool or similar
+                try:
+                    formatted_tools.append(convert_to_openai_tool(tool))
+                except Exception:
+                    # Fallback for custom tools
+                    formatted_tools.append(
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": getattr(tool, "name", "unknown"),
+                                "description": getattr(tool, "description", ""),
+                                "parameters": getattr(tool, "args_schema", {}).schema()
+                                if hasattr(tool, "args_schema")
+                                else {},
+                            },
+                        }
+                    )
+            elif callable(tool):
+                # Python function - convert to tool format
+                try:
+                    formatted_tools.append(convert_to_openai_tool(tool))
+                except Exception:
+                    func_name = getattr(tool, "__name__", "function")
+                    formatted_tools.append(
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": func_name,
+                                "description": getattr(tool, "__doc__", "") or "",
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                        }
+                    )
+
+        # Create a copy with tools bound
+        new_model = self.__class__(
+            model_path=self.model_path,
+            hf_repo_id=self.hf_repo_id,
+            threads=self.threads,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            repetition_penalty=self.repetition_penalty,
+        )
+        # Store bound tools as private attribute
+        object.__setattr__(new_model, "_bound_tools", formatted_tools)
+        object.__setattr__(new_model, "_tool_choice", tool_choice)
+        object.__setattr__(new_model, "_original_tools", tools)
+
+        return new_model
+
+    def with_structured_output(
+        self,
+        schema: Any,
+        *,
+        include_raw: bool = False,
+        **kwargs: Any,
+    ) -> "DenseCoreChatModel":
+        """
+        Force the model to output structured JSON matching a schema.
+
+        Args:
+            schema: Schema to enforce. Can be:
+                - Pydantic model class
+                - Dict with JSON schema
+                - TypedDict class
+            include_raw: If True, include raw response alongside structured output
+            **kwargs: Additional arguments
+
+        Returns:
+            New DenseCoreChatModel that outputs structured data
+
+        Example:
+            >>> from pydantic import BaseModel
+            >>>
+            >>> class Person(BaseModel):
+            ...     name: str
+            ...     age: int
+            >>>
+            >>> llm = DenseCoreChatModel(hf_repo_id="...")
+            >>> structured_llm = llm.with_structured_output(Person)
+            >>> result = structured_llm.invoke("Tell me about Alice, age 30")
+        """
+        # Convert schema to JSON schema format
+        if hasattr(schema, "schema"):
+            # Pydantic model
+            json_schema = schema.schema()
+        elif isinstance(schema, dict):
+            json_schema = schema
+        else:
+            # Try to infer schema
+            json_schema = {"type": "object"}
+
+        # Create a copy with structured output enabled
+        new_model = self.__class__(
+            model_path=self.model_path,
+            hf_repo_id=self.hf_repo_id,
+            threads=self.threads,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            repetition_penalty=self.repetition_penalty,
+        )
+        object.__setattr__(new_model, "_output_schema", json_schema)
+        object.__setattr__(
+            new_model, "_output_schema_class", schema if hasattr(schema, "schema") else None
+        )
+        object.__setattr__(new_model, "_include_raw", include_raw)
+
+        return new_model
+
+    def _parse_tool_calls(self, text: str) -> list[dict[str, Any]]:
+        """
+        Parse tool calls from generated text with robust error handling.
+
+        Supports multiple formats:
+        - <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+        - {"name": "...", "arguments": {...}}
+        - Partial/malformed JSON with repair attempts
+
+        Args:
+            text: Generated text to parse
+
+        Returns:
+            List of parsed tool calls with id, name, and arguments
+        """
+        tool_calls: list[dict[str, Any]] = []
+
+        # Strategy 1: Look for XML-style tool calls
+        xml_pattern = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+        for match in xml_pattern.finditer(text):
+            inner = match.group(1).strip()
+            parsed = _safe_json_parse(inner)
+            if parsed and isinstance(parsed, dict):
+                name = parsed.get("name")
+                args = parsed.get("arguments", {})
+                if name:
+                    tool_calls.append(
+                        {
+                            "id": f"call_{len(tool_calls)}",
+                            "name": name,
+                            "args": args if isinstance(args, dict) else {},
+                        }
+                    )
+            else:
+                logger.debug("Failed to parse tool call XML content: %s", inner[:100])
+
+        if tool_calls:
+            return tool_calls
+
+        # Strategy 2: Look for incomplete XML-style (missing closing tag)
+        partial_pattern = re.compile(r"<tool_call>\s*(\{.+)", re.DOTALL)
+        partial_match = partial_pattern.search(text)
+        if partial_match:
+            json_str, _ = _extract_json_object(partial_match.group(1))
+            if json_str:
+                parsed = _safe_json_parse(json_str)
+                if parsed and isinstance(parsed, dict):
+                    name = parsed.get("name")
+                    args = parsed.get("arguments", {})
+                    if name:
+                        tool_calls.append(
+                            {
+                                "id": "call_0",
+                                "name": name,
+                                "args": args if isinstance(args, dict) else {},
+                            }
+                        )
+                        logger.warning(
+                            "Parsed incomplete tool call (missing </tool_call>): %s", name
+                        )
+
+        if tool_calls:
+            return tool_calls
+
+        # Strategy 3: Look for raw JSON function calls
+        # Pattern: {"name": "...", "arguments": {...}}
+        pos = 0
+        while pos < len(text):
+            json_str, end_pos = _extract_json_object(text, pos)
+            if json_str is None:
+                break
+
+            parsed = _safe_json_parse(json_str)
+            if parsed and isinstance(parsed, dict):
+                # Check if it looks like a function call
+                if "name" in parsed and ("arguments" in parsed or "args" in parsed):
+                    name = parsed.get("name")
+                    args = parsed.get("arguments") or parsed.get("args", {})
+                    if name and isinstance(name, str):
+                        tool_calls.append(
+                            {
+                                "id": f"call_{len(tool_calls)}",
+                                "name": name,
+                                "args": args if isinstance(args, dict) else {},
+                            }
+                        )
+
+            pos = end_pos
+
+        return tool_calls
+
+    def _format_messages(self, messages: list[BaseMessage]) -> str:
+        """
+        Format messages into a prompt string.
+
+        Handles all message types including ToolMessage for multi-turn tool use.
+        """
+        formatted_parts = []
+
+        # Check if we have tools bound
+        bound_tools = getattr(self, "_bound_tools", [])
+
+        # Add tool definitions if present
+        if bound_tools:
+            tools_desc = "Available tools:\n"
+            for tool in bound_tools:
+                func = tool.get("function", {})
+                tools_desc += f"- {func.get('name', 'unknown')}: {func.get('description', '')}\n"
+            tools_desc += '\nTo use a tool, respond with: <tool_call>{"name": "tool_name", "arguments": {...}}</tool_call>\n'
+            formatted_parts.append(f"System: {tools_desc}")
+
+        for message in messages:
+            if isinstance(message, SystemMessage):
+                formatted_parts.append(f"System: {message.content}")
+            elif isinstance(message, HumanMessage):
+                formatted_parts.append(f"User: {message.content}")
+            elif isinstance(message, AIMessage):
+                content = message.content
+                # Include tool calls in the message if present
+                if hasattr(message, "tool_calls") and message.tool_calls:
+                    for tc in message.tool_calls:
+                        content += f'\n<tool_call>{{"name": "{tc["name"]}", "arguments": {json.dumps(tc.get("args", {}))}}}</tool_call>'
+                formatted_parts.append(f"Assistant: {content}")
+            elif isinstance(message, ToolMessage):
+                # Format tool result
+                tool_name = getattr(message, "name", "tool")
+                formatted_parts.append(f"Tool ({tool_name}): {message.content}")
+            elif isinstance(message, ChatMessage):
+                role = message.role or "User"
+                formatted_parts.append(f"{role}: {message.content}")
+            else:
+                # Fallback for unknown message types
+                formatted_parts.append(f"User: {message.content}")
+
+        # Add assistant prefix to prompt completion
+        formatted_parts.append("Assistant: ")
+        return "\n".join(formatted_parts)
+
+    def _get_generation_config(self, **kwargs: Any) -> GenerationConfig:
+        """Create GenerationConfig from parameters."""
+        params = {
+            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+            "temperature": kwargs.get("temperature", self.temperature),
+            "top_p": kwargs.get("top_p", self.top_p),
+            "top_k": kwargs.get("top_k", self.top_k),
+            "repetition_penalty": kwargs.get("repetition_penalty", self.repetition_penalty),
+            "stop_sequences": kwargs.get("stop", []),
+        }
+        return GenerationConfig(**params)
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """
+        Generate chat completion with tool calling support.
+
+        Args:
+            messages: List of chat messages
+            stop: Stop sequences
+            run_manager: Callback manager
+            **kwargs: Additional generation parameters
+
+        Returns:
+            ChatResult with generated message (including tool_calls if detected)
+        """
+        prompt = self._format_messages(messages)
+
+        if stop:
+            kwargs["stop"] = stop
+
+        config = self._get_generation_config(**kwargs)
+
+        try:
+            result = self.engine.generate(
+                prompt=prompt,
+                max_tokens=config.max_tokens,
+                config=config,
+            )
+
+            # Handle string or GenerationOutput result
+            if isinstance(result, str):
+                text = result
+                tokens = 0
+                finish_reason = "stop"
+                generation_time = 0.0
+            else:
+                text = result.text
+                tokens = getattr(result, "tokens", 0)
+                finish_reason = getattr(result, "finish_reason", "stop")
+                generation_time = getattr(result, "generation_time", 0.0)
+
+            # Parse tool calls if tools are bound
+            tool_calls = []
+            if getattr(self, "_bound_tools", None):
+                tool_calls = self._parse_tool_calls(text)
+
+            # Create AIMessage with tool_calls if present
+            if tool_calls:
+                message = AIMessage(
+                    content=text,
+                    tool_calls=tool_calls,
+                )
+            else:
+                message = AIMessage(content=text)
+
+            generation = ChatGeneration(message=message)
+
+            return ChatResult(
+                generations=[generation],
+                llm_output={
+                    "tokens": tokens,
+                    "finish_reason": finish_reason,
+                    "generation_time": generation_time,
+                    "tool_calls": tool_calls,
+                },
+            )
+
+        except Exception as e:
+            logger.error("Error during chat generation: %s", e)
+            if run_manager:
+                run_manager.on_llm_error(e)
+            raise
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """
+        Async generate chat completion with tool calling support.
+
+        Args:
+            messages: List of chat messages
+            stop: Stop sequences
+            run_manager: Async callback manager
+            **kwargs: Additional generation parameters
+
+        Returns:
+            ChatResult with generated message (including tool_calls if detected)
+        """
+        prompt = self._format_messages(messages)
+
+        if stop:
+            kwargs["stop"] = stop
+
+        config = self._get_generation_config(**kwargs)
+
+        try:
+            result = await self.engine.generate_async(
+                prompt=prompt,
+                max_tokens=config.max_tokens,
+                config=config,
+            )
+
+            # Handle string or GenerationOutput result
+            if isinstance(result, str):
+                text = result
+                tokens = 0
+                finish_reason = "stop"
+                generation_time = 0.0
+            else:
+                text = result.text
+                tokens = getattr(result, "tokens", 0)
+                finish_reason = getattr(result, "finish_reason", "stop")
+                generation_time = getattr(result, "generation_time", 0.0)
+
+            # Parse tool calls if tools are bound
+            tool_calls = []
+            if getattr(self, "_bound_tools", None):
+                tool_calls = self._parse_tool_calls(text)
+
+            # Create AIMessage with tool_calls if present
+            if tool_calls:
+                message = AIMessage(
+                    content=text,
+                    tool_calls=tool_calls,
+                )
+            else:
+                message = AIMessage(content=text)
+
+            generation = ChatGeneration(message=message)
+
+            return ChatResult(
+                generations=[generation],
+                llm_output={
+                    "tokens": tokens,
+                    "finish_reason": finish_reason,
+                    "generation_time": generation_time,
+                    "tool_calls": tool_calls,
+                },
+            )
+
+        except Exception as e:
+            logger.error("Error during async chat generation: %s", e)
+            if run_manager:
+                await run_manager.on_llm_error(e)
+            raise
+
+    def _stream(
+        self,
+        messages: list[BaseMessage],
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGeneration]:
+        """
+        Stream chat completion.
+
+        Args:
+            messages: List of chat messages
+            stop: Stop sequences
+            run_manager: Callback manager
+            **kwargs: Additional generation parameters
+
+        Yields:
+            ChatGeneration chunks
+        """
+        prompt = self._format_messages(messages)
+
+        if stop:
+            kwargs["stop"] = stop
+
+        config = self._get_generation_config(**kwargs)
+
+        try:
+            accumulated_text = ""
+            for token in self.engine.stream(
+                prompt=prompt,
+                max_tokens=config.max_tokens,
+                config=config,
+            ):
+                accumulated_text += token
+                message = AIMessage(content=token)
+                generation = ChatGeneration(message=message)
+
+                if run_manager:
+                    run_manager.on_llm_new_token(token)
+
+                yield generation
+
+        except Exception as e:
+            logger.error(f"Error during chat streaming: {e}")
+            if run_manager:
+                run_manager.on_llm_error(e)
+            raise
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGeneration]:
+        """
+        Async stream chat completion.
+
+        Args:
+            messages: List of chat messages
+            stop: Stop sequences
+            run_manager: Async callback manager
+            **kwargs: Additional generation parameters
+
+        Yields:
+            ChatGeneration chunks
+        """
+        prompt = self._format_messages(messages)
+
+        if stop:
+            kwargs["stop"] = stop
+
+        config = self._get_generation_config(**kwargs)
+
+        try:
+            async for token in self.engine.stream_async(
+                prompt=prompt,
+                max_tokens=config.max_tokens,
+                config=config,
+            ):
+                message = AIMessage(content=token)
+                generation = ChatGeneration(message=message)
+
+                if run_manager:
+                    await run_manager.on_llm_new_token(token)
+
+                yield generation
+
+        except Exception as e:
+            logger.error(f"Error during async chat streaming: {e}")
+            if run_manager:
+                await run_manager.on_llm_error(e)
+            raise

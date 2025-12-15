@@ -1,0 +1,84 @@
+# KEDA ScaledObject for Queue-Based Autoscaling
+# ================================================
+# Scales based on pending request queue depth (leading indicator)
+# instead of CPU (lagging indicator)
+#
+# Prerequisites:
+# 1. Install KEDA: helm install keda kedacore/keda --namespace keda --create-namespace
+# 2. Ensure Prometheus is scraping densecore metrics at /metrics
+# 3. Update prometheus-server address below to match your setup
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: densecore-scaledobject
+  namespace: default
+  labels:
+    app.kubernetes.io/name: densecore
+    app.kubernetes.io/component: autoscaling
+spec:
+  # Target deployment to scale
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: densecore
+  
+  # Scaling bounds
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  
+  # Cooldown periods (seconds)
+  cooldownPeriod: 60           # Wait 60s after last trigger before scale-down
+  pollingInterval: 15          # Check metrics every 15s
+  
+  # Advanced settings
+  advanced:
+    restoreToOriginalReplicaCount: false  # Don't restore on ScaledObject delete
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 120  # Prevent flapping
+          policies:
+            - type: Percent
+              value: 25        # Scale down max 25% at a time
+              periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 0   # Scale up immediately
+          policies:
+            - type: Pods
+              value: 2         # Add max 2 pods at a time
+              periodSeconds: 30
+  
+  # Triggers - Queue depth from Prometheus
+  triggers:
+    # Primary: Pending request queue depth
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-server.monitoring.svc.cluster.local:80
+        query: |
+          sum(densecore_pending_requests{app="densecore"}) or vector(0)
+        threshold: "5"         # Target: 5 pending requests per replica
+        metricName: densecore_pending_requests
+    
+    # Secondary: Active requests (for burst handling)
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-server.monitoring.svc.cluster.local:80
+        query: |
+          sum(densecore_active_requests{app="densecore"}) or vector(0)
+        threshold: "8"         # Target: 8 active requests per replica
+        metricName: densecore_active_requests
+
+---
+# TriggerAuthentication (if Prometheus requires auth)
+# Uncomment and configure if needed
+# apiVersion: keda.sh/v1alpha1
+# kind: TriggerAuthentication
+# metadata:
+#   name: prometheus-auth
+#   namespace: default
+# spec:
+#   secretTargetRef:
+#     - parameter: bearerToken
+#       name: prometheus-token
+#       key: token

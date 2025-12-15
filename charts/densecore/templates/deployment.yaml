@@ -1,0 +1,187 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "densecore.fullname" . }}
+  labels:
+    {{- include "densecore.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "densecore.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "densecore.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "densecore.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      
+      {{- if eq .Values.model.source "huggingface" }}
+      initContainers:
+        - name: model-downloader
+          image: python:3.11-slim
+          env:
+            - name: MODEL_REPO
+              value: {{ .Values.model.repoId | quote }}
+            - name: MODEL_FILE
+              value: {{ .Values.model.filename | quote }}
+            {{- if .Values.model.hfTokenSecret }}
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.model.hfTokenSecret }}
+                  key: HF_TOKEN
+            {{- end }}
+          volumeMounts:
+            - name: model-volume
+              mountPath: /models
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              MODEL_PATH="/models/{{ .Values.model.filename }}"
+              
+              echo "[Init] Checking for model at $MODEL_PATH..."
+              if [ -f "$MODEL_PATH" ]; then
+                echo "[Init] Model already exists. Skipping download."
+                # Verify symlink for main_model.gguf
+                if [ ! -f "/models/main_model.gguf" ]; then
+                   ln -s "$MODEL_PATH" /models/main_model.gguf
+                fi
+                exit 0
+              fi
+              
+              echo "[Init] Installing huggingface_hub..."
+              pip install --quiet huggingface_hub
+              
+              echo "[Init] Downloading model from $MODEL_REPO..."
+              python3 << 'EOF'
+              import os
+              from huggingface_hub import hf_hub_download
+              
+              repo = os.environ.get("MODEL_REPO")
+              filename = os.environ.get("MODEL_FILE")
+              token = os.environ.get("HF_TOKEN")
+              
+              print(f"[Init] Downloading {repo}/{filename}...")
+              path = hf_hub_download(
+                  repo_id=repo,
+                  filename=filename,
+                  local_dir="/models",
+                  token=token if token else None
+              )
+              
+              # Create symlink
+              if os.path.exists("/models/main_model.gguf"):
+                  os.remove("/models/main_model.gguf")
+              os.symlink(path, "/models/main_model.gguf")
+              print(f"[Init] Symlink created: /models/main_model.gguf -> {path}")
+              EOF
+              echo "[Init] Model ready."
+      {{- end }}
+
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8080"
+            - name: MAIN_MODEL_PATH
+              value: "/models/main_model.gguf"
+            - name: LOG_FORMAT
+              value: {{ .Values.config.logFormat | quote }}
+            - name: READ_TIMEOUT
+              value: {{ .Values.config.readTimeout | quote }}
+            - name: WRITE_TIMEOUT
+              value: {{ .Values.config.writeTimeout | quote }}
+            - name: SHUTDOWN_TIMEOUT
+              value: {{ .Values.config.shutdownTimeout | quote }}
+            - name: RATE_LIMIT_ENABLED
+              value: {{ .Values.config.rateLimit.enabled | quote }}
+            - name: RATE_LIMIT_RPS
+              value: {{ .Values.config.rateLimit.rps | quote }}
+            - name: RATE_LIMIT_BURST
+              value: {{ .Values.config.rateLimit.burst | quote }}
+            - name: AUTH_ENABLED
+              value: {{ .Values.config.auth.enabled | quote }}
+            {{- if .Values.config.auth.apiKeysSecret }}
+            - name: API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.auth.apiKeysSecret }}
+                  key: API_KEYS
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health/startup
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: model-volume
+              mountPath: /models
+              
+      volumes:
+        - name: model-volume
+        {{- if eq .Values.model.source "huggingface" }}
+          emptyDir: {}
+        {{- else if eq .Values.model.source "pvc" }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.model.existingClaim | default (printf "%s-pvc" (include "densecore.fullname" .)) }}
+        {{- else if eq .Values.model.source "hostPath" }}
+          hostPath:
+            path: {{ .Values.model.hostPath }}
+        {{- end }}
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

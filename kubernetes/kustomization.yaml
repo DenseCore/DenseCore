@@ -1,0 +1,42 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: default
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - configmap.yaml
+  - hpa.yaml
+  - servicemonitor.yaml
+  - ingress.yaml
+
+# Common labels applied to all resources
+commonLabels:
+  app.kubernetes.io/name: densecore
+  app.kubernetes.io/managed-by: kustomize
+
+# Add version label
+labels:
+  - pairs:
+      app.kubernetes.io/version: "2.0.0"
+
+# Image transformation
+images:
+  - name: densecore
+    newName: yourname/densecore  # Change this to your Docker Hub username
+    newTag: latest
+
+# ConfigMap generator (alternative to configmap.yaml)
+# Uncomment to generate ConfigMap from env file
+# configMapGenerator:
+#   - name: densecore-config
+#     envs:
+#       - config.env
+
+# Secret generator
+# Uncomment for production and use proper secret management
+# secretGenerator:
+#   - name: densecore-secrets
+#     envs:
+#       - secrets.env

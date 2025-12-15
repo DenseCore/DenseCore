@@ -1,0 +1,62 @@
+groups:
+  - name: densecore-alerts
+    rules:
+      # High latency alert
+      - alert: DenseCoreHighLatency
+        expr: histogram_quantile(0.95, rate(densecore_request_duration_seconds_bucket[5m])) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DenseCore high latency detected"
+          description: "95th percentile latency is {{ $value }}s (threshold: 10s)"
+
+      # High error rate
+      - alert: DenseCoreHighErrorRate
+        expr: rate(densecore_requests_total{status="error"}[5m]) / rate(densecore_requests_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DenseCore error rate above 5%"
+          description: "Error rate is {{ $value | humanizePercentage }}"
+
+      # Pod not ready
+      - alert: DenseCorePodNotReady
+        expr: kube_pod_status_ready{pod=~"densecore.*", condition="true"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DenseCore pod not ready"
+          description: "Pod {{ $labels.pod }} has been not ready for 5 minutes"
+
+      # High memory usage
+      - alert: DenseCoreHighMemory
+        expr: container_memory_usage_bytes{container="densecore"} / container_spec_memory_limit_bytes{container="densecore"} > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DenseCore memory usage above 90%"
+          description: "Memory usage is {{ $value | humanizePercentage }}"
+
+      # Low throughput
+      - alert: DenseCoreLowThroughput
+        expr: rate(densecore_tokens_generated_total[5m]) < 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DenseCore low throughput"
+          description: "Token generation rate is {{ $value }} tok/s"
+
+      # Instance down
+      - alert: DenseCoreDown
+        expr: up{job="densecore"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DenseCore instance is down"
+          description: "DenseCore instance {{ $labels.instance }} is unreachable"

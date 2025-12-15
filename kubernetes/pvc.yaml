@@ -1,0 +1,101 @@
+# =============================================================================
+# PersistentVolumeClaim for DenseCore Model Storage
+# =============================================================================
+# Apply this manifest BEFORE deploying DenseCore if using PVC storage.
+#
+# Usage:
+#   kubectl apply -f pvc.yaml
+#   # Wait for PVC to be bound
+#   kubectl get pvc densecore-models-pvc
+#   # Then deploy DenseCore (ensure deployment.yaml uses this PVC)
+#
+# Storage Class Selection Guide:
+#   AWS:
+#     - gp3: Single-AZ, ReadWriteOnce (cheaper, per-node)
+#     - efs-sc: Multi-AZ, ReadWriteMany (shared cache, recommended)
+#   GCP:
+#     - standard: Single-zone persistent disk
+#     - standard-rwx: Filestore (ReadWriteMany)
+#   Azure:
+#     - managed-premium: Premium SSD
+#     - azurefile: Azure Files (ReadWriteMany)
+#   On-Prem:
+#     - nfs: NFS-backed storage (ReadWriteMany)
+#     - local-storage: Node-local PVs
+# =============================================================================
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: densecore-models-pvc
+  namespace: default
+  labels:
+    app.kubernetes.io/name: densecore
+    app.kubernetes.io/component: storage
+spec:
+  # ---------------------------------------------------------------------------
+  # Access Modes
+  # ---------------------------------------------------------------------------
+  # ReadWriteOnce (RWO): Single node can mount read-write
+  #   - Use for single-replica deployments or with node affinity
+  #   - Cheaper, works with block storage (EBS, PD)
+  #
+  # ReadWriteMany (RWX): Multiple nodes can mount read-write  
+  #   - Recommended for multi-replica deployments
+  #   - Requires NFS/EFS/Azure Files storage class
+  #   - One downloader populates, all pods read
+  #
+  # ReadOnlyMany (ROX): Multiple nodes can mount read-only
+  #   - Use after initial population (manually trigger)
+  # ---------------------------------------------------------------------------
+  accessModes:
+    - ReadWriteMany  # Change to ReadWriteOnce if using block storage
+  
+  # ---------------------------------------------------------------------------
+  # Storage Class
+  # ---------------------------------------------------------------------------
+  # Leave empty for cluster default, or specify explicitly
+  # Examples: "efs-sc", "nfs", "azurefile", "standard-rwx"
+  # ---------------------------------------------------------------------------
+  # storageClassName: "efs-sc"
+  
+  resources:
+    requests:
+      # Size should accommodate your largest model + buffer
+      # Examples:
+      #   - Qwen 0.5B Q4: ~500MB
+      #   - Llama 7B Q4: ~4GB  
+      #   - Llama 13B Q4: ~8GB
+      #   - Mixtral 8x7B Q4: ~26GB
+      storage: 50Gi
+
+---
+# =============================================================================
+# (Optional) PersistentVolume for HostPath
+# =============================================================================
+# Use this ONLY for local development or specific node-pinned deployments.
+# Not recommended for production multi-node clusters.
+# =============================================================================
+# apiVersion: v1
+# kind: PersistentVolume
+# metadata:
+#   name: densecore-models-pv
+#   labels:
+#     type: local
+# spec:
+#   storageClassName: local-storage
+#   capacity:
+#     storage: 50Gi
+#   accessModes:
+#     - ReadWriteOnce
+#   hostPath:
+#     path: /var/cache/densecore-models
+#     type: DirectoryOrCreate
+#   nodeAffinity:
+#     required:
+#       nodeSelectorTerms:
+#         - matchExpressions:
+#             - key: kubernetes.io/hostname
+#               operator: In
+#               values:
+#                 - your-worker-node-name

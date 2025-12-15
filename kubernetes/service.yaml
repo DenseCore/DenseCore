@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: densecore-service
+  namespace: default
+  labels:
+    app.kubernetes.io/name: densecore
+    app.kubernetes.io/component: inference-engine
+spec:
+  selector:
+    app.kubernetes.io/name: densecore
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8080
+  type: LoadBalancer

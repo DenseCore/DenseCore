@@ -1,0 +1,113 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "densecore"
+version = "2.0.0"
+description = "High-Performance CPU Inference Engine for LLMs with HuggingFace Integration"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+authors = [
+    {name = "DenseCore Team"}
+]
+keywords = [
+    "llm",
+    "inference",
+    "cpu",
+    "transformer",
+    "huggingface",
+    "gguf",
+    "machine-learning",
+    "deep-learning",
+    "ai",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "huggingface-hub>=0.20.0",
+    "numpy>=2.0.2",
+    "torch>=2.5.1",
+    "transformers>=4.46.3",
+    "typing-extensions>=4.0.0;python_version<'3.10'",
+]
+
+[project.optional-dependencies]
+full = [
+    "transformers>=4.35.0",
+    "tokenizers>=0.15.0",
+    "numpy>=1.20.0",
+]
+langchain = [
+    "langchain-core>=0.1.0",
+    "langchain-community>=0.0.20",
+    "langchain>=0.1.0",
+    "langgraph>=0.0.20",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-asyncio>=0.21.0",
+    "mypy>=1.0",
+    "ruff>=0.1.0",
+    "black>=23.0",
+]
+docs = [
+    "sphinx>=7.0",
+    "sphinx-rtd-theme>=2.0",
+    "myst-parser>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Jake-Network/DenseCore"
+Documentation = "https://github.com/Jake-Network/DenseCore#readme"
+Repository = "https://github.com/Jake-Network/DenseCore"
+Issues = "https://github.com/Jake-Network/DenseCore/issues"
+Changelog = "https://github.com/Jake-Network/DenseCore/blob/main/CHANGELOG.md"
+
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["densecore*"]
+
+[tool.setuptools.package-data]
+densecore = ["*.so", "*.dylib", "*.dll", "py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --tb=short"

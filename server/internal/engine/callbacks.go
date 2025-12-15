@@ -1,0 +1,193 @@
+package engine
+
+/*
+// CGO Build Configuration
+// -----------------------
+// IMPORTANT: Set these environment variables before building:
+//   export CGO_CFLAGS="-I${PWD}/core/include"
+//   export CGO_LDFLAGS="-L${PWD}/build -ldensecore -lstdc++"
+// OR use pkg-config if available.
+//
+// The ${SRCDIR} variable expands to the directory containing the Go source file.
+#cgo CFLAGS: -I${SRCDIR}/../../../core/include
+#cgo LDFLAGS: -L${SRCDIR}/../../../build -ldensecore -lstdc++
+#include <stdlib.h>
+#include "densecore.h"
+
+// Forward declaration of the Go callback
+extern void streamCallbackGateway(char* token, int is_finished, void* user_data);
+
+// Wrapper function to call SubmitRequest with the callback
+static int SubmitRequestWrapper(DenseCoreHandle handle, const char* prompt, int max_tokens, void* user_data) {
+    return SubmitRequest(handle, prompt, max_tokens, (TokenCallback)streamCallbackGateway, user_data);
+}
+
+// Wrapper function for SubmitRequestWithFormat
+static int SubmitRequestWithFormatWrapper(DenseCoreHandle handle, const char* prompt, int max_tokens, int json_mode, void* user_data) {
+    return SubmitRequestWithFormat(handle, prompt, max_tokens, json_mode, (TokenCallback)streamCallbackGateway, user_data);
+}
+
+// Forward declaration of the Go callback for embeddings
+extern void embeddingCallbackGateway(float* embedding, int size, void* user_data);
+
+// Wrapper for SubmitEmbeddingRequest
+static int SubmitEmbeddingRequestWrapper(DenseCoreHandle handle, const char* prompt, void* user_data) {
+    return SubmitEmbeddingRequest(handle, prompt, (EmbeddingCallback)embeddingCallbackGateway, user_data);
+}
+*/
+import "C"
+
+import (
+	"sync"
+	"unsafe"
+
+	"descore-server/internal/domain"
+)
+
+// RequestChannelMap is an optimized channel storage with RWMutex.
+// For high-frequency create/delete patterns, a mutex-protected map
+// performs better than sync.Map (which is optimized for read-heavy workloads).
+type RequestChannelMap struct {
+	mu       sync.RWMutex
+	channels map[uintptr]chan domain.StreamEvent
+}
+
+func NewRequestChannelMap() *RequestChannelMap {
+	return &RequestChannelMap{
+		channels: make(map[uintptr]chan domain.StreamEvent),
+	}
+}
+
+func (m *RequestChannelMap) Store(id uintptr, ch chan domain.StreamEvent) {
+	m.mu.Lock()
+	m.channels[id] = ch
+	m.mu.Unlock()
+}
+
+func (m *RequestChannelMap) Load(id uintptr) (chan domain.StreamEvent, bool) {
+	m.mu.RLock()
+	ch, ok := m.channels[id]
+	m.mu.RUnlock()
+	return ch, ok
+}
+
+func (m *RequestChannelMap) Delete(id uintptr) {
+	m.mu.Lock()
+	delete(m.channels, id)
+	m.mu.Unlock()
+}
+
+// EmbeddingChannelMap is an optimized channel storage for embeddings.
+type EmbeddingChannelMap struct {
+	mu       sync.RWMutex
+	channels map[uintptr]chan []float32
+}
+
+func NewEmbeddingChannelMap() *EmbeddingChannelMap {
+	return &EmbeddingChannelMap{
+		channels: make(map[uintptr]chan []float32),
+	}
+}
+
+func (m *EmbeddingChannelMap) Store(id uintptr, ch chan []float32) {
+	m.mu.Lock()
+	m.channels[id] = ch
+	m.mu.Unlock()
+}
+
+func (m *EmbeddingChannelMap) Load(id uintptr) (chan []float32, bool) {
+	m.mu.RLock()
+	ch, ok := m.channels[id]
+	m.mu.RUnlock()
+	return ch, ok
+}
+
+func (m *EmbeddingChannelMap) Delete(id uintptr) {
+	m.mu.Lock()
+	delete(m.channels, id)
+	m.mu.Unlock()
+}
+
+// CompletionChannelMap tracks request completion for context cancellation goroutines.
+// This prevents goroutine leaks by signaling when requests finish.
+type CompletionChannelMap struct {
+	mu       sync.RWMutex
+	channels map[uintptr]chan struct{}
+}
+
+func NewCompletionChannelMap() *CompletionChannelMap {
+	return &CompletionChannelMap{
+		channels: make(map[uintptr]chan struct{}),
+	}
+}
+
+// Register creates and stores a completion channel for the given request ID.
+// Returns the channel that will be closed when the request completes.
+func (m *CompletionChannelMap) Register(id uintptr) chan struct{} {
+	m.mu.Lock()
+	ch := make(chan struct{})
+	m.channels[id] = ch
+	m.mu.Unlock()
+	return ch
+}
+
+// Load retrieves the completion channel for the given request ID.
+func (m *CompletionChannelMap) Load(id uintptr) (chan struct{}, bool) {
+	m.mu.RLock()
+	ch, ok := m.channels[id]
+	m.mu.RUnlock()
+	return ch, ok
+}
+
+// Signal closes the completion channel to notify watchers, then removes it.
+func (m *CompletionChannelMap) Signal(id uintptr) {
+	m.mu.Lock()
+	if ch, ok := m.channels[id]; ok {
+		close(ch)
+		delete(m.channels, id)
+	}
+	m.mu.Unlock()
+}
+
+// Global channel maps
+var requestChannels = NewRequestChannelMap()
+var embeddingChannels = NewEmbeddingChannelMap()
+var completionChannels = NewCompletionChannelMap()
+
+//export streamCallbackGateway
+func streamCallbackGateway(token *C.char, isFinished C.int, userData unsafe.Pointer) {
+	id := uintptr(userData)
+	if ch, ok := requestChannels.Load(id); ok {
+		tokenStr := C.GoString(token)
+		ch <- domain.StreamEvent{
+			Token:      tokenStr,
+			IsFinished: isFinished != 0,
+		}
+
+		if isFinished != 0 {
+			// Signal completion BEFORE cleanup to ensure watcher goroutine exits
+			completionChannels.Signal(id)
+			// Clean up request channel
+			requestChannels.Delete(id)
+		}
+	}
+}
+
+//export embeddingCallbackGateway
+func embeddingCallbackGateway(embedding *C.float, size C.int, userData unsafe.Pointer) {
+	id := uintptr(userData)
+	if ch, ok := embeddingChannels.Load(id); ok {
+		// Convert C float array to Go slice
+		length := int(size)
+		slice := (*[1 << 30]float32)(unsafe.Pointer(embedding))[:length:length]
+
+		// Copy to new slice to be safe (C memory may be freed)
+		goSlice := make([]float32, length)
+		copy(goSlice, slice)
+
+		ch <- goSlice
+		// Channel is one-shot, delete immediately
+		embeddingChannels.Delete(id)
+	}
+}
+
