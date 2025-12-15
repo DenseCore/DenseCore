@@ -1,19 +1,150 @@
 """
-DenseCore setup.py - Pure Python package
-
-The C++ library must be built separately using:
-    cd .. && make lib
-
-This setup.py installs only the Python bindings.
+DenseCore setup.py
 """
 import os
-from setuptools import setup, find_packages
+import subprocess
+import sys
+import shutil
+from pathlib import Path
+
+from setuptools import setup, find_packages, Extension
+from setuptools.command.build_ext import build_ext
+from setuptools.command.sdist import sdist
+
+# Project directory (python/)
+PROJECT_DIR = Path(__file__).parent.resolve()
+# Root directory (DenseCore/)
+ROOT_DIR = PROJECT_DIR.parent.resolve()
+
+class CMakeExtension(Extension):
+    def __init__(self, name, sourcedir=''):
+        Extension.__init__(self, name, sources=[])
+        self.sourcedir = os.path.abspath(sourcedir)
+
+class CMakeBuild(build_ext):
+    def build_extension(self, ext):
+        # Get the full path where setuptools expects the extension module
+        ext_fullpath = Path(self.get_ext_fullpath(ext.name)).resolve()
+        extdir = ext_fullpath.parent
+
+        # Ensure the directory exists
+        extdir.mkdir(parents=True, exist_ok=True)
+
+        debug = int(os.environ.get("DEBUG", 0)) if self.debug is None else self.debug
+        cfg = "Debug" if debug else "Release"
+
+        # Set CMake args
+        # Note: CMakeLists.txt forces CMAKE_LIBRARY_OUTPUT_DIRECTORY to CMAKE_BINARY_DIR
+        # so we don't set it here, and we expect the output in build_temp.
+        cmake_args = [
+            f"-DPYTHON_EXECUTABLE={sys.executable}",
+            f"-DCMAKE_BUILD_TYPE={cfg}",
+            "-DDENSECORE_BUILD_TESTS=OFF",
+        ]
+
+        # Build args
+        build_args = []
+        if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ:
+            if hasattr(self, "parallel") and self.parallel:
+                build_args += [f"-j{self.parallel}"]
+
+        # Detect if we are building from a source distribution (sdist)
+        bundled_core_src = PROJECT_DIR / "densecore" / "core_src"
+        if bundled_core_src.exists():
+            ext.sourcedir = str(bundled_core_src)
+        else:
+            core_dir = ROOT_DIR / "core"
+            if not core_dir.exists():
+                raise RuntimeError(f"Cannot find core directory at {core_dir}")
+            ext.sourcedir = str(core_dir)
+
+        if not os.path.exists(self.build_temp):
+            os.makedirs(self.build_temp)
+
+        # Config and Build
+        subprocess.check_call(
+            ["cmake", ext.sourcedir] + cmake_args,
+            cwd=self.build_temp
+        )
+        subprocess.check_call(
+            ["cmake", "--build", "."] + build_args,
+            cwd=self.build_temp
+        )
+
+        # Find the built library and copy to the expected location
+        # CMake outputs directly to build_temp because of its configuration
+        cmake_output_dir = Path(self.build_temp).resolve()
+        
+        import platform
+        if platform.system() == "Windows":
+            lib_patterns = ["densecore.dll", "libdensecore.dll"]
+        elif platform.system() == "Darwin":
+            lib_patterns = ["libdensecore.dylib", "libdensecore.so"]
+        else:
+            lib_patterns = ["libdensecore.so"]
+
+        built_lib = None
+        for pattern in lib_patterns:
+            candidate = cmake_output_dir / pattern
+            if candidate.exists():
+                built_lib = candidate
+                break
+
+        if built_lib:
+            # Copy to the path setuptools expects
+            print(f"Copying {built_lib} -> {ext_fullpath}")
+            shutil.copy2(built_lib, ext_fullpath)
+        else:
+            raise RuntimeError(
+                f"CMake build completed but library not found. "
+                f"Looked for {lib_patterns} in {cmake_output_dir}"
+            )
+
+class CustomSdist(sdist):
+    def run(self):
+        # When creating a source distribution, we need to bundle the C++ source
+        # into the package so that it can be built by users.
+        
+        # 1. Define source and destination
+        core_src = ROOT_DIR / "core"
+        dest_dir = PROJECT_DIR / "densecore" / "core_src"
+        
+        # 2. Check if we are in the repo
+        if core_src.exists():
+            print(f"Bundling C++ source from {core_src} to {dest_dir}...")
+            if dest_dir.exists():
+                shutil.rmtree(dest_dir)
+            
+            # Copy, ignoring build artifacts and hidden files
+            shutil.copytree(core_src, dest_dir, ignore=shutil.ignore_patterns(
+                "build", "bin", ".git", "*.pyc", "__pycache__"
+            ))
+            
+            # Also copy root files if needed (LICENSE, README)
+            # README is already handled by setup() metadata, LICENSE usually via MANIFEST.in
+            # But let's verify LICENSE existence
+            license_src = ROOT_DIR / "LICENSE"
+            if license_src.exists():
+                shutil.copy(license_src, PROJECT_DIR / "LICENSE")
+
+        else:
+             print("Warning: ../core not found. Assuming we are already in an sdist or simplified environment.")
+
+        # 3. Run the standard sdist command
+        super().run()
+        
+        # 4. Cleanup (optional, but keeps the tree clean)
+        if dest_dir.exists():
+             print(f"Cleaning up {dest_dir}...")
+             shutil.rmtree(dest_dir)
+        if (PROJECT_DIR / "LICENSE").exists():
+            os.remove(PROJECT_DIR / "LICENSE")
 
 # Read long description from README
-readme_path = os.path.join(os.path.dirname(__file__), 'README.md')
+readme_path = PROJECT_DIR / 'README.md'
 long_description = ""
-if os.path.exists(readme_path):
-    with open(readme_path, 'r', encoding='utf-8') as f:
+if readme_path.exists():
+    with open(readme_path, encoding='utf-8') as f:
         long_description = f.read()
 
 setup(
@@ -26,24 +157,34 @@ setup(
     long_description_content_type='text/markdown',
     url='https://github.com/Jake-Network/DenseCore',
     packages=find_packages(),
+    # Add CMakeExtension
+    ext_modules=[CMakeExtension("densecore.libdensecore")],
+    cmdclass={
+        "build_ext": CMakeBuild,
+        "sdist": CustomSdist,
+    },
     classifiers=[
         'Development Status :: 4 - Beta',
         'Intended Audience :: Developers',
         'Intended Audience :: Science/Research',
         'Topic :: Scientific/Engineering :: Artificial Intelligence',
-        'License :: OSI Approved :: MIT License',
+        'License :: OSI Approved :: Apache Software License',
         'Operating System :: POSIX :: Linux',
-        'Operating System :: MacOS :: MacOS X',
+        'Operating System :: Microsoft :: Windows',
+        'Programming Language :: C++',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: 3.10',
         'Programming Language :: Python :: 3.11',
         'Programming Language :: Python :: 3.12',
     ],
-    python_requires='>=3.8',
+    python_requires='>=3.9',
     install_requires=[
         'huggingface-hub>=0.20.0',
+        'numpy>=2.0.2',
+        'torch>=2.5.1',
+        'transformers>=4.46.3',
+        'typing-extensions>=4.0.0;python_version<"3.10"',
     ],
     extras_require={
         'full': [
@@ -51,13 +192,28 @@ setup(
             'tokenizers>=0.15.0',
             'numpy>=1.20.0',
         ],
+        'langchain': [
+            'langchain-core>=0.1.0',
+            'langchain-community>=0.0.20',
+            'langchain>=0.1.0',
+            'langgraph>=0.0.20',
+        ],
         'dev': [
             'pytest>=7.0',
             'pytest-cov>=4.0',
+            'pytest-asyncio>=0.21.0',
+            'mypy>=1.0',
+            'ruff>=0.1.0',
+            'black>=23.0',
+        ],
+        'docs': [
+            'sphinx>=7.0',
+            'sphinx-rtd-theme>=2.0',
+            'myst-parser>=2.0',
         ],
     },
     package_data={
-        'densecore': ['*.so', '*.dylib', '*.dll', 'py.typed'],
+        'densecore': ['py.typed', '*.so', '*.dll'],
     },
     include_package_data=True,
     zip_safe=False,

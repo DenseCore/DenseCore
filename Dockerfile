@@ -122,6 +122,7 @@ WORKDIR /app
 # Copy binaries and libraries
 COPY --from=builder /densecore-server /app/densecore-server
 COPY --from=builder /app/build/libdensecore.so* /app/lib/
+COPY --from=builder /app/build/libggml*.so* /app/lib/
 
 # Create symlink for versioned library name
 RUN cd /app/lib && \

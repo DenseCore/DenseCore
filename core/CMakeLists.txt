@@ -325,57 +325,73 @@ install(FILES include/densecore.h
 # ==========================================
 # Testing Infrastructure (GoogleTest)
 # ==========================================
-include(FetchContent)
-FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG v1.14.0
-)
-# Prevent gtest from overriding compiler/linker settings on Windows
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
+option(DENSECORE_BUILD_TESTS "Build DenseCore tests" ON)
 
-enable_testing()
+if(DENSECORE_BUILD_TESTS)
+    include(FetchContent)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG v1.14.0
+    )
+    # Prevent gtest from overriding compiler/linker settings on Windows
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
 
-# Test sources
-set(TEST_SOURCES
-    tests/test_simd_ops.cpp
-    tests/test_memory_pool.cpp
-    tests/test_kv_cache.cpp
-)
+    enable_testing()
 
-# Create test executable
-add_executable(densecore_tests ${TEST_SOURCES})
+    # Test sources
+    set(TEST_SOURCES
+        tests/test_simd_ops.cpp
+        tests/test_memory_pool.cpp
+        tests/test_kv_cache.cpp
+    )
 
-target_include_directories(densecore_tests PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${GGML_DIR}/include
-    ${GGML_DIR}/src
-    ${GGML_DIR}/src/ggml-cpu
-)
+    # Create test executable
+    # NOTE: We include SOURCES here to compile core files directly into the test executable.
+    # This allows tests to access "internal" (hidden visibility) symbols that are not exported
+    # by the shared library.
+    add_executable(densecore_tests ${TEST_SOURCES} ${SOURCES})
 
-target_link_libraries(densecore_tests PRIVATE
-    densecore
-    GTest::gtest_main
-    Threads::Threads
-)
+    target_include_directories(densecore_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${GGML_DIR}/include
+        ${GGML_DIR}/src
+        ${GGML_DIR}/src/ggml-cpu
+    )
 
-# Apply same compile flags as densecore
-if(CPU_HAS_AVX512 AND COMPILER_SUPPORTS_AVX512)
-    target_compile_options(densecore_tests PRIVATE ${AVX512_FLAG})
-    target_compile_definitions(densecore_tests PRIVATE USE_AVX512 GGML_USE_CPU)
-elseif(COMPILER_SUPPORTS_AVX2)
-    target_compile_options(densecore_tests PRIVATE ${AVX2_FLAG})
-    target_compile_definitions(densecore_tests PRIVATE USE_AVX2 GGML_USE_CPU GGML_USE_AVX2 GGML_USE_FMA)
-elseif(COMPILER_SUPPORTS_AVX)
-    target_compile_options(densecore_tests PRIVATE ${AVX_FLAG})
-    target_compile_definitions(densecore_tests PRIVATE USE_AVX GGML_USE_CPU)
-else()
-    target_compile_definitions(densecore_tests PRIVATE GGML_USE_CPU)
+    # Link dependencies directly (do NOT link densecore shared lib to avoid symbol conflicts/hiding)
+    target_link_libraries(densecore_tests PRIVATE
+        ggml
+        GTest::gtest_main
+        Threads::Threads
+    )
+    
+    if(USE_ACCELERATE)
+        target_link_libraries(densecore_tests PRIVATE ${ACCELERATE_FRAMEWORK})
+    endif()
+
+    # Apply same compile flags as densecore
+    if(CPU_HAS_AVX512 AND COMPILER_SUPPORTS_AVX512)
+        target_compile_options(densecore_tests PRIVATE ${AVX512_FLAG})
+        target_compile_definitions(densecore_tests PRIVATE USE_AVX512 GGML_USE_CPU GGML_USE_AVX512)
+    elseif(COMPILER_SUPPORTS_AVX2)
+        target_compile_options(densecore_tests PRIVATE ${AVX2_FLAG})
+        target_compile_definitions(densecore_tests PRIVATE USE_AVX2 GGML_USE_CPU GGML_USE_AVX2 GGML_USE_FMA)
+    elseif(COMPILER_SUPPORTS_AVX)
+        target_compile_options(densecore_tests PRIVATE ${AVX_FLAG})
+        target_compile_definitions(densecore_tests PRIVATE USE_AVX GGML_USE_CPU GGML_USE_AVX)
+    else()
+        target_compile_definitions(densecore_tests PRIVATE GGML_USE_CPU)
+    endif()
+    
+    if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+        target_compile_options(densecore_tests PRIVATE -mcpu=apple-m1)
+    endif()
+
+    include(GoogleTest)
+    gtest_discover_tests(densecore_tests)
 endif()
-
-include(GoogleTest)
-gtest_discover_tests(densecore_tests)
 
 # Print configuration summary
 message(STATUS "==========================================")
