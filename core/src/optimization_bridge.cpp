@@ -338,6 +338,8 @@ int QuantizeModel(const char *model_path, const char *output_path,
       config.format = densecore::QuantFormat::INT8;
     else if (fmt == "fp8_e4m3")
       config.format = densecore::QuantFormat::FP8_E4M3;
+    else if (fmt == "int4" || fmt == "int4_blockwise")
+      config.format = densecore::QuantFormat::INT4_BLOCKWISE;
     else
       config.format = densecore::QuantFormat::INT4_BLOCKWISE;
 

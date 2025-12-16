@@ -866,6 +866,338 @@ inline float CosineSimilarity(const float *a, const float *b, size_t n) {
   return dot / (norm_a * norm_b);
 }
 
+// =============================================================================
+// INT4 Quantized GEMM (AVX512) - HIGHLY OPTIMIZED
+// =============================================================================
+
+#if defined(__AVX512F__)
+
+/**
+ * @brief Unpack 64 × 4-bit signed integers using AVX512 (OPTIMIZED)
+ *
+ * Uses shift trick for sign extension:
+ * 1. Shift left 12 bits (positions 4-bit value at top of 16-bit)
+ * 2. Arithmetic right shift 12 bits (propagates sign bit)
+ *
+ * Processes 32 bytes (64 packed 4-bit values) into 64 × int16_t
+ *
+ * @param packed Input: 32 bytes containing 64 packed 4-bit values
+ * @param unpacked_lo Output: first 32 × int16_t values (low 16 bytes input)
+ * @param unpacked_hi Output: second 32 × int16_t values (high 16 bytes input)
+ */
+inline void UnpackInt4x64_AVX512(const uint8_t *packed, __m512i &unpacked_lo,
+                                 __m512i &unpacked_hi) {
+  // Load 32 bytes = 64 packed 4-bit values into AVX512 register
+  __m256i packed_256 =
+      _mm256_loadu_si256(reinterpret_cast<const __m256i *>(packed));
+
+  // Expand 8-bit elements to 16-bit
+  __m512i packed_16 = _mm512_cvtepu8_epi16(packed_256);
+
+  // Extract lower nibbles (bits 0-3)
+  __m512i low_nibbles = _mm512_and_si512(packed_16, _mm512_set1_epi16(0x0F));
+
+  // Extract upper nibbles (bits 4-7), shift down
+  __m512i high_nibbles = _mm512_srli_epi16(packed_16, 4);
+  high_nibbles = _mm512_and_si512(high_nibbles, _mm512_set1_epi16(0x0F));
+
+  // Sign extension using shift trick:
+  // slli by 12 moves 4-bit value to bits 12-15 (sign bit at position 15)
+  // srai by 12 propagates sign bit through bits 4-15
+  low_nibbles = _mm512_slli_epi16(low_nibbles, 12);
+  low_nibbles = _mm512_srai_epi16(low_nibbles, 12);
+
+  high_nibbles = _mm512_slli_epi16(high_nibbles, 12);
+  high_nibbles = _mm512_srai_epi16(high_nibbles, 12);
+
+  // Interleave: [a0, b0, a1, b1, ...] where a=low, b=high
+  // unpacklo takes low halves of each lane, unpackhi takes high halves
+  __m512i interleaved_lo = _mm512_unpacklo_epi16(low_nibbles, high_nibbles);
+  __m512i interleaved_hi = _mm512_unpackhi_epi16(low_nibbles, high_nibbles);
+
+  // The 512-bit unpack works on 256-bit lanes, so we need to permute
+  // to get correct final order
+  unpacked_lo = _mm512_permutex2var_epi64(
+      interleaved_lo, _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11),
+      interleaved_hi);
+  unpacked_hi = _mm512_permutex2var_epi64(
+      interleaved_lo, _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15),
+      interleaved_hi);
+}
+
+/**
+ * @brief High-performance GEMM kernel: C = A * W^T (HIGHLY OPTIMIZED)
+ *
+ * Optimizations:
+ * - 16x register blocking along N dimension (maximum ILP)
+ * - Shift-based sign extension (no branches, no masks)
+ * - Aggressive prefetching (128 bytes ahead)
+ * - Minimized loop overhead with unrolling
+ *
+ * Performance target: >90% of theoretical AVX512 peak
+ */
+inline void GemmInt4Fp32_AVX512(float *C, const float *A, const uint8_t *W_int4,
+                                const float *scales, const float *zero_points,
+                                int M, int N, int K, int group_size) {
+  if (K % group_size != 0)
+    return;
+
+  const int num_groups = K / group_size;
+  const int packed_K = K / 2; // Bytes per weight row
+
+  // Constants for prefetch distance
+  constexpr int PREFETCH_DIST = 128; // Bytes ahead
+
+  // Outer loop: rows of output
+  for (int m = 0; m < M; m++) {
+    const float *a_row = A + m * K;
+
+    // Middle loop: columns of output in blocks of 16 (REGISTER BLOCKING)
+    int n = 0;
+    for (; n + 16 <= N; n += 16) {
+      // 16 accumulators for 16 output elements
+      __m512 acc00 = _mm512_setzero_ps();
+      __m512 acc01 = _mm512_setzero_ps();
+      __m512 acc02 = _mm512_setzero_ps();
+      __m512 acc03 = _mm512_setzero_ps();
+      __m512 acc04 = _mm512_setzero_ps();
+      __m512 acc05 = _mm512_setzero_ps();
+      __m512 acc06 = _mm512_setzero_ps();
+      __m512 acc07 = _mm512_setzero_ps();
+      __m512 acc08 = _mm512_setzero_ps();
+      __m512 acc09 = _mm512_setzero_ps();
+      __m512 acc10 = _mm512_setzero_ps();
+      __m512 acc11 = _mm512_setzero_ps();
+      __m512 acc12 = _mm512_setzero_ps();
+      __m512 acc13 = _mm512_setzero_ps();
+      __m512 acc14 = _mm512_setzero_ps();
+      __m512 acc15 = _mm512_setzero_ps();
+
+      // Loop over quantization groups
+      for (int g = 0; g < num_groups; g++) {
+        const int k_offset = g * group_size;
+        const int packed_offset = g * (group_size / 2);
+        const float *a_ptr = a_row + k_offset;
+
+        // Prefetch activations for next group
+        if (g + 1 < num_groups) {
+          _mm_prefetch(
+              reinterpret_cast<const char *>(a_row + (g + 1) * group_size),
+              _MM_HINT_T0);
+        }
+
+        // Process 32 weights at a time (64 bits packed = 16 bytes)
+        for (int k = 0; k < group_size; k += 32) {
+          // Load 2 × 16 floats from activations
+          __m512 a0 = _mm512_loadu_ps(a_ptr + k);
+          __m512 a1 = _mm512_loadu_ps(a_ptr + k + 16);
+
+// Process all 16 weight rows with 2-way unrolling
+#define PROCESS_ROW(idx)                                                       \
+  do {                                                                         \
+    const int row = n + (idx);                                                 \
+    const float scale = scales[row * num_groups + g];                          \
+    const float zero = zero_points[row * num_groups + g];                      \
+    const __m512 vscale = _mm512_set1_ps(scale);                               \
+    const __m512 vzero = _mm512_set1_ps(zero);                                 \
+                                                                               \
+    const uint8_t *w_ptr = W_int4 + row * packed_K + packed_offset + k / 2;    \
+    _mm_prefetch(reinterpret_cast<const char *>(w_ptr + PREFETCH_DIST),        \
+                 _MM_HINT_T0);                                                 \
+                                                                               \
+    /* Load 16 bytes = 32 packed weights */                                    \
+    __m128i packed =                                                           \
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(w_ptr));             \
+    __m256i packed_256 = _mm256_cvtepu8_epi16(packed);                         \
+                                                                               \
+    /* Extract low nibbles */                                                  \
+    __m256i low = _mm256_and_si256(packed_256, _mm256_set1_epi16(0x0F));       \
+    /* Extract high nibbles */                                                 \
+    __m256i high = _mm256_srli_epi16(packed_256, 4);                           \
+    high = _mm256_and_si256(high, _mm256_set1_epi16(0x0F));                    \
+                                                                               \
+    /* Sign extension via shift trick */                                       \
+    low = _mm256_slli_epi16(low, 12);                                          \
+    low = _mm256_srai_epi16(low, 12);                                          \
+    high = _mm256_slli_epi16(high, 12);                                        \
+    high = _mm256_srai_epi16(high, 12);                                        \
+                                                                               \
+    /* Interleave to restore order */                                          \
+    __m256i interleaved_lo = _mm256_unpacklo_epi16(low, high);                 \
+    __m256i interleaved_hi = _mm256_unpackhi_epi16(low, high);                 \
+                                                                               \
+    /* Permute for correct lane order after interleave */                      \
+    __m256i w16_0 =                                                            \
+        _mm256_permute2x128_si256(interleaved_lo, interleaved_hi, 0x20);       \
+    __m256i w16_1 =                                                            \
+        _mm256_permute2x128_si256(interleaved_lo, interleaved_hi, 0x31);       \
+                                                                               \
+    /* Convert to FP32 */                                                      \
+    __m512i w32_0 = _mm512_cvtepi16_epi32(w16_0);                              \
+    __m512i w32_1 = _mm512_cvtepi16_epi32(w16_1);                              \
+    __m512 wf0 = _mm512_cvtepi32_ps(w32_0);                                    \
+    __m512 wf1 = _mm512_cvtepi32_ps(w32_1);                                    \
+                                                                               \
+    /* Dequantize: w_dequant = scale * (q - zero) */                           \
+    wf0 = _mm512_mul_ps(vscale, _mm512_sub_ps(wf0, vzero));                    \
+    wf1 = _mm512_mul_ps(vscale, _mm512_sub_ps(wf1, vzero));                    \
+                                                                               \
+    /* FMA */                                                                  \
+    acc##idx = _mm512_fmadd_ps(a0, wf0, acc##idx);                             \
+    acc##idx = _mm512_fmadd_ps(a1, wf1, acc##idx);                             \
+  } while (0)
+
+          PROCESS_ROW(00);
+          PROCESS_ROW(01);
+          PROCESS_ROW(02);
+          PROCESS_ROW(03);
+          PROCESS_ROW(04);
+          PROCESS_ROW(05);
+          PROCESS_ROW(06);
+          PROCESS_ROW(07);
+          PROCESS_ROW(08);
+          PROCESS_ROW(09);
+          PROCESS_ROW(10);
+          PROCESS_ROW(11);
+          PROCESS_ROW(12);
+          PROCESS_ROW(13);
+          PROCESS_ROW(14);
+          PROCESS_ROW(15);
+
+#undef PROCESS_ROW
+        }
+      }
+
+      // Horizontal reduction and store results
+      C[m * N + n + 0] = _mm512_reduce_add_ps(acc00);
+      C[m * N + n + 1] = _mm512_reduce_add_ps(acc01);
+      C[m * N + n + 2] = _mm512_reduce_add_ps(acc02);
+      C[m * N + n + 3] = _mm512_reduce_add_ps(acc03);
+      C[m * N + n + 4] = _mm512_reduce_add_ps(acc04);
+      C[m * N + n + 5] = _mm512_reduce_add_ps(acc05);
+      C[m * N + n + 6] = _mm512_reduce_add_ps(acc06);
+      C[m * N + n + 7] = _mm512_reduce_add_ps(acc07);
+      C[m * N + n + 8] = _mm512_reduce_add_ps(acc08);
+      C[m * N + n + 9] = _mm512_reduce_add_ps(acc09);
+      C[m * N + n + 10] = _mm512_reduce_add_ps(acc10);
+      C[m * N + n + 11] = _mm512_reduce_add_ps(acc11);
+      C[m * N + n + 12] = _mm512_reduce_add_ps(acc12);
+      C[m * N + n + 13] = _mm512_reduce_add_ps(acc13);
+      C[m * N + n + 14] = _mm512_reduce_add_ps(acc14);
+      C[m * N + n + 15] = _mm512_reduce_add_ps(acc15);
+    }
+
+    // Handle remaining columns (N % 16)
+    for (; n < N; n++) {
+      __m512 acc = _mm512_setzero_ps();
+
+      for (int g = 0; g < num_groups; g++) {
+        const int k_offset = g * group_size;
+        const float *a_ptr = a_row + k_offset;
+        const float scale = scales[n * num_groups + g];
+        const float zero = zero_points[n * num_groups + g];
+        const __m512 vscale = _mm512_set1_ps(scale);
+        const __m512 vzero = _mm512_set1_ps(zero);
+        const uint8_t *w_ptr = W_int4 + n * packed_K + g * (group_size / 2);
+
+        for (int k = 0; k < group_size; k += 32) {
+          // Load 16 bytes = 32 packed weights
+          __m128i packed =
+              _mm_loadu_si128(reinterpret_cast<const __m128i *>(w_ptr + k / 2));
+          __m256i packed_256 = _mm256_cvtepu8_epi16(packed);
+
+          // Extract and sign-extend nibbles
+          __m256i low = _mm256_and_si256(packed_256, _mm256_set1_epi16(0x0F));
+          __m256i high = _mm256_srli_epi16(packed_256, 4);
+          high = _mm256_and_si256(high, _mm256_set1_epi16(0x0F));
+
+          low = _mm256_slli_epi16(low, 12);
+          low = _mm256_srai_epi16(low, 12);
+          high = _mm256_slli_epi16(high, 12);
+          high = _mm256_srai_epi16(high, 12);
+
+          // Interleave and permute
+          __m256i lo = _mm256_unpacklo_epi16(low, high);
+          __m256i hi = _mm256_unpackhi_epi16(low, high);
+          __m256i w16_0 = _mm256_permute2x128_si256(lo, hi, 0x20);
+          __m256i w16_1 = _mm256_permute2x128_si256(lo, hi, 0x31);
+
+          // Convert and dequantize
+          __m512 wf0 = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(w16_0));
+          __m512 wf1 = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(w16_1));
+
+          wf0 = _mm512_mul_ps(vscale, _mm512_sub_ps(wf0, vzero));
+          wf1 = _mm512_mul_ps(vscale, _mm512_sub_ps(wf1, vzero));
+
+          // Load activations and FMA
+          __m512 a0 = _mm512_loadu_ps(a_ptr + k);
+          __m512 a1 = _mm512_loadu_ps(a_ptr + k + 16);
+
+          acc = _mm512_fmadd_ps(a0, wf0, acc);
+          acc = _mm512_fmadd_ps(a1, wf1, acc);
+        }
+      }
+
+      C[m * N + n] = _mm512_reduce_add_ps(acc);
+    }
+  }
+}
+
+#else // No AVX512 support
+
+/**
+ * Fallback GEMM for INT4 weights (scalar implementation)
+ */
+inline void GemmInt4Fp32_AVX512(float *C, const float *A, const uint8_t *W_int4,
+                                const float *scales, const float *zero_points,
+                                int M, int N, int K, int group_size) {
+  if (K % group_size != 0)
+    return;
+
+  const int num_groups = K / group_size;
+
+  for (int m = 0; m < M; m++) {
+    for (int n = 0; n < N; n++) {
+      float sum = 0.0f;
+
+      for (int g = 0; g < num_groups; g++) {
+        const float scale = scales[n * num_groups + g];
+        const float zero = zero_points[n * num_groups + g];
+
+        const int k_start = g * group_size;
+        const uint8_t *w_packed = W_int4 + n * (K / 2) + g * (group_size / 2);
+
+        for (int k = 0; k < group_size; k++) {
+          // Unpack 4-bit weight
+          const int byte_idx = k / 2;
+          const int nibble_idx = k % 2;
+          uint8_t packed_byte = w_packed[byte_idx];
+
+          int8_t q;
+          if (nibble_idx == 0) {
+            q = static_cast<int8_t>(packed_byte & 0x0F);
+          } else {
+            q = static_cast<int8_t>((packed_byte >> 4) & 0x0F);
+          }
+
+          // Sign extend
+          if (q & 0x08) {
+            q |= static_cast<int8_t>(0xF0);
+          }
+
+          // Dequantize and accumulate
+          float w_dequant = scale * (static_cast<float>(q) - zero);
+          sum += A[m * K + k_start + k] * w_dequant;
+        }
+      }
+
+      C[m * N + n] = sum;
+    }
+  }
+}
+
+#endif // __AVX512F__
+
 } // namespace simd
 } // namespace densecore
 

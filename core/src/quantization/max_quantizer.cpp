@@ -30,6 +30,12 @@ void MaxQuantizer::QuantizeWeight(struct ggml_tensor *tensor) {
   case QuantFormat::FP16:
     // No quantization needed (FP8_E4M3 is aliased to FP16)
     break;
+
+  case QuantFormat::INT4_BLOCKWISE:
+    // Custom format - use INT4Quantizer instead
+    std::cerr << "Warning: MaxQuantizer does not support INT4_BLOCKWISE format."
+              << " Use INT4Quantizer instead." << std::endl;
+    break;
   }
 }
 

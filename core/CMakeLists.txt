@@ -91,6 +91,7 @@ set(SOURCES
     src/quantization/max_quantizer.cpp
     src/quantization/awq_quantizer.cpp
     src/quantization/smoothquant_quantizer.cpp
+    src/quantization/int4_quantizer.cpp
     # Pruning module
     src/pruner.cpp
     src/tensor_utils.cpp

@@ -1,12 +1,13 @@
 #include "inference.h"
 #include "flash_attention.h"
-#include "ggml.h"     // Required for ggml_tensor definition
+#include "ggml.h" // Required for ggml_tensor definition
 
 #ifndef GGML_KQ_MASK_PAD
 #define GGML_KQ_MASK_PAD 32
 #endif
 #include "kv_cache.h" // Added for KV cache
 #include "memory_pool.h"
+#include "quantization/int4_types.h" // For TensorInt4
 #include "simd_ops.h"
 #include <algorithm>
 #include <cmath>
@@ -126,6 +127,183 @@ void cb_kv_manage(struct ggml_tensor *dst, const struct ggml_tensor *src,
 }
 
 // ============================================================================
+// INT4 GEMM Integration
+// ============================================================================
+
+/**
+ * User data for INT4 GEMM custom operation
+ */
+struct INT4GemmUserData {
+  const densecore::TensorInt4 *int4_weight; // INT4 quantized weight metadata
+  int M;                                    // Output rows
+  int N;                                    // Output columns
+  int K;                                    // Inner dimension
+};
+
+/**
+ * Custom callback for INT4 GEMM operation (MULTI-THREADED)
+ *
+ * Computes: dst = src * weight^T
+ * where weight is INT4 quantized
+ *
+ * Threading Strategy:
+ * - Parallelize along N dimension (output columns/features)
+ * - Each thread computes a subset of output columns
+ * - M dimension (batch size) is usually small, so not worth parallelizing
+ */
+void cb_int4_gemm(struct ggml_tensor *dst, const struct ggml_tensor *src,
+                  int ith, int nth, void *userdata) {
+  auto *ud = (INT4GemmUserData *)userdata;
+  if (!ud || !ud->int4_weight)
+    return;
+
+  const int M = ud->M;
+  const int N = ud->N;
+  const int K = ud->K;
+  const auto *w = ud->int4_weight;
+  const int num_groups = K / w->group_size;
+
+  // Work partitioning along N dimension
+  // Each thread computes a range of output columns: [n_start, n_end)
+  const int n_per_thread = (N + nth - 1) / nth; // Ceiling division
+  const int n_start = ith * n_per_thread;
+  const int n_end = std::min(n_start + n_per_thread, N);
+
+  // Early exit if this thread has no work
+  if (n_start >= N || n_start >= n_end)
+    return;
+
+  const int n_local = n_end - n_start;
+
+  // Input/output pointers
+  const float *A = (const float *)src->data; // [M × K] - shared by all threads
+  float *C = (float *)dst->data;             // [M × N] - partitioned output
+
+  // Offset pointers for this thread's partition
+  // Weights are stored as [N × K/2] (packed INT4, row-major)
+  // Thread i processes weight rows [n_start, n_end)
+  const size_t weight_row_size = K / 2; // Bytes per weight row (packed)
+  const uint8_t *W_int4_local =
+      (const uint8_t *)w->q_data + n_start * weight_row_size;
+
+  // Scales and zero-points are stored as [N × num_groups]
+  // Thread i needs entries [n_start * num_groups, n_end * num_groups)
+  const float *scales_local = w->scales + n_start * num_groups;
+  const float *zeros_local = w->zero_points + n_start * num_groups;
+
+  // Allocate temporary output buffer for this thread
+  // We can't write directly to C with stride N, so use temp buffer
+  std::vector<float> C_local(M * n_local);
+
+  // Call the INT4 GEMM kernel for this thread's partition
+  densecore::simd::GemmInt4Fp32_AVX512(
+      C_local.data(), // Temporary output [M × n_local]
+      A,              // Full activations [M × K]
+      W_int4_local,   // Subset of weights [n_local × K]
+      scales_local,   // Subset of scales [n_local × num_groups]
+      zeros_local,    // Subset of zero-points [n_local × num_groups]
+      M, n_local, K,  // n_local instead of N
+      w->group_size);
+
+  // Copy thread-local results to final output with proper stride
+  // C[m, n] = C[m * N + n] (row-major)
+  // We write to columns [n_start, n_end) for all rows
+  for (int m = 0; m < M; m++) {
+    memcpy(C + m * N + n_start,          // Destination: C[m, n_start]
+           C_local.data() + m * n_local, // Source: thread's local buffer
+           n_local * sizeof(float));     // Copy n_local elements
+  }
+}
+
+/**
+ * Check if a tensor is quantized to INT4
+ */
+inline bool IsINT4Quantized(const struct ggml_tensor *tensor) {
+  if (!tensor || !tensor->extra)
+    return false;
+
+  // Check if extra data contains TensorInt4 metadata
+  // This is set by the INT4Quantizer during quantization
+  const densecore::TensorInt4 *int4 =
+      static_cast<const densecore::TensorInt4 *>(tensor->extra);
+
+  // Validate it's actually INT4 data
+  return (int4 && int4->q_data && int4->scales && int4->zero_points);
+}
+
+/**
+ * Create a custom GGML operation for INT4 GEMM
+ *
+ * This replaces ggml_mul_mat when weights are INT4 quantized.
+ */
+inline struct ggml_tensor *
+ggml_mul_mat_int4(struct ggml_context *ctx,
+                  struct ggml_tensor *weight, // INT4 quantized
+                  struct ggml_tensor *input,  // FP32 activations
+                  INT4GemmUserData *userdata) {
+
+  // Create output tensor
+  // ggml_mul_mat(weight, input) computes input^T * weight^T
+  // For weight [N × K] and input [K × M], result is [N × M]
+  const int M = input->ne[1];  // Batch size / sequence length
+  const int N = weight->ne[1]; // Output dimension
+  const int K = weight->ne[0]; // Input dimension
+
+  struct ggml_tensor *result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
+
+  // Populate user data
+  userdata->int4_weight =
+      static_cast<const densecore::TensorInt4 *>(weight->extra);
+  userdata->M = M;
+  userdata->N = N;
+  userdata->K = K;
+
+  // Create custom operation
+  result = ggml_map_custom1(ctx, input, cb_int4_gemm, 1, userdata);
+
+  return result;
+}
+
+// Thread-local pool for INT4 GEMM user data (avoid allocations)
+static constexpr int kMaxINT4GemmUserDataSlots = 64;
+static thread_local INT4GemmUserData
+    g_int4_gemm_userdata_pool[kMaxINT4GemmUserDataSlots];
+static thread_local int g_int4_gemm_userdata_index = 0;
+
+inline INT4GemmUserData *GetINT4GemmUserData() {
+  int idx = g_int4_gemm_userdata_index++;
+  if (idx >= kMaxINT4GemmUserDataSlots) {
+    g_int4_gemm_userdata_index = 0;
+    idx = 0;
+  }
+  return &g_int4_gemm_userdata_pool[idx];
+}
+
+/**
+ * Smart matrix multiplication dispatcher
+ *
+ * Uses INT4 GEMM kernel if weights are quantized, otherwise falls back to
+ * ggml_mul_mat
+ */
+inline struct ggml_tensor *smart_mul_mat(struct ggml_context *ctx,
+                                         struct ggml_tensor *weight,
+                                         struct ggml_tensor *input) {
+
+  // Check if INT4 quantization is available and should be used
+  static const bool use_int4_kernel =
+      (densecore::simd::DetectSimdLevel() >= densecore::simd::SimdLevel::AVX2);
+
+  if (use_int4_kernel && IsINT4Quantized(weight)) {
+    // Use custom INT4 GEMM kernel
+    INT4GemmUserData *ud = GetINT4GemmUserData();
+    return ggml_mul_mat_int4(ctx, weight, input, ud);
+  } else {
+    // Fallback to standard GGML matrix multiplication
+    return ggml_mul_mat(ctx, weight, input);
+  }
+}
+
+// ============================================================================
 // SIMPLIFIED UNIVERSAL ATTENTION (llama.cpp style)
 // This version trades the complex paged KV cache for correctness and clarity.
 // Once working, KV cache can be re-added following the proven llama.cpp
@@ -177,10 +355,10 @@ struct ggml_tensor *BuildTransformerGraph(
     cur = ggml_rms_norm(ctx_c, cur, model->hparams.f_norm_rms_eps);
     cur = ggml_mul(ctx_c, cur, model->layers[il].attention_norm);
 
-    // Q/K/V Projections
-    struct ggml_tensor *Qcur = ggml_mul_mat(ctx_c, model->layers[il].wq, cur);
-    struct ggml_tensor *Kcur = ggml_mul_mat(ctx_c, model->layers[il].wk, cur);
-    struct ggml_tensor *Vcur = ggml_mul_mat(ctx_c, model->layers[il].wv, cur);
+    // Q/K/V Projections (using smart dispatcher for INT4 support)
+    struct ggml_tensor *Qcur = smart_mul_mat(ctx_c, model->layers[il].wq, cur);
+    struct ggml_tensor *Kcur = smart_mul_mat(ctx_c, model->layers[il].wk, cur);
+    struct ggml_tensor *Vcur = smart_mul_mat(ctx_c, model->layers[il].wv, cur);
 
     // Add Bias if present (for Qwen2 and some other models)
     if (model->layers[il].bq)
@@ -458,8 +636,8 @@ struct ggml_tensor *BuildTransformerGraph(
 
     cur = ggml_reshape_2d(ctx_c, KQV_merged, head_dim_q * n_head, N);
 
-    // Output Projection
-    cur = ggml_mul_mat(ctx_c, model->layers[il].wo, cur);
+    // Output Projection (using smart dispatcher for INT4 support)
+    cur = smart_mul_mat(ctx_c, model->layers[il].wo, cur);
     if (model->layers[il].bo)
       cur = ggml_add(ctx_c, cur, model->layers[il].bo);
 
@@ -489,11 +667,11 @@ struct ggml_tensor *BuildTransformerGraph(
     cur = ggml_rms_norm(ctx_c, cur, model->hparams.f_norm_rms_eps);
     cur = ggml_mul(ctx_c, cur, model->layers[il].ffn_norm);
 
-    // SwiGLU FFN
-    struct ggml_tensor *w1 = ggml_mul_mat(ctx_c, model->layers[il].w1, cur);
-    struct ggml_tensor *w3 = ggml_mul_mat(ctx_c, model->layers[il].w3, cur);
+    // SwiGLU FFN (using smart dispatcher for INT4 support)
+    struct ggml_tensor *w1 = smart_mul_mat(ctx_c, model->layers[il].w1, cur);
+    struct ggml_tensor *w3 = smart_mul_mat(ctx_c, model->layers[il].w3, cur);
     cur = ggml_mul(ctx_c, ggml_silu(ctx_c, w1), w3);
-    cur = ggml_mul_mat(ctx_c, model->layers[il].w2, cur);
+    cur = smart_mul_mat(ctx_c, model->layers[il].w2, cur);
 
     // Residual connection
     cur = ggml_add(ctx_c, cur, inpFF);
