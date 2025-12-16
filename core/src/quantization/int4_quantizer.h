@@ -87,24 +87,6 @@ private:
                      float &zero_point, uint8_t *output);
 
   /**
-   * @brief Pack quantized blocks into AVX512-optimized layout
-   *
-   * For group_size=128:
-   * - Each block is 72 bytes (8 + 64)
-   * - Align each block to 64-byte boundary
-   * - Single _mm512_loadu_si512() loads one block's weights
-   *
-   * For group_size=32:
-   * - Interleave 4 consecutive blocks
-   * - Total 96 bytes (4 × 24), rounded to 128 for alignment
-   * - Single AVX512 load fetches 4 blocks
-   *
-   * @param tensor_int4 TensorInt4 structure with quantized data
-   * @param output_buffer Pre-allocated 64-byte aligned buffer
-   */
-  void PackWeightsAVX512(const TensorInt4 &tensor_int4, void *output_buffer);
-
-  /**
    * @brief Convert GGML tensor to FP32 array
    *
    * Handles both F32 and F16 GGML tensors.
@@ -121,14 +103,34 @@ private:
    * @param size Size in bytes
    * @return Pointer to aligned memory (must be freed with AlignedFree)
    */
-  void *AlignedAlloc(size_t size);
+  static void *AlignedAlloc(size_t size);
 
   /**
    * @brief Free 64-byte aligned memory
    *
    * @param ptr Pointer returned by AlignedAlloc
    */
-  void AlignedFree(void *ptr);
+  static void AlignedFree(void *ptr);
+
+public:
+  /**
+   * @brief Free INT4 quantized data attached to a tensor
+   *
+   * This function MUST be called when unloading a model that contains
+   * INT4 quantized tensors to prevent memory leaks. The function safely
+   * handles null pointers and non-quantized tensors.
+   *
+   * @param tensor GGML tensor with INT4 data attached via tensor->extra
+   */
+  static void FreeINT4Data(struct ggml_tensor *tensor);
+
+  /**
+   * @brief Check if a tensor has INT4 quantized data attached
+   *
+   * @param tensor GGML tensor to check
+   * @return true if tensor->extra contains valid TensorInt4 data
+   */
+  static bool IsINT4Quantized(const struct ggml_tensor *tensor);
 };
 
 } // namespace densecore

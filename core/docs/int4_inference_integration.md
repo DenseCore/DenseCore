@@ -20,10 +20,10 @@ The system automatically detects whether to use INT4 kernel at runtime:
 
 ```cpp
 static const bool use_int4_kernel = 
-    (densecore::simd::DetectSimdLevel() >= densecore::simd::SimdLevel::AVX2);
+    (densecore::simd::DetectSimdLevel() >= densecore::simd::SimdLevel::AVX512);
 ```
 
-**Rationale:** AVX2 is the minimum requirement. The kernel is optimized for AVX512, but includes an AVX2 fallback path.
+**Rationale:** AVX512 is required for the optimized INT4 GEMM kernel. AVX2-only systems fall back to GGML's highly optimized FP32 kernels, which outperform our scalar INT4 implementation.
 
 ### 2. Weight Detection
 
@@ -219,7 +219,7 @@ For a 7B parameter model on Intel Ice Lake (AVX512):
 
 2. **No dynamic batching:** Batch size is fixed at graph build time. Dynamic batching could improve GPU-like throughput.
 
-3. **AVX2 minimum:** Non-AVX2 systems fall back to scalar, which is slower than GGML's optimized FP32 kernels.
+3. **AVX512 only:** Non-AVX512 systems (including AVX2-only CPUs) use GGML's optimized FP32 kernels instead. This is intentional as the scalar INT4 fallback is slower.
 
 ### Planned Enhancements
 

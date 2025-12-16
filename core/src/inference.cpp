@@ -191,27 +191,39 @@ void cb_int4_gemm(struct ggml_tensor *dst, const struct ggml_tensor *src,
   const float *scales_local = w->scales + n_start * num_groups;
   const float *zeros_local = w->zero_points + n_start * num_groups;
 
-  // Allocate temporary output buffer for this thread
-  // We can't write directly to C with stride N, so use temp buffer
-  std::vector<float> C_local(M * n_local);
+  // Thread-local workspace buffer (reused across calls, no heap allocation)
+  // Max supported: M=64 (batch size), n_local=8192 (large hidden dim)
+  // 64 * 8192 * 4 = 2MB per thread
+  static constexpr size_t kMaxWorkspaceSize = 64 * 8192;
+  static thread_local float s_workspace[kMaxWorkspaceSize];
+
+  const size_t required_size = static_cast<size_t>(M) * n_local;
+  float *C_local = s_workspace;
+
+  // Fallback to heap allocation if workspace is too small (rare edge case)
+  std::vector<float> C_local_heap;
+  if (required_size > kMaxWorkspaceSize) {
+    C_local_heap.resize(required_size);
+    C_local = C_local_heap.data();
+  }
 
   // Call the INT4 GEMM kernel for this thread's partition
   densecore::simd::GemmInt4Fp32_AVX512(
-      C_local.data(), // Temporary output [M × n_local]
-      A,              // Full activations [M × K]
-      W_int4_local,   // Subset of weights [n_local × K]
-      scales_local,   // Subset of scales [n_local × num_groups]
-      zeros_local,    // Subset of zero-points [n_local × num_groups]
-      M, n_local, K,  // n_local instead of N
+      C_local,       // Temporary output [M × n_local]
+      A,             // Full activations [M × K]
+      W_int4_local,  // Subset of weights [n_local × K]
+      scales_local,  // Subset of scales [n_local × num_groups]
+      zeros_local,   // Subset of zero-points [n_local × num_groups]
+      M, n_local, K, // n_local instead of N
       w->group_size);
 
   // Copy thread-local results to final output with proper stride
   // C[m, n] = C[m * N + n] (row-major)
   // We write to columns [n_start, n_end) for all rows
   for (int m = 0; m < M; m++) {
-    memcpy(C + m * N + n_start,          // Destination: C[m, n_start]
-           C_local.data() + m * n_local, // Source: thread's local buffer
-           n_local * sizeof(float));     // Copy n_local elements
+    memcpy(C + m * N + n_start,      // Destination: C[m, n_start]
+           C_local + m * n_local,    // Source: thread's local buffer
+           n_local * sizeof(float)); // Copy n_local elements
   }
 }
 
@@ -290,8 +302,8 @@ inline struct ggml_tensor *smart_mul_mat(struct ggml_context *ctx,
                                          struct ggml_tensor *input) {
 
   // Check if INT4 quantization is available and should be used
-  static const bool use_int4_kernel =
-      (densecore::simd::DetectSimdLevel() >= densecore::simd::SimdLevel::AVX2);
+  static const bool use_int4_kernel = (densecore::simd::DetectSimdLevel() >=
+                                       densecore::simd::SimdLevel::AVX512);
 
   if (use_int4_kernel && IsINT4Quantized(weight)) {
     // Use custom INT4 GEMM kernel

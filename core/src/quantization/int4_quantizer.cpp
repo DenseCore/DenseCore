@@ -71,6 +71,47 @@ void INT4Quantizer::AlignedFree(void *ptr) {
 }
 
 // ============================================================================
+// Memory Cleanup Functions
+// ============================================================================
+
+void INT4Quantizer::FreeINT4Data(struct ggml_tensor *tensor) {
+  if (!tensor || !tensor->extra) {
+    return;
+  }
+
+  TensorInt4 *int4_data = static_cast<TensorInt4 *>(tensor->extra);
+
+  // Free aligned weight data buffer
+  if (int4_data->q_data) {
+    AlignedFree(int4_data->q_data);
+    int4_data->q_data = nullptr;
+  }
+
+  // Free scales array
+  if (int4_data->scales) {
+    delete[] int4_data->scales;
+    int4_data->scales = nullptr;
+  }
+
+  // Free zero_points array
+  if (int4_data->zero_points) {
+    delete[] int4_data->zero_points;
+    int4_data->zero_points = nullptr;
+  }
+
+  // Free the TensorInt4 struct itself
+  delete int4_data;
+  tensor->extra = nullptr;
+}
+
+bool INT4Quantizer::IsINT4Quantized(const struct ggml_tensor *tensor) {
+  // Note: This is a best-effort check. The caller is responsible for
+  // ensuring tensor->extra actually points to TensorInt4 data.
+  // A more robust solution would use a magic number or type tag.
+  return tensor && tensor->extra != nullptr;
+}
+
+// ============================================================================
 // FP32 Extraction from GGML Tensor
 // ============================================================================
 
@@ -156,49 +197,6 @@ void INT4Quantizer::QuantizeBlock(const float *weights, int block_size,
 
   // Adjust zero_point for signed representation
   zero_point -= 8.0f;
-}
-
-// ============================================================================
-// AVX512-Optimized Weight Packing
-// ============================================================================
-
-void INT4Quantizer::PackWeightsAVX512(const TensorInt4 &tensor_int4,
-                                      void *output_buffer) {
-  const int num_blocks = tensor_int4.num_blocks;
-  const int group_size = tensor_int4.group_size;
-  const size_t block_data_size = group_size / 2; // Packed INT4 size
-
-  uint8_t *output = static_cast<uint8_t *>(output_buffer);
-
-  // For group_size=128: Each block is 72 bytes (8 + 64)
-  // Align each block to 64-byte boundary for optimal AVX512 access
-  const size_t block_total_size =
-      sizeof(float) * 2 + block_data_size; // scale + zero + data
-  const size_t aligned_block_size =
-      (block_total_size + 63) & ~63ULL; // Round up to 64
-
-  for (int b = 0; b < num_blocks; ++b) {
-    uint8_t *block_ptr = output + b * aligned_block_size;
-
-    // Write scale
-    std::memcpy(block_ptr, &tensor_int4.scales[b], sizeof(float));
-    block_ptr += sizeof(float);
-
-    // Write zero_point
-    std::memcpy(block_ptr, &tensor_int4.zero_points[b], sizeof(float));
-    block_ptr += sizeof(float);
-
-    // Write packed data
-    const uint8_t *src_data =
-        static_cast<const uint8_t *>(tensor_int4.q_data) + b * block_data_size;
-    std::memcpy(block_ptr, src_data, block_data_size);
-
-    // Zero-fill padding for alignment
-    const size_t padding = aligned_block_size - block_total_size;
-    if (padding > 0) {
-      std::memset(block_ptr + block_data_size, 0, padding);
-    }
-  }
 }
 
 // ============================================================================
