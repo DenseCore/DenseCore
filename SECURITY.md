@@ -64,8 +64,3 @@ When deploying DenseCore in production:
 3. **Network Isolation**: Run in private networks, expose only through ingress
 4. **Resource Limits**: Set appropriate CPU/memory limits in K8s
 5. **Regular Updates**: Keep DenseCore and dependencies up to date
-
-## Contact
-
-- Security issues: security@densecore.io
-- General questions: [GitHub Discussions](https://github.com/densecore/densecore/discussions)

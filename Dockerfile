@@ -41,7 +41,7 @@ RUN mkdir -p core/src core/src/quantization core/src/pruning core/tests && \
     optimization_bridge save_model quantizer pruner quantize version tensor_utils; do \
     echo "" > core/src/${f}.cpp; \
     done && \
-    for f in max_quantizer awq_quantizer smoothquant_quantizer; do \
+    for f in max_quantizer awq_quantizer smoothquant_quantizer int4_quantizer; do \
     echo "" > core/src/quantization/${f}.cpp; \
     done && \
     for f in depth_pruner width_pruner attention_pruner combined_pruner; do \
