@@ -73,9 +73,9 @@ We built DenseCore because **GPUs are scarce and expensive**, but CPUs are every
 
 ### 🔥 Blazing Fast
 C++ core with **AVX-512 & AVX2** hand-tuned kernels. 
+- **INT4 Quantization**: 7× compression, 5-6× faster inference.
 - **Continuous Batching**: Maximizes throughput.
 - **Graph Caching**: Reduces overhead by 40%.
-- **Flash Attention**: Optimized for CPU cache hierarchy.
 
 </td>
 <td width="50%">
@@ -130,13 +130,16 @@ Slash your cloud bills by **90%**.
 Includes built-in tools to compress models (Quantization & Pruning) for edge deployment.
 
 ```python
-from densecore.quantize import quantize_model, Q4_K_M_CFG
+from densecore.quantize import quantize_model, Q4_K_M_CFG, INT4_PAPER_CFG
 
-# 4x smaller, 2x faster, <5% quality loss
+# Standard GGML quantization
 quantize_model("model.gguf", "model-q4.gguf", config=Q4_K_M_CFG)
+
+# 🚀 NEW: Custom INT4 with AVX512-optimized kernels (5-6× faster inference!)
+quantize_model("model.gguf", "model-int4.gguf", config=INT4_PAPER_CFG(block_size=128))
 ```
 
-📖 **[Optimization Guide →](docs/MODEL_OPTIMIZATION.md)**
+📖 **[Optimization Guide →](docs/MODEL_OPTIMIZATION.md)** | **[INT4 Quantization →](docs/INT4_QUANTIZATION.md)**
 
 ---
 
@@ -146,6 +149,7 @@ quantize_model("model.gguf", "model-q4.gguf", config=Q4_K_M_CFG)
 |-----------|-------------|
 | **[Python SDK](python/README.md)** | Full guide for Python developers. |
 | **[API Reference](docs/API_REFERENCE.md)** | Detailed API docs for Python, C, and Go. |
+| **[INT4 Quantization](docs/INT4_QUANTIZATION.md)** | AVX512-optimized INT4 with 5-6× speedup. |
 | **[Architecture](docs/ARCHITECTURE.md)** | Deep dive into the C++ internal design. |
 | **[Deployment](docs/DEPLOYMENT.md)** | Docker and Kubernetes setup guides. |
 | **[Contributing](CONTRIBUTING.md)** | How to build and contribute to DenseCore. |
