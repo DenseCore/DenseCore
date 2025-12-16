@@ -219,11 +219,20 @@ void INT4Quantizer::QuantizeWeight(struct ggml_tensor *tensor) {
   }
 
   const int64_t nelements = ggml_nelements(tensor);
-  const int num_blocks = (nelements + group_size_ - 1) / group_size_;
 
-  std::cout << "[INT4Quantizer] Quantizing " << tensor->name << ": "
-            << nelements << " elements, " << num_blocks << " blocks"
-            << std::endl;
+  // Get tensor dimensions
+  // For 2D weight tensors: [K, N] where K is inner dim, N is output dim
+  const int64_t K = tensor->ne[0]; // cols (inner dimension)
+  const int64_t N = tensor->ne[1]; // rows (output dimension)
+  const bool is_2d = (ggml_n_dims(tensor) == 2);
+
+  // Number of groups per row (for 2D) or total (for 1D)
+  const int groups_per_row = (K + group_size_ - 1) / group_size_;
+  const int total_blocks = is_2d ? (N * groups_per_row) : groups_per_row;
+
+  std::cout << "[INT4Quantizer] Quantizing " << tensor->name << ": " << K << "x"
+            << N << " (" << nelements << " elements), " << total_blocks
+            << " blocks (" << groups_per_row << " per row)" << std::endl;
 
   // Step 1: Extract FP32 weights
   std::vector<float> fp32_weights(nelements);
@@ -234,84 +243,90 @@ void INT4Quantizer::QuantizeWeight(struct ggml_tensor *tensor) {
   }
 
   // Step 2: Allocate quantized data structures
-  const size_t packed_size = num_blocks * (group_size_ / 2);
+  // Packed weights: [N × K/2] row-major
+  const size_t packed_size = N * (K / 2);
   std::vector<uint8_t> packed_data(packed_size);
-  std::vector<float> scales(num_blocks);
-  std::vector<float> zero_points(num_blocks);
 
-  // Step 3: Quantize each block
-  for (int b = 0; b < num_blocks; ++b) {
-    const int start_idx = b * group_size_;
-    const int end_idx = std::min(start_idx + group_size_, (int)nelements);
-    const int actual_block_size = end_idx - start_idx;
+  // Scales and zeros: [N × groups_per_row] - CRITICAL for cache efficiency
+  // Access pattern in kernel: scales[n * groups_per_row + g]
+  // This ensures linear access when iterating n, then g
+  std::vector<float> scales(total_blocks);
+  std::vector<float> zero_points(total_blocks);
 
-    // Handle partial last block by zero-padding
-    std::vector<float> block_weights(group_size_, 0.0f);
-    std::memcpy(block_weights.data(), &fp32_weights[start_idx],
-                actual_block_size * sizeof(float));
+  // Step 3: Quantize each row, then each group within the row
+  // This produces [N, NumGroups] layout for scales/zeros
+  for (int64_t row = 0; row < N; ++row) {
+    const float *row_weights = fp32_weights.data() + row * K;
+    uint8_t *row_packed = packed_data.data() + row * (K / 2);
 
-    uint8_t *block_output = packed_data.data() + b * (group_size_ / 2);
-    QuantizeBlock(block_weights.data(), group_size_, scales[b], zero_points[b],
-                  block_output);
+    for (int g = 0; g < groups_per_row; ++g) {
+      const int64_t k_start = g * group_size_;
+      const int64_t k_end = std::min(k_start + group_size_, K);
+      const int actual_size = static_cast<int>(k_end - k_start);
+
+      // Handle partial last group by zero-padding
+      std::vector<float> block_weights(group_size_, 0.0f);
+      std::memcpy(block_weights.data(), row_weights + k_start,
+                  actual_size * sizeof(float));
+
+      // Index in [N, groups_per_row] layout
+      const int meta_idx = row * groups_per_row + g;
+
+      // Output location in packed data
+      uint8_t *block_output = row_packed + g * (group_size_ / 2);
+
+      QuantizeBlock(block_weights.data(), group_size_, scales[meta_idx],
+                    zero_points[meta_idx], block_output);
+    }
   }
 
   // Step 4: Create TensorInt4 metadata
-  TensorInt4 tensor_int4;
-  tensor_int4.group_size = group_size_;
-  tensor_int4.num_blocks = num_blocks;
-  tensor_int4.num_elements = nelements;
-  tensor_int4.data_alignment = 64;
+  TensorInt4 *persistent_int4 = new TensorInt4();
+  persistent_int4->group_size = group_size_;
+  persistent_int4->num_blocks = total_blocks;
+  persistent_int4->num_elements = nelements;
+  persistent_int4->data_alignment = 64;
 
   // Copy tensor shape
   for (int i = 0; i < 4; ++i) {
-    tensor_int4.ne[i] = tensor->ne[i];
+    persistent_int4->ne[i] = tensor->ne[i];
   }
 
-  // Step 5: Allocate aligned output buffer
-  const size_t total_size = GetQuantizedSize(nelements, group_size_);
-  void *aligned_buffer = AlignedAlloc(total_size);
+  // Step 5: Allocate persistent aligned memory for packed weights
+  void *aligned_buffer = AlignedAlloc(packed_size);
   if (!aligned_buffer) {
     std::cerr << "[INT4Quantizer] Failed to allocate aligned memory"
               << std::endl;
+    delete persistent_int4;
     return;
   }
-
-  // Temporarily store packed data, scales, and zero_points
-  tensor_int4.q_data = packed_data.data();
-  tensor_int4.scales = scales.data();
-  tensor_int4.zero_points = zero_points.data();
-
-  // Step 6: Pack into AVX512-optimized layout
-  PackWeightsAVX512(tensor_int4, aligned_buffer);
-
-  // Step 7: Allocate persistent metadata and attach to tensor
-  TensorInt4 *persistent_int4 = new TensorInt4();
-  *persistent_int4 = tensor_int4;
-
-  // Allocate persistent copies of scales and zero_points
-  persistent_int4->scales = new float[num_blocks];
-  persistent_int4->zero_points = new float[num_blocks];
-  std::memcpy(persistent_int4->scales, scales.data(),
-              num_blocks * sizeof(float));
-  std::memcpy(persistent_int4->zero_points, zero_points.data(),
-              num_blocks * sizeof(float));
-
-  // Update q_data to point to the aligned buffer
+  std::memcpy(aligned_buffer, packed_data.data(), packed_size);
   persistent_int4->q_data = aligned_buffer;
 
+  // Allocate persistent copies of scales and zero_points (already in [N,
+  // NumGroups] layout)
+  persistent_int4->scales = new float[total_blocks];
+  persistent_int4->zero_points = new float[total_blocks];
+  std::memcpy(persistent_int4->scales, scales.data(),
+              total_blocks * sizeof(float));
+  std::memcpy(persistent_int4->zero_points, zero_points.data(),
+              total_blocks * sizeof(float));
+
   // Attach to GGML tensor (store pointer in extra field)
-  // NOTE: This is a simplification. In production, you'd want a proper
-  // metadata management system to avoid memory leaks.
   tensor->extra = persistent_int4;
 
   // Log success
-  const float compression_ratio =
-      (float)(nelements * sizeof(float)) / (float)total_size;
+  const float compression_ratio = (float)(nelements * sizeof(float)) /
+                                  (float)(packed_size + total_blocks * 8);
   std::cout << "[INT4Quantizer] Quantized " << tensor->name << " successfully"
             << std::endl;
   std::cout << "  Original: " << (nelements * sizeof(float))
-            << " bytes, Quantized: " << total_size << " bytes" << std::endl;
+            << " bytes, Quantized: " << (packed_size + total_blocks * 8)
+            << " bytes" << std::endl;
   std::cout << "  Compression ratio: " << compression_ratio << "x" << std::endl;
+  std::cout << "  Scales/zeros layout: [N=" << N
+            << ", NumGroups=" << groups_per_row << "] (cache-optimized)"
+            << std::endl;
 }
 
 } // namespace densecore
