@@ -1,6 +1,7 @@
 #ifndef DENSECORE_QUANTIZER_H
 #define DENSECORE_QUANTIZER_H
 
+#include "densecore.h" // For DENSECORE_API
 #include "quantization_config.h"
 #include <ggml.h>
 #include <memory>
@@ -48,7 +49,8 @@ protected:
 };
 
 // Factory function to create quantizer based on config
-std::unique_ptr<Quantizer> CreateQuantizer(const QuantConfig &config);
+DENSECORE_API std::unique_ptr<Quantizer>
+CreateQuantizer(const QuantConfig &config);
 
 } // namespace densecore
 

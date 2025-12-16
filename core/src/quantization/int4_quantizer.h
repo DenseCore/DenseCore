@@ -122,7 +122,7 @@ public:
    *
    * @param tensor GGML tensor with INT4 data attached via tensor->extra
    */
-  static void FreeINT4Data(struct ggml_tensor *tensor);
+  DENSECORE_API static void FreeINT4Data(struct ggml_tensor *tensor);
 
   /**
    * @brief Check if a tensor has INT4 quantized data attached

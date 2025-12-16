@@ -9,6 +9,7 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "quantization/int4_quantizer.h"
 #include "quantization/int4_types.h"
 #include "quantization_config.h"
 #include "quantizer.h"
@@ -590,6 +591,16 @@ int QuantizeINT4Custom(const char *input_path, const char *output_path,
 
   gguf_free(ctx_out);
   gguf_free(ctx_gguf);
+
+  // Free INT4 quantized data before freeing ggml context
+  // (ggml_free does not manage tensor->extra allocations)
+  for (int i = 0; i < n_tensors; ++i) {
+    struct ggml_tensor *tensor =
+        ggml_get_tensor(ctx_in, tensor_names[i].c_str());
+    if (tensor && is_quantized[i]) {
+      INT4Quantizer::FreeINT4Data(tensor);
+    }
+  }
   ggml_free(ctx_in);
 
   std::cout << std::endl;

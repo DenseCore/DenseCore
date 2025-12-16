@@ -311,8 +311,8 @@ if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
     target_compile_options(quantize PRIVATE -mcpu=apple-m1)
 endif()
 
-# Link against ggml and threads
-target_link_libraries(quantize PRIVATE ggml Threads::Threads)
+# Link against densecore (for CreateQuantizer, FreeINT4Data), ggml, and threads
+target_link_libraries(quantize PRIVATE densecore ggml Threads::Threads)
 set_target_properties(quantize PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/../bin)
 
 install(TARGETS quantize
