@@ -1,4 +1,5 @@
 #include "kv_cache.h"
+#include "numa_allocator.h"
 #include "simd_ops.h"
 #include <cstring>
 #include <iostream>
@@ -316,8 +317,18 @@ uint64_t BlockManager::ComputeTokenHash(const int *tokens, int n_tokens) {
 // ============================================================================
 
 PagedKVCache::~PagedKVCache() {
+  // Note: ggml_free does not call free() on mem_buffer if it was provided
+  // externally, so we must free our NUMA buffer ourselves AFTER ggml_free
   if (ctx)
     ggml_free(ctx);
+
+  // Free NUMA-allocated buffer if we allocated it
+  if (numa_buffer && numa_buffer_size > 0) {
+    densecore::NumaAllocator::Free(numa_buffer, numa_buffer_size);
+    numa_buffer = nullptr;
+    numa_buffer_size = 0;
+  }
+
   if (block_manager)
     delete block_manager;
 }
@@ -422,7 +433,8 @@ void PagedKVCache::CopyBlockDataLayer(int src_block_id, int dst_block_id,
 // ============================================================================
 
 PagedKVCache *InitPagedKVCache(TransformerModel *model, int max_num_seqs,
-                               int max_seq_len, ggml_type type) {
+                               int max_seq_len, ggml_type type,
+                               int numa_node_id) {
   PagedKVCache *cache = new PagedKVCache();
 
   // llama.cpp style: Use pre-computed head dimension from hparams
@@ -462,9 +474,50 @@ PagedKVCache *InitPagedKVCache(TransformerModel *model, int max_num_seqs,
   size_t total_size = tensor_size * 2; // K and V
 
   // Add extra buffer for ggml overhead
+  size_t mem_size = total_size + 1024 * 1024 * 10;
+
+  // NUMA-aware memory allocation with graceful fallback
+  void *numa_buffer = nullptr;
+  bool on_preferred_node = false;
+  int actual_numa_node = -1;
+
+  if (numa_node_id >= 0) {
+    // Use AllocatePreferred for graceful degradation on OOM
+    auto alloc_result =
+        densecore::NumaAllocator::AllocatePreferred(mem_size, 64, numa_node_id);
+
+    numa_buffer = alloc_result.ptr;
+    on_preferred_node = alloc_result.on_preferred_node;
+    actual_numa_node = alloc_result.actual_node;
+
+    if (numa_buffer) {
+      // Store NUMA allocation info for proper cleanup
+      cache->numa_buffer = numa_buffer;
+      cache->numa_buffer_size = mem_size;
+      cache->numa_node_id = actual_numa_node;
+
+      // Log allocation status
+      if (on_preferred_node) {
+        std::cout << "[KVCache] Allocated " << (mem_size / 1024 / 1024)
+                  << " MB on NUMA node " << actual_numa_node << " (OPTIMAL)"
+                  << std::endl;
+      } else if (actual_numa_node >= 0) {
+        std::cerr << "[KVCache] WARNING: Fallback allocation on NUMA node "
+                  << actual_numa_node << " (requested: " << numa_node_id
+                  << ") - may impact performance" << std::endl;
+      } else {
+        std::cerr << "[KVCache] WARNING: Using interleaved/standard memory - "
+                  << "NUMA optimization disabled" << std::endl;
+      }
+    } else {
+      std::cerr << "[KVCache] Error: All NUMA allocation attempts failed for "
+                << (mem_size / 1024 / 1024) << " MB" << std::endl;
+    }
+  }
+
   struct ggml_init_params params = {
-      .mem_size = total_size + 1024 * 1024 * 10,
-      .mem_buffer = nullptr,
+      .mem_size = mem_size,
+      .mem_buffer = numa_buffer,
       .no_alloc = false,
   };
 
@@ -473,6 +526,11 @@ PagedKVCache *InitPagedKVCache(TransformerModel *model, int max_num_seqs,
     std::cerr << "[KVCache] Error: Failed to allocate "
               << (total_size / 1024 / 1024)
               << " MB for KV cache. Try reducing max_seq_len." << std::endl;
+    if (numa_buffer) {
+      densecore::NumaAllocator::Free(numa_buffer, mem_size);
+      cache->numa_buffer = nullptr;
+      cache->numa_buffer_size = 0;
+    }
     delete cache;
     return nullptr;
   }
@@ -516,6 +574,15 @@ PagedKVCache *InitPagedKVCache(TransformerModel *model, int max_num_seqs,
   std::cout << "  - cache_type: " << type_name << std::endl;
   std::cout << "  - total_memory: " << (total_size / 1024 / 1024) << " MB"
             << std::endl;
+  if (numa_node_id >= 0 && numa_buffer) {
+    std::cout << "  - numa_node: " << numa_node_id << std::endl;
+  }
+
+  // Run diagnostic report to verify NUMA placement and huge page status
+  if (numa_buffer) {
+    densecore::MemoryDiagnostics::PrintSystemTopologyReport(
+        numa_buffer, mem_size, numa_node_id, "KV Cache");
+  }
 
   return cache;
 }

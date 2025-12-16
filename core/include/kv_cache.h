@@ -164,6 +164,11 @@ struct PagedKVCache {
   // Cache type
   ggml_type cache_type;
 
+  // NUMA allocation tracking for proper cleanup
+  void *numa_buffer = nullptr; // Pointer to NUMA-allocated buffer (if used)
+  size_t numa_buffer_size = 0; // Size of NUMA buffer for munmap
+  int numa_node_id = -1;       // NUMA node where buffer was allocated
+
   ~PagedKVCache();
 
   // -------------------------------------------------------------------------
@@ -241,8 +246,11 @@ struct PagedKVCache {
 // ============================================================================
 
 // Initialize Paged KV Cache
+// numa_node_id: -1 for default allocation, >= 0 to bind memory to specific NUMA
+// node
 PagedKVCache *InitPagedKVCache(TransformerModel *model, int max_num_seqs,
-                               int max_seq_len, ggml_type type = GGML_TYPE_F16);
+                               int max_seq_len, ggml_type type = GGML_TYPE_F16,
+                               int numa_node_id = -1);
 
 // ============================================================================
 // Backward Compatibility

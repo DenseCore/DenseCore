@@ -260,6 +260,36 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(densecore PRIVATE Threads::Threads)
 
+# ==========================================================================
+# NUMA / hwloc Support (Optional)
+# ==========================================================================
+# Enables NUMA-aware memory allocation and thread affinity for multi-socket
+# servers. Falls back to sysfs detection if libraries are not available.
+# ==========================================================================
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(HWLOC QUIET hwloc)
+    pkg_check_modules(NUMA QUIET numa)
+    
+    if(HWLOC_FOUND AND NUMA_FOUND)
+        target_include_directories(densecore PRIVATE 
+            ${HWLOC_INCLUDE_DIRS} ${NUMA_INCLUDE_DIRS})
+        target_link_libraries(densecore PRIVATE 
+            ${HWLOC_LIBRARIES} ${NUMA_LIBRARIES})
+        target_compile_definitions(densecore PRIVATE DENSECORE_USE_HWLOC)
+        message(STATUS "NUMA support enabled: hwloc ${HWLOC_VERSION}, numa ${NUMA_VERSION}")
+    elseif(HWLOC_FOUND)
+        target_include_directories(densecore PRIVATE ${HWLOC_INCLUDE_DIRS})
+        target_link_libraries(densecore PRIVATE ${HWLOC_LIBRARIES})
+        target_compile_definitions(densecore PRIVATE DENSECORE_USE_HWLOC)
+        message(STATUS "Partial NUMA support: hwloc ${HWLOC_VERSION} (libnuma not found)")
+    else()
+        message(STATUS "NUMA libs not found - using fallback sysfs detection")
+    endif()
+else()
+    message(STATUS "pkg-config not found - NUMA support disabled")
+endif()
+
 # Position Independent Code (required for shared libraries)
 set_target_properties(densecore PROPERTIES
     POSITION_INDEPENDENT_CODE ON

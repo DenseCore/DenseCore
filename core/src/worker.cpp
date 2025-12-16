@@ -1,5 +1,6 @@
 #include "engine_internal.h"
 #include "ggml.h"
+#include "hardware_topology.h"
 #include "simd_ops.h"
 #include <cstring>
 #include <iostream>
@@ -21,30 +22,49 @@ void EngineLoop(EngineState *state) {
   TransformerModel *current_model = model_entry->model.get();
   PagedKVCache *current_kv_cache = model_entry->kv_cache.get();
 
-  // NUMA-aware thread pinning for multi-socket servers
+  // NUMA-aware thread pinning using HardwareTopology
   {
-    int numa_nodes = densecore::simd::GetNumaNodeCount();
-    if (numa_nodes > 1) {
-      // Pin to first core of NUMA node 0 (where KV cache is typically
-      // allocated)
-      auto cores = densecore::simd::GetCoresInNumaNode(0);
-      if (!cores.empty()) {
-        bool pinned = densecore::simd::PinThreadToCore(cores[0]);
-        if (pinned) {
-          std::cout << "[DenseCore] Worker pinned to core " << cores[0]
-                    << " (NUMA node 0, " << numa_nodes << " nodes detected)"
-                    << std::endl;
-        } else {
-          std::cerr << "[DenseCore] Warning: Thread pinning to core "
-                    << cores[0] << " failed" << std::endl;
-        }
+    auto &topo = densecore::HardwareTopology::GetInstance();
+    int target_node = (state->numa_node_id >= 0) ? state->numa_node_id : 0;
+
+    if (topo.GetNumaNodeCount() > 1) {
+      // Multi-socket: pin worker to physical cores on target NUMA node
+      bool pinned = topo.PinCurrentThreadToNumaNode(
+          target_node, densecore::PinningPolicy::SCATTER);
+      if (pinned) {
+        std::cout << "[DenseCore] Worker thread pinned to NUMA node "
+                  << target_node << " (" << topo.GetNumaNodeCount()
+                  << " nodes detected, SCATTER policy)" << std::endl;
+      } else {
+        std::cerr << "[DenseCore] Warning: Thread pinning to NUMA node "
+                  << target_node << " failed" << std::endl;
       }
     } else {
-      // Single NUMA node: optional pinning for cache locality
-      int num_cores = densecore::simd::GetNumCores();
-      if (num_cores > 1) {
-        densecore::simd::PinThreadToCore(0); // Best-effort, no warning on fail
+      // Single NUMA node: pin to first physical core for cache locality
+      auto physical_cores = topo.GetPhysicalCoreIds(-1);
+      if (!physical_cores.empty()) {
+        densecore::HardwareTopology::PinCurrentThread(physical_cores[0]);
+        std::cout << "[DenseCore] Worker pinned to core " << physical_cores[0]
+                  << " (single NUMA node)" << std::endl;
       }
+    }
+  }
+
+  // Setup compute thread affinity mapping for GGML workers
+  // This pre-computes core assignments so GGML threads can self-pin on first
+  // use
+  {
+    auto &topo = densecore::HardwareTopology::GetInstance();
+    int target_node = (state->numa_node_id >= 0) ? state->numa_node_id : 0;
+
+    // Get n_threads from model or use physical core count on NUMA node
+    int n_compute_threads = topo.GetPhysicalCoreCount(target_node);
+    if (n_compute_threads > 0) {
+      // Use configured pinning policy (0=SCATTER, 1=COMPACT)
+      densecore::PinningPolicy policy = (state->pinning_policy == 1)
+                                            ? densecore::PinningPolicy::COMPACT
+                                            : densecore::PinningPolicy::SCATTER;
+      topo.SetupComputeThreadAffinity(target_node, n_compute_threads, policy);
     }
   }
 

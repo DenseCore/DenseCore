@@ -100,7 +100,7 @@ int GetEmbeddingDimension(DenseCoreHandle handle) {
 }
 
 DenseCoreHandle InitEngine(const char *model_path, const char * /*reserved*/,
-                           int threads) {
+                           int threads, int numa_node_id, int pinning_policy) {
   try {
     (void)threads; // Reserved for future use
 #ifdef _OPENMP
@@ -114,6 +114,8 @@ DenseCoreHandle InitEngine(const char *model_path, const char * /*reserved*/,
       return nullptr;
 
     EngineState *state = new EngineState();
+    state->numa_node_id = numa_node_id;     // Store NUMA configuration
+    state->pinning_policy = pinning_policy; // Store pinning policy
 
     // Calculate optimal KV cache size based on model dimensions
     const int head_dim = model->hparams.n_embd / model->hparams.n_head;
@@ -153,9 +155,15 @@ DenseCoreHandle InitEngine(const char *model_path, const char * /*reserved*/,
                 << ")" << std::endl;
     }
 
-    // Initialize Paged KV Cache
-    PagedKVCache *cache =
-        InitPagedKVCache(model, 1, optimal_seq_len, GGML_TYPE_F16);
+    // Log NUMA configuration
+    if (numa_node_id >= 0) {
+      std::cout << "[DenseCore] NUMA binding: node " << numa_node_id
+                << std::endl;
+    }
+
+    // Initialize Paged KV Cache with NUMA-aware allocation
+    PagedKVCache *cache = InitPagedKVCache(model, 1, optimal_seq_len,
+                                           GGML_TYPE_F16, numa_node_id);
     if (!cache) {
       delete model;
       delete state;
