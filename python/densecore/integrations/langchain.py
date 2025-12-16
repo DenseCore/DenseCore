@@ -1141,10 +1141,7 @@ class DenseCoreEmbeddings(Embeddings):
         """
         from ..embedding import EmbeddingConfig, EmbeddingModel
 
-        self._model_path = model_path
-        self._pooling_strategy = pooling_strategy
         self._normalize = normalize
-        self._threads = threads
 
         config = EmbeddingConfig(
             pooling=pooling_strategy,
@@ -1204,6 +1201,5 @@ class DenseCoreEmbeddings(Embeddings):
         return (
             f"DenseCoreEmbeddings("
             f"dim={self._model.dimension}, "
-            f"pooling='{self._pooling_strategy}', "
             f"normalize={self._normalize})"
         )
