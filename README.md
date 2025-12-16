@@ -22,7 +22,7 @@
 ## ⚡ Quick Start
 
 > [!NOTE]
-> **Linux Only (Recommended)**: DenseCore is optimized for **Linux (Ubuntu 24.04+)**.
+> **Linux Only (Recommended)**: DenseCore is optimized for **Linux (Ubuntu 22.04+)**.
 
 ### 1. Python SDK
 

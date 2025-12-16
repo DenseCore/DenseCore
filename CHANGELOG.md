@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.1.0] - 2025-12-15
+## [0.2.0] - 2025-12-16
 
 ### Added
 
@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Async Streaming:** Added `stream_async()` method with native async/await support
 - **Batch Embeddings:** Added `embed_batch()` for efficient multi-text embedding generation
 - **HuggingFace Tokenization:** Integrated `transformers` library for better tokenization quality
+- **System Diagnostics:** Added topology reporting and configurable thread pinning (`SCATTER`/`COMPACT`)
+- **Symbol Visibility:** Optimized binary size by hiding internal symbols
+- **Version Info:** Embedded build metadata for runtime diagnostics
 
 #### Model Optimization
 - **Quantization Module:** INT4/INT8/FP8 quantization with AWQ and MAX algorithms
@@ -30,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Context Manager:** Support for `with DenseCore(...) as model:` syntax
 - **Metrics API:** `get_metrics()` for monitoring throughput and latency
 - **Custom Tokenization:** `hf_repo_id` parameter for using official HF tokenizers
+- **LangChain Integration:** Added `DenseCoreEmbeddings` for vector store compatibility
+- **Batch Optimization:** Non-blocking C++ submission for higher throughput
+- **Type Safety:** Hardened ctypes bindings and error handling
 
 #### Server (Go)
 - **OpenAI-Compatible API:** `/v1/chat/completions` endpoint with SSE streaming
@@ -37,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Prometheus Metrics:** Comprehensive metrics at `/metrics` endpoint
 - **Health Probes:** Kubernetes-ready health checks (`/health/live`, `/health/ready`, `/health/startup`)
 - **Graceful Shutdown:** Request draining with configurable timeout
+- **Request Tracing:** Added UUID-based request IDs for observability
+- **Resilience:** Enhanced middleware chain and fixed channel leaks
 
 #### DevOps
 - **Docker Multi-Stage Build:** Optimized production image (<200MB)
@@ -65,6 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Memory Leaks:** Fixed KV cache memory leaks in long-running sessions
 - **NaN Logits:** Fixed numerical stability issues in attention computation
 - **Vocab Size Mismatch:** Corrected vocabulary size handling across architectures
+- **NUMA Allocator:** Fixed memory corruption via type-safe deallocation
+- **Linker Errors:** Resolved symbol visibility issues in tests
+- **Docker:** Fixed build failures and optimized layer caching
 
 ### Performance
 
@@ -73,21 +84,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Average Speedup:** 3.13x across all tested workloads
 - **Memory Usage:** 3.5GB for 7B INT4 model (vs. 14GB FP16)
 
----
+## [0.1.0] - 2025-12-15
 
 ### Added
 
-- Initial C++ inference engine with GGML backend
-- Basic Python bindings via ctypes
-- GGUF model loading
-- Simple text generation
-- KV cache (contiguous allocation)
-- Go REST server MVP
+- **Core:** Initial C++ inference engine with GGML backend
+- **Python:** Basic ctypes bindings, GGUF loading, and text generation
+- **Server:** MVP Go REST API
+- **Memory:** Basic contiguous KV cache allocation
 
 ### Known Issues
 
 - Limited model architecture support
-- High memory usage
+- High memory usage (no paging)
 - No quantization support
 - CLI-only interface
 
@@ -116,12 +125,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Version History
 
+- **0.2.0** - Production release (2025-12-16)
 - **0.1.0** - Production release (2025-12-15)
 ---
 
 ## Migration Guides
 
-### Migrating to 0.1.0
+### Migrating to 0.2.0
 
 **Python API Changes:**
 
