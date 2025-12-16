@@ -38,43 +38,84 @@ static int SubmitEmbeddingRequestWrapper(DenseCoreHandle handle, const char* pro
 import "C"
 
 import (
+	"log"
 	"sync"
+	"time"
 	"unsafe"
 
 	"descore-server/internal/domain"
 )
+
+// requestItem wraps the channel with a timestamp for zombie detection
+type requestItem struct {
+	ch        chan domain.StreamEvent
+	createdAt time.Time
+}
 
 // RequestChannelMap is an optimized channel storage with RWMutex.
 // For high-frequency create/delete patterns, a mutex-protected map
 // performs better than sync.Map (which is optimized for read-heavy workloads).
 type RequestChannelMap struct {
 	mu       sync.RWMutex
-	channels map[uintptr]chan domain.StreamEvent
+	channels map[uintptr]requestItem
 }
 
 func NewRequestChannelMap() *RequestChannelMap {
 	return &RequestChannelMap{
-		channels: make(map[uintptr]chan domain.StreamEvent),
+		channels: make(map[uintptr]requestItem),
 	}
 }
 
 func (m *RequestChannelMap) Store(id uintptr, ch chan domain.StreamEvent) {
 	m.mu.Lock()
-	m.channels[id] = ch
+	m.channels[id] = requestItem{
+		ch:        ch,
+		createdAt: time.Now(),
+	}
 	m.mu.Unlock()
 }
 
 func (m *RequestChannelMap) Load(id uintptr) (chan domain.StreamEvent, bool) {
 	m.mu.RLock()
-	ch, ok := m.channels[id]
+	item, ok := m.channels[id]
 	m.mu.RUnlock()
-	return ch, ok
+	return item.ch, ok
 }
 
 func (m *RequestChannelMap) Delete(id uintptr) {
 	m.mu.Lock()
 	delete(m.channels, id)
 	m.mu.Unlock()
+}
+
+// StartCleanupTicker starts a background goroutine to clean up stale channels.
+// It removes channels older than the ttl.
+func (m *RequestChannelMap) StartCleanupTicker(interval, ttl time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			m.cleanupStaleChannels(ttl)
+		}
+	}()
+}
+
+func (m *RequestChannelMap) cleanupStaleChannels(ttl time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	threshold := time.Now().Add(-ttl)
+	for id, item := range m.channels {
+		if item.createdAt.Before(threshold) {
+			log.Printf("Cleaning up zombie request channel %d (age > %v)", id, ttl)
+			// Just delete, do not close. Let GC handle it to avoid "send on closed channel" panic in C++ callback
+			delete(m.channels, id)
+			
+			// Also clean up completion channel if it exists
+			completionChannels.Signal(id)
+		}
+	}
 }
 
 // EmbeddingChannelMap is an optimized channel storage for embeddings.
@@ -153,6 +194,19 @@ func (m *CompletionChannelMap) Signal(id uintptr) {
 var requestChannels = NewRequestChannelMap()
 var embeddingChannels = NewEmbeddingChannelMap()
 var completionChannels = NewCompletionChannelMap()
+
+// Cleanup removes all resources associated with a request ID.
+// Safe to call multiple times.
+func Cleanup(id uintptr) {
+	requestChannels.Delete(id)
+	completionChannels.Signal(id)
+	embeddingChannels.Delete(id)
+}
+
+// StartMapCleanupTicker initializes the background cleaner for the global map.
+func StartMapCleanupTicker(interval, ttl time.Duration) {
+	requestChannels.StartCleanupTicker(interval, ttl)
+}
 
 //export streamCallbackGateway
 func streamCallbackGateway(token *C.char, isFinished C.int, userData unsafe.Pointer) {

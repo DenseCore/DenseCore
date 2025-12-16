@@ -1,6 +1,11 @@
 package domain
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+var ErrServiceBusy = errors.New("server is busy, please try again later")
 
 // Engine defines the interface for the inference engine
 type Engine interface {

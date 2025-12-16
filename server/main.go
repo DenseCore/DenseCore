@@ -15,6 +15,7 @@ import (
 	"descore-server/internal/config"
 	"descore-server/internal/engine"
 	"descore-server/internal/middleware"
+	"descore-server/internal/queue"
 	"descore-server/internal/service"
 )
 
@@ -88,7 +89,20 @@ func main() {
 		slog.Info("no model path specified, use /v1/models/load to load a model")
 	}
 
-	chatService := service.NewChatService(modelService)
+
+
+	// Initialize Request Queue and Worker Pool
+	// queueSize 1024 allows buffering bursts of traffic
+	requestQueue := queue.NewRequestQueue(1024)
+	
+	// Start Worker Pool
+	// We use 'threads' as the number of concurrent workers. 
+	// This ensures we don't oversubscribe the CPU if the engine handles concurrency, 
+	// or we process N requests in parallel.
+	workerPool := service.NewQueueProcessor(requestQueue, modelService)
+	workerPool.Start(threads)
+
+	chatService := service.NewChatService(modelService, requestQueue)
 	handler := api.NewHandler(chatService, modelService)
 
 	// Initialize API key store
@@ -121,84 +135,93 @@ func main() {
 	if cfg.RateLimitEnabled {
 		rateLimiter = middleware.NewRateLimiter(cfg.RateLimitReqPerSec, cfg.RateLimitBurst)
 	}
-	// Create middleware chain
-	var middlewareChain func(http.Handler) http.Handler
 
+	// 1. Global Chain: Applies to ALL requests
+	//    - Recovery: Catch panics
+	//    - RequestID: Tag requests
+	//    - Tracing: Start OTel spans
+	//    - Logging: Log access (skipped for health via exclusion later if needed, but good to check)
+	globalChain := middleware.Chain(
+		middleware.Recovery(),
+		middleware.RequestID(),
+		middleware.Tracing(), // Assuming Tracing middleware returns func(http.Handler) http.Handler
+		middleware.Logging(cfg.LogFormat),
+	)
+
+	// 2. API Chain: Applies to /v1/ requests
+	//    - RateLimit: Protect resources
+	//    - CORS: Browser access
+	//    - Auth: Security
+	//    - MaxBodySize: DoS protection
+	//    - ContentType: JSON default
+	apiMiddleware := []func(http.Handler) http.Handler{}
+
+	// Rate Limit
 	if cfg.RateLimitEnabled && rateLimiter != nil {
-		if authEnabled {
-			middlewareChain = middleware.Chain(
-				middleware.Recovery(),
-				middleware.RequestID(),
-				middleware.Tracing(),
-				middleware.CORS(cfg.CORSAllowedOrigins),
-				middleware.APIKeyAuth(apiKeyStore),
-				middleware.RateLimitWithInterface(rateLimiter),
-				middleware.MaxBodySize(cfg.MaxRequestBodySize),
-				middleware.Logging(cfg.LogFormat),
-			)
-		} else {
-			middlewareChain = middleware.Chain(
-				middleware.Recovery(),
-				middleware.RequestID(),
-				middleware.Tracing(),
-				middleware.CORS(cfg.CORSAllowedOrigins),
-				middleware.RateLimitWithInterface(rateLimiter),
-				middleware.MaxBodySize(cfg.MaxRequestBodySize),
-				middleware.Logging(cfg.LogFormat),
-			)
-		}
-	} else {
-		if authEnabled {
-			middlewareChain = middleware.Chain(
-				middleware.Recovery(),
-				middleware.RequestID(),
-				middleware.Tracing(),
-				middleware.CORS(cfg.CORSAllowedOrigins),
-				middleware.APIKeyAuth(apiKeyStore),
-				middleware.MaxBodySize(cfg.MaxRequestBodySize),
-				middleware.Logging(cfg.LogFormat),
-			)
-		} else {
-			middlewareChain = middleware.Chain(
-				middleware.Recovery(),
-				middleware.RequestID(),
-				middleware.Tracing(),
-				middleware.CORS(cfg.CORSAllowedOrigins),
-				middleware.MaxBodySize(cfg.MaxRequestBodySize),
-				middleware.Logging(cfg.LogFormat),
-			)
-		}
+		apiMiddleware = append(apiMiddleware, middleware.RateLimitWithInterface(rateLimiter))
 	}
 
-	// Setup router
-	mux := http.NewServeMux()
+	// CORS (Positioned early to allow preflight, but after rate limit)
+	apiMiddleware = append(apiMiddleware, middleware.CORS(cfg.CORSAllowedOrigins))
 
-	// API endpoints
-	mux.HandleFunc("/v1/chat/completions", handler.ChatCompletionHandler)
-	mux.HandleFunc("/v1/embeddings", handler.EmbeddingsHandler)
-	mux.HandleFunc("/v1/models", handler.ModelsHandler)
-	mux.HandleFunc("/v1/models/load", handler.LoadModelHandler)
-	mux.HandleFunc("/v1/models/unload", handler.UnloadModelHandler)
+	// Authentication (If enabled)
+	if authEnabled {
+		apiMiddleware = append(apiMiddleware, middleware.APIKeyAuth(apiKeyStore))
+	}
 
-	// Health endpoints (K8s probes)
-	mux.HandleFunc("/health", handler.HealthHandler)
-	mux.HandleFunc("/health/live", handler.LivenessHandler)
-	mux.HandleFunc("/health/ready", handler.ReadinessHandler)
-	mux.HandleFunc("/health/startup", handler.StartupHandler)
+	// Safety & Defaults
+	apiMiddleware = append(apiMiddleware,
+		middleware.MaxBodySize(cfg.MaxRequestBodySize),
+		middleware.ContentType("application/json"),
+	)
 
-	// Metrics endpoint
-	mux.HandleFunc("/metrics", handler.MetricsHandler)
+	apiChain := middleware.Chain(apiMiddleware...)
 
-	// Root info endpoint
-	mux.HandleFunc("/", rootHandler)
+	// ========================================================================
+	// Routing Strategy
+	// ========================================================================
 
-	// Apply middleware
-	httpHandler := middlewareChain(mux)
+	rootMux := http.NewServeMux()
+
+	// --- 1. Health & Custom (Protected only by Global Chain) ---
+	// We use a separate mux for health to avoid API middleware (Auth/RateLimit)
+	healthMux := http.NewServeMux()
+	healthMux.HandleFunc("/health", handler.HealthHandler)
+	healthMux.HandleFunc("/health/live", handler.LivenessHandler)
+	healthMux.HandleFunc("/health/ready", handler.ReadinessHandler)
+	healthMux.HandleFunc("/health/startup", handler.StartupHandler)
+	healthMux.HandleFunc("/metrics", handler.MetricsHandler)
+	healthMux.HandleFunc("/", rootHandler) // Root info
+
+	// Mount Health on Root
+	// Note: We mount individual paths or the prefix.
+	// Since /health is a prefix for others, we can handle it specifically.
+	rootMux.Handle("/health", healthMux)
+	rootMux.Handle("/health/", healthMux)
+	rootMux.Handle("/metrics", healthMux)
+	rootMux.Handle("/", healthMux) // Root handler fallback
+
+	// --- 2. API V1 (Protected by API Chain + Global Chain) ---
+	apiMux := http.NewServeMux()
+	apiMux.HandleFunc("/v1/chat/completions", handler.ChatCompletionHandler)
+	apiMux.HandleFunc("/v1/embeddings", handler.EmbeddingsHandler)
+	apiMux.HandleFunc("/v1/models", handler.ModelsHandler)
+	apiMux.HandleFunc("/v1/models/load", handler.LoadModelHandler)
+	apiMux.HandleFunc("/v1/models/unload", handler.UnloadModelHandler)
+
+	// Wrap API mux with API Chain
+	apiHandler := apiChain(apiMux)
+
+	// Mount API on Root
+	rootMux.Handle("/v1/", apiHandler)
+
+	// Wrap Root with Global Chain
+	finalHandler := globalChain(rootMux)
 
 	// Create server with timeouts
 	server := &http.Server{
 		Addr:         cfg.Address(),
-		Handler:      httpHandler,
+		Handler:      finalHandler,
 		ReadTimeout:  cfg.ReadTimeout,
 		WriteTimeout: cfg.WriteTimeout,
 		IdleTimeout:  cfg.IdleTimeout,

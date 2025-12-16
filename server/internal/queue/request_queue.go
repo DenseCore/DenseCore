@@ -16,6 +16,7 @@ type QueuedRequest struct {
 	Priority    RequestPriority
 	EnqueueTime time.Time
 	MaxTokens   int
+	JSONMode    bool
 	Prompt      string
 	Context     context.Context
 	ResultChan  chan interface{}
