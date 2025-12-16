@@ -289,6 +289,14 @@ struct EngineState {
   int max_models = 5;
   std::mutex models_mu;
 
+  // NUMA binding configuration (-1 = auto, >= 0 = specific node)
+  int numa_node_id = -1;
+
+  // Thread pinning policy for compute threads
+  // 0 = SCATTER (maximize L3/bandwidth, best for latency-sensitive single-user)
+  // 1 = COMPACT (share L2, leave room for other processes, best for throughput)
+  int pinning_policy = 0; // Default: SCATTER
+
   // Advanced scheduler (vLLM-style)
   std::unique_ptr<densecore::Scheduler> scheduler; // Smart pointer ownership
 

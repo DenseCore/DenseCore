@@ -1,6 +1,7 @@
 #include "inference.h"
 #include "flash_attention.h"
-#include "ggml.h" // Required for ggml_tensor definition
+#include "ggml.h"              // Required for ggml_tensor definition
+#include "hardware_topology.h" // For compute thread affinity
 
 #ifndef GGML_KQ_MASK_PAD
 #define GGML_KQ_MASK_PAD 32
@@ -153,6 +154,10 @@ struct INT4GemmUserData {
  */
 void cb_int4_gemm(struct ggml_tensor *dst, const struct ggml_tensor *src,
                   int ith, int nth, void *userdata) {
+  // Pin this GGML worker thread on first invocation (thread-local, O(1) after
+  // first call)
+  densecore::HardwareTopology::GetInstance().PinComputeThread(ith);
+
   auto *ud = (INT4GemmUserData *)userdata;
   if (!ud || !ud->int4_weight)
     return;

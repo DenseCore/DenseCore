@@ -165,23 +165,35 @@ typedef void (*EmbeddingCallback)(const float *embedding, int size,
  * @param model_path Path to the GGUF model file (required)
  * @param reserved Reserved for future use (pass NULL)
  * @param threads Number of CPU threads to use (0 for auto-detect)
+ * @param numa_node_id NUMA node to bind memory and threads (-1 for
+ * auto/default)
+ * @param pinning_policy Thread pinning policy for compute threads:
+ *        - 0 = SCATTER (default): Distribute threads across physical cores,
+ *          maximizes L3 cache and memory bandwidth. Best for latency-sensitive
+ *          single-user workloads.
+ *        - 1 = COMPACT: Pack threads on adjacent cores, shares L2 cache.
+ *          Best for throughput-oriented batch processing, leaves cores for
+ *          other processes.
  * @return Handle to the initialized engine, or NULL on failure
  *
  * @note The engine must be freed with FreeEngine() when no longer needed.
+ * @note For multi-socket servers, specifying numa_node_id can significantly
+ *       improve performance by reducing cross-socket memory access.
  *
  * @see FreeEngine()
  *
  * Example:
  * @code
- * DenseCoreHandle engine = InitEngine("model.gguf", NULL, 4);
- * if (!engine) {
- *     fprintf(stderr, "Failed to initialize engine\n");
- *     return -1;
- * }
+ * // Auto-detect NUMA with SCATTER pinning (default)
+ * DenseCoreHandle engine = InitEngine("model.gguf", NULL, 4, -1, 0);
+ *
+ * // NUMA node 0 with COMPACT pinning for batch throughput
+ * DenseCoreHandle engine = InitEngine("model.gguf", NULL, 4, 0, 1);
  * @endcode
  */
 DENSECORE_API DenseCoreHandle InitEngine(const char *model_path,
-                                         const char *reserved, int threads);
+                                         const char *reserved, int threads,
+                                         int numa_node_id, int pinning_policy);
 
 /**
  * Submit a request to the DenseCore engine (Non-blocking)

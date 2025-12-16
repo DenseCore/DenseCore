@@ -2,6 +2,7 @@
 #define DENSECORE_KV_CACHE_H
 
 #include "model_types.h"
+#include "numa_allocator.h"
 #include <unordered_map>
 
 // ============================================================================
@@ -164,6 +165,13 @@ struct PagedKVCache {
   // Cache type
   ggml_type cache_type;
 
+  // NUMA allocation tracking for proper cleanup
+  void *numa_buffer = nullptr; // Pointer to NUMA-allocated buffer (if used)
+  size_t numa_buffer_size = 0; // Size of NUMA buffer for deallocation
+  int numa_node_id = -1;       // NUMA node where buffer was allocated
+  densecore::AllocationType numa_allocation_type =
+      densecore::AllocationType::Aligned;
+
   ~PagedKVCache();
 
   // -------------------------------------------------------------------------
@@ -241,8 +249,11 @@ struct PagedKVCache {
 // ============================================================================
 
 // Initialize Paged KV Cache
+// numa_node_id: -1 for default allocation, >= 0 to bind memory to specific NUMA
+// node
 PagedKVCache *InitPagedKVCache(TransformerModel *model, int max_num_seqs,
-                               int max_seq_len, ggml_type type = GGML_TYPE_F16);
+                               int max_seq_len, ggml_type type = GGML_TYPE_F16,
+                               int numa_node_id = -1);
 
 // ============================================================================
 // Backward Compatibility
