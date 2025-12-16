@@ -4,16 +4,23 @@ import (
 	"context"
 	"errors"
 
+	"fmt"
+
+	"github.com/google/uuid"
+
 	"descore-server/internal/domain"
+	"descore-server/internal/queue"
 )
 
 type ChatService struct {
 	modelService domain.ModelService
+	requestQueue *queue.RequestQueue
 }
 
-func NewChatService(modelService domain.ModelService) *ChatService {
+func NewChatService(modelService domain.ModelService, q *queue.RequestQueue) *ChatService {
 	return &ChatService{
 		modelService: modelService,
+		requestQueue: q,
 	}
 }
 
@@ -42,11 +49,40 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 	// Check if JSON mode is requested
 	jsonMode := req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object"
 
-	if jsonMode {
-		return engine.GenerateStreamWithFormat(ctx, prompt, req.MaxTokens, true, outputChan)
+	// Create QueuedRequest
+	queuedReq := &queue.QueuedRequest{
+		ID:          uuid.New().String(),
+		Priority:    queue.RequestPriority(0),     // Default priority
+		MaxTokens:   req.MaxTokens,
+		Prompt:      prompt,
+		JSONMode:    jsonMode,
+		Context:     ctx,
+		ResultChan:  make(chan interface{}, 1),
 	}
 
-	return engine.GenerateStream(ctx, prompt, req.MaxTokens, outputChan)
+	// Enqueue with backpressure
+	if !s.requestQueue.Enqueue(queuedReq) {
+		return domain.ErrServiceBusy // Need to define this or standard error
+	}
+
+	// Wait for worker to pick up the request
+	select {
+	case result := <-queuedReq.ResultChan:
+		switch v := result.(type) {
+		case error:
+			return v
+		case chan domain.StreamEvent:
+			// Stream tokens from worker to client
+			for event := range v {
+				outputChan <- event
+			}
+			return nil
+		default:
+			return fmt.Errorf("unexpected result type from worker")
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *ChatService) GetEmbeddings(req domain.EmbeddingRequest) ([]float32, error) {

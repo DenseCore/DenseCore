@@ -49,6 +49,7 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,6 +57,8 @@ import (
 
 	"descore-server/internal/domain"
 )
+
+var cleanupOnce sync.Once
 
 // DenseEngine wraps the C++ engine with thread safety
 type DenseEngine struct {
@@ -77,10 +80,18 @@ func NewDenseEngine(mainModelPath, draftModelPath string, threads int) (*DenseEn
 		defer C.free(unsafe.Pointer(cDraftPath))
 	}
 
-	handle := C.InitEngine(cMainPath, cDraftPath, C.int(threads))
+	// InitEngine(model_path, reserved, threads, numa_node_id, pinning_policy)
+	// numa_node_id=-1 (auto), pinning_policy=0 (SCATTER - default)
+	handle := C.InitEngine(cMainPath, cDraftPath, C.int(threads), C.int(-1), C.int(0))
 	if handle == nil {
 		return nil, fmt.Errorf("failed to initialize DenseCore engine")
 	}
+
+	// Ensure background cleanup ticker runs exactly once (global state)
+	cleanupOnce.Do(func() {
+		// Interval: 1 minute, TTL: 5 minutes
+		StartMapCleanupTicker(1*time.Minute, 5*time.Minute)
+	})
 
 	return &DenseEngine{
 		handle: handle,
@@ -104,8 +115,7 @@ func (e *DenseEngine) GenerateStream(ctx context.Context, prompt string, maxToke
 	// Call C wrapper
 	ret := C.SubmitRequestWrapper(e.handle, cPrompt, C.int(maxTokens), unsafe.Pointer(reqID))
 	if ret < 0 {
-		requestChannels.Delete(reqID)
-		completionChannels.Signal(reqID) // Clean up completion channel
+		Cleanup(reqID)
 		return fmt.Errorf("submission failed with error code %d", ret)
 	}
 
@@ -138,8 +148,7 @@ func (e *DenseEngine) GenerateStreamWithFormat(ctx context.Context, prompt strin
 	// Call C wrapper with format
 	ret := C.SubmitRequestWithFormatWrapper(e.handle, cPrompt, C.int(maxTokens), C.int(jsonModeInt), unsafe.Pointer(reqID))
 	if ret < 0 {
-		requestChannels.Delete(reqID)
-		completionChannels.Signal(reqID) // Clean up completion channel
+		Cleanup(reqID)
 		return fmt.Errorf("submission failed with error code %d", ret)
 	}
 
@@ -157,7 +166,9 @@ func (e *DenseEngine) watchContext(ctx context.Context, reqID uintptr, completio
 	select {
 	case <-ctx.Done():
 		// Context cancelled - signal C++ to stop generating
-		e.CancelRequest(reqID)
+		log.Printf("Context cancelled for request %d, cleaning up...", reqID)
+		e.CancelRequest(reqID) // C++ side cancellation
+		Cleanup(reqID)         // Go side cleanup
 	case <-completionCh:
 		// Generation finished normally - exit silently
 	}
