@@ -7,31 +7,51 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"context"
 	"descore-server/internal/domain"
+	"descore-server/internal/queue"
 	"descore-server/internal/service"
 )
 
 // MockEngine implements a simple mock inference engine for testing
 type MockEngine struct {
-	generateFunc func(string, int) (string, error)
-	streamFunc   func(string, int, func(string)) error
+	generateStreamFunc func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error
 }
 
-func (m *MockEngine) Generate(prompt string, maxTokens int) (string, error) {
-	if m.generateFunc != nil {
-		return m.generateFunc(prompt, maxTokens)
+func (m *MockEngine) GenerateStream(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
+	if m.generateStreamFunc != nil {
+		return m.generateStreamFunc(ctx, prompt, maxTokens, outputChan)
 	}
-	return "mock response", nil
-}
-
-func (m *MockEngine) Stream(prompt string, maxTokens int, callback func(string)) error {
-	if m.streamFunc != nil {
-		return m.streamFunc(prompt, maxTokens, callback)
-	}
-	callback("mock")
-	callback(" stream")
+	// Default behavior: send one token and finish
+	go func() {
+		outputChan <- domain.StreamEvent{Token: "mock response", IsFinished: true}
+	}()
 	return nil
 }
+
+func (m *MockEngine) GenerateStreamWithFormat(ctx context.Context, prompt string, maxTokens int, jsonMode bool, outputChan chan domain.StreamEvent) error {
+	return m.GenerateStream(ctx, prompt, maxTokens, outputChan)
+}
+
+func (m *MockEngine) GetEmbeddings(prompt string) ([]float32, error) {
+	return []float32{0.1, 0.2, 0.3}, nil
+}
+
+func (m *MockEngine) GetEmbeddingsWithOptions(prompt string, poolingType string, normalize *bool) ([]float32, error) {
+	return []float32{0.1, 0.2, 0.3}, nil
+}
+
+func (m *MockEngine) GetMetrics() map[string]interface{} {
+	return map[string]interface{}{}
+}
+
+func (m *MockEngine) GetDetailedMetrics() *domain.DetailedMetrics {
+	return &domain.DetailedMetrics{}
+}
+
+func (m *MockEngine) Close() {}
+
+func (m *MockEngine) CancelRequest(reqID uintptr) {}
 
 // MockModelService provides a test model service
 type MockModelService struct {
@@ -46,7 +66,7 @@ func NewMockModelService() *MockModelService {
 	}
 }
 
-func (m *MockModelService) GetEngine() domain.InferenceEngine {
+func (m *MockModelService) GetEngine() domain.Engine {
 	return m.engine
 }
 
@@ -153,15 +173,26 @@ func TestChatCompletionHandler(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Setup
+			// Setup
 			mockModelService := NewMockModelService()
-			mockModelService.engine.generateFunc = func(prompt string, maxTokens int) (string, error) {
+			mockModelService.engine.generateStreamFunc = func(ctx context.Context, prompt string, maxTokens int, outputChan chan domain.StreamEvent) error {
 				if tt.mockError != nil {
-					return "", tt.mockError
+					return tt.mockError
 				}
-				return tt.mockResponse, nil
+				go func() {
+					outputChan <- domain.StreamEvent{Token: tt.mockResponse, IsFinished: true}
+					close(outputChan)
+				}()
+				return nil
 			}
 
-			chatService := service.NewChatService(mockModelService)
+			// Initialize Queue and Worker
+			q := queue.NewRequestQueue(10)
+			workerPool := service.NewQueueProcessor(q, mockModelService)
+			workerPool.Start(1)
+			defer workerPool.Stop()
+
+			chatService := service.NewChatService(mockModelService, q)
 			handler := NewHandler(chatService, mockModelService)
 
 			// Create request
@@ -224,7 +255,11 @@ func TestEmbeddingsHandler(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Setup
 			mockModelService := NewMockModelService()
-			chatService := service.NewChatService(mockModelService)
+			q := queue.NewRequestQueue(10)
+			// Worker not needed for embeddings (yet, unless embeddings are also queued? ChatService.GetEmbeddings calls engine directly in current implementation)
+			// Checking chat_service.go: GetEmbeddings uses s.modelService.GetEngine().GetEmbeddings() directly. Correct.
+			
+			chatService := service.NewChatService(mockModelService, q)
 			handler := NewHandler(chatService, mockModelService)
 
 			// Create request
@@ -244,7 +279,8 @@ func TestEmbeddingsHandler(t *testing.T) {
 
 func TestModelsHandler(t *testing.T) {
 	mockModelService := NewMockModelService()
-	chatService := service.NewChatService(mockModelService)
+	q := queue.NewRequestQueue(10)
+	chatService := service.NewChatService(mockModelService, q)
 	handler := NewHandler(chatService, mockModelService)
 
 	req := httptest.NewRequest("GET", "/v1/models", nil)
@@ -266,7 +302,8 @@ func TestModelsHandler(t *testing.T) {
 
 func TestHealthHandlers(t *testing.T) {
 	mockModelService := NewMockModelService()
-	chatService := service.NewChatService(mockModelService)
+	q := queue.NewRequestQueue(10)
+	chatService := service.NewChatService(mockModelService, q)
 	handler := NewHandler(chatService, mockModelService)
 
 	tests := []struct {
@@ -304,7 +341,12 @@ func TestHealthHandlers(t *testing.T) {
 // Benchmark tests
 func BenchmarkChatCompletion(b *testing.B) {
 	mockModelService := NewMockModelService()
-	chatService := service.NewChatService(mockModelService)
+	q := queue.NewRequestQueue(100) // Larger queue for benchmark
+	workerPool := service.NewQueueProcessor(q, mockModelService)
+	workerPool.Start(1)
+	defer workerPool.Stop()
+
+	chatService := service.NewChatService(mockModelService, q)
 	handler := NewHandler(chatService, mockModelService)
 
 	request := domain.ChatCompletionRequest{

@@ -31,6 +31,12 @@ func (p *QueueProcessor) Start(workers int) {
 	}
 }
 
+// Stop signals the worker pool to stop by closing the request queue.
+func (p *QueueProcessor) Stop() {
+	slog.Info("stopping worker pool")
+	p.queue.Close()
+}
+
 // workerLoop continuously processes requests from the queue.
 // It acts as a proxy, holding the "slot" until the request is fully streamed.
 func (p *QueueProcessor) workerLoop(workerID int) {

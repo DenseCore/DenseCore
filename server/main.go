@@ -260,6 +260,9 @@ func main() {
 		}
 
 		// Cleanup resources
+		slog.Info("stopping worker pool")
+		workerPool.Stop()
+		
 		slog.Info("unloading model")
 		if err := modelService.UnloadModel(); err != nil {
 			slog.Error("failed to unload model", slog.String("error", err.Error()))

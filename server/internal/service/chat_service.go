@@ -5,7 +5,8 @@ import (
 	"errors"
 
 	"fmt"
-	"time"
+
+	"github.com/google/uuid"
 
 	"descore-server/internal/domain"
 	"descore-server/internal/queue"
@@ -50,7 +51,7 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 
 	// Create QueuedRequest
 	queuedReq := &queue.QueuedRequest{
-		ID:          fmt.Sprintf("req-%d", time.Now().UnixNano()),
+		ID:          uuid.New().String(),
 		Priority:    queue.RequestPriority(0),     // Default priority
 		MaxTokens:   req.MaxTokens,
 		Prompt:      prompt,

@@ -102,17 +102,35 @@ func (m *RequestChannelMap) StartCleanupTicker(interval, ttl time.Duration) {
 }
 
 func (m *RequestChannelMap) cleanupStaleChannels(ttl time.Duration) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	threshold := time.Now().Add(-ttl)
+	var staleIDs []uintptr
+
+	// 1. Scan with Read Lock (Low contention)
+	m.mu.RLock()
 	for id, item := range m.channels {
 		if item.createdAt.Before(threshold) {
-			log.Printf("Cleaning up zombie request channel %d (age > %v)", id, ttl)
-			// Just delete, do not close. Let GC handle it to avoid "send on closed channel" panic in C++ callback
-			delete(m.channels, id)
-			
-			// Also clean up completion channel if it exists
+			staleIDs = append(staleIDs, id)
+		}
+	}
+	m.mu.RUnlock()
+
+	// 2. Delete with Write Lock (Short duration)
+	if len(staleIDs) > 0 {
+		m.mu.Lock()
+		for _, id := range staleIDs {
+			// Re-check existence to be safe (though delete is idempotent)
+			if item, exists := m.channels[id]; exists && item.createdAt.Before(threshold) {
+				log.Printf("Cleaning up zombie request channel %d (age > %v)", id, ttl)
+				
+				// Close channel to unblock workers
+				close(item.ch)
+				delete(m.channels, id)
+			}
+		}
+		m.mu.Unlock()
+
+		// 3. Signal completion watchers (Thread-safe, outside map lock)
+		for _, id := range staleIDs {
 			completionChannels.Signal(id)
 		}
 	}
@@ -221,6 +239,8 @@ func streamCallbackGateway(token *C.char, isFinished C.int, userData unsafe.Poin
 		if isFinished != 0 {
 			// Signal completion BEFORE cleanup to ensure watcher goroutine exits
 			completionChannels.Signal(id)
+			// Close the channel to unblock any range loops (e.g. in worker pool)
+			close(ch)
 			// Clean up request channel
 			requestChannels.Delete(id)
 		}
