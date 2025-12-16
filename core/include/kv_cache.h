@@ -2,6 +2,7 @@
 #define DENSECORE_KV_CACHE_H
 
 #include "model_types.h"
+#include "numa_allocator.h"
 #include <unordered_map>
 
 // ============================================================================
@@ -166,8 +167,10 @@ struct PagedKVCache {
 
   // NUMA allocation tracking for proper cleanup
   void *numa_buffer = nullptr; // Pointer to NUMA-allocated buffer (if used)
-  size_t numa_buffer_size = 0; // Size of NUMA buffer for munmap
+  size_t numa_buffer_size = 0; // Size of NUMA buffer for deallocation
   int numa_node_id = -1;       // NUMA node where buffer was allocated
+  densecore::AllocationType numa_allocation_type =
+      densecore::AllocationType::Aligned;
 
   ~PagedKVCache();
 

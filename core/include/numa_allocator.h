@@ -29,6 +29,16 @@
 namespace densecore {
 
 /**
+ * Allocation type for correct deallocation dispatch.
+ * Each allocation method requires its own deallocator.
+ */
+enum class AllocationType {
+  Aligned, ///< posix_memalign/_aligned_malloc: use free()/_aligned_free()
+  Mmap,    ///< mmap: use munmap()
+  Numa     ///< numa_alloc_*: use numa_free()
+};
+
+/**
  * NUMA-aware memory allocator
  *
  * Provides explicit NUMA node binding for large memory allocations.
@@ -91,9 +101,25 @@ public:
    * Result of preferred allocation with fallback status
    */
   struct AllocationResult {
-    void *ptr = nullptr;    ///< Allocated memory pointer
-    bool on_preferred_node; ///< True if allocated on requested NUMA node
-    int actual_node;        ///< Actual NUMA node (-1 if unknown/fallback)
+    void *ptr = nullptr; ///< Allocated memory pointer
+    size_t size = 0;     ///< Allocation size (for proper deallocation)
+    AllocationType allocation_type =
+        AllocationType::Aligned; ///< How memory was allocated
+    bool on_preferred_node =
+        false;            ///< True if allocated on requested NUMA node
+    int actual_node = -1; ///< Actual NUMA node (-1 if unknown/fallback)
+
+    /**
+     * Free the allocated memory using the correct deallocator.
+     * Sets ptr to nullptr after freeing.
+     */
+    void Free() {
+      if (!ptr)
+        return;
+      NumaAllocator::Free(ptr, size, allocation_type);
+      ptr = nullptr;
+      size = 0;
+    }
   };
 
   /**
@@ -128,6 +154,8 @@ public:
         // Touch pages to ensure physical allocation
         TouchPages(ptr, aligned_size);
         result.ptr = ptr;
+        result.size = aligned_size;
+        result.allocation_type = AllocationType::Numa;
         result.on_preferred_node = true;
         result.actual_node = preferred_node;
         return result;
@@ -143,6 +171,8 @@ public:
       if (ptr) {
         TouchPages(ptr, aligned_size);
         result.ptr = ptr;
+        result.size = aligned_size;
+        result.allocation_type = AllocationType::Numa;
         result.on_preferred_node = false;
         result.actual_node = GetMemoryNode(ptr);
         std::cerr << "[NumaAllocator] Fallback allocation on node "
@@ -155,6 +185,8 @@ public:
       if (ptr) {
         TouchPages(ptr, aligned_size);
         result.ptr = ptr;
+        result.size = aligned_size;
+        result.allocation_type = AllocationType::Numa;
         result.on_preferred_node = false;
         result.actual_node = -1; // Interleaved across nodes
         std::cerr << "[NumaAllocator] Using interleaved NUMA allocation"
@@ -168,6 +200,8 @@ public:
 
     // Final fallback: standard aligned allocation
     result.ptr = AllocateAligned(aligned_size, alignment);
+    result.size = aligned_size;
+    result.allocation_type = AllocationType::Aligned;
     result.on_preferred_node = false;
     result.actual_node = -1;
     if (result.ptr) {
@@ -178,24 +212,97 @@ public:
   }
 
   /**
-   * Free memory allocated by this allocator
+   * Free NUMA-allocated memory (from numa_alloc_*).
+   * MUST be used for memory from AllocatePreferred when it used libnuma.
    *
    * @param ptr Pointer to memory
-   * @param bytes Size of allocation (required for mmap-based allocations)
+   * @param bytes Size of allocation
    */
+  static void FreeNuma(void *ptr, size_t bytes) {
+    if (!ptr)
+      return;
+#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+    numa_free(ptr, bytes);
+#else
+    // If libnuma is not available, this path should never be taken.
+    // Fallback to aligned free as a safety measure.
+    (void)bytes;
+    FreeAligned(ptr);
+#endif
+  }
+
+  /**
+   * Free mmap-allocated memory.
+   *
+   * @param ptr Pointer to memory
+   * @param bytes Size of allocation (required for munmap)
+   */
+  static void FreeMmap(void *ptr, size_t bytes) {
+    if (!ptr)
+      return;
+#if defined(__linux__)
+    munmap(ptr, bytes);
+#else
+    // mmap not available on this platform
+    (void)bytes;
+    FreeAligned(ptr);
+#endif
+  }
+
+  /**
+   * Free memory allocated by this allocator using explicit allocation type.
+   * This is the preferred method as it dispatches to the correct deallocator.
+   *
+   * @param ptr Pointer to memory
+   * @param bytes Size of allocation (required for mmap/numa deallocation)
+   * @param type How the memory was allocated
+   */
+  static void Free(void *ptr, size_t bytes, AllocationType type) {
+    if (!ptr)
+      return;
+    switch (type) {
+    case AllocationType::Numa:
+      FreeNuma(ptr, bytes);
+      break;
+    case AllocationType::Mmap:
+      FreeMmap(ptr, bytes);
+      break;
+    case AllocationType::Aligned:
+    default:
+      FreeAligned(ptr);
+      break;
+    }
+  }
+
+  /**
+   * @deprecated Use Free(void*, size_t, AllocationType) instead.
+   * Legacy free function with heuristic-based deallocation.
+   * WARNING: This function uses a fragile heuristic and may cause memory
+   * leaks/corruption for NUMA-allocated memory. Prefer using
+   * AllocationResult::Free() or the explicit type-aware Free() overload.
+   *
+   * @param ptr Pointer to memory
+   * @param bytes Size of allocation
+   */
+  [[deprecated("Use Free(void*, size_t, AllocationType) or "
+               "AllocationResult::Free() instead")]]
   static void Free(void *ptr, size_t bytes) {
     if (!ptr)
       return;
 
 #if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
-    // Check if this was mmap-allocated by examining the pointer
-    // mmap returns page-aligned addresses
+    // LEGACY HEURISTIC: Try to guess allocation type from pointer alignment.
+    // WARNING: This is fragile! posix_memalign can also return page-aligned
+    // pointers. This path is kept only for backward compatibility.
     size_t page_size = GetPageSize();
     if (((uintptr_t)ptr & (page_size - 1)) == 0 && bytes >= page_size) {
-      // Likely mmap allocation
+      // Could be mmap OR numa_alloc. Since numa_free on mmap memory is UB,
+      // we conservatively use munmap. For true NUMA memory, this will leak.
       munmap(ptr, bytes);
       return;
     }
+#else
+    (void)bytes;
 #endif
     // Standard aligned free
     FreeAligned(ptr);
