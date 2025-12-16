@@ -24,6 +24,7 @@ try:
         AsyncCallbackManagerForLLMRun,
         CallbackManagerForLLMRun,
     )
+    from langchain_core.embeddings import Embeddings
     from langchain_core.language_models import LLM, BaseChatModel
     from langchain_core.messages import (
         AIMessage,
@@ -1084,3 +1085,125 @@ class DenseCoreChatModel(BaseChatModel):
             if run_manager:
                 await run_manager.on_llm_error(e)
             raise
+
+
+# ==============================================================================
+# Embeddings Wrapper for VectorStore Integration
+# ==============================================================================
+
+
+class DenseCoreEmbeddings(Embeddings):
+    """
+    LangChain Embeddings wrapper for DenseCore.
+
+    Enables seamless integration with LangChain VectorStores like FAISS, Chroma, etc.
+    Uses DenseCore's CPU-optimized embedding engine under the hood.
+
+    Args:
+        model_path: Path to GGUF embedding model (e.g., bge-small.gguf)
+        pooling_strategy: Pooling method ("mean", "cls", "last", "max")
+        normalize: Whether to L2 normalize embeddings for cosine similarity
+        threads: CPU threads for inference (0 = auto-detect)
+
+    Example:
+        >>> from densecore.integrations.langchain import DenseCoreEmbeddings
+        >>> from langchain_community.vectorstores import FAISS
+        >>>
+        >>> embeddings = DenseCoreEmbeddings(
+        ...     model_path="./bge-small.gguf",
+        ...     pooling_strategy="mean",
+        ...     normalize=True,
+        ... )
+        >>>
+        >>> # Create vector store
+        >>> vectorstore = FAISS.from_texts(
+        ...     ["Document 1", "Document 2", "Document 3"],
+        ...     embeddings
+        ... )
+        >>> results = vectorstore.similarity_search("query")
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        pooling_strategy: str = "mean",
+        normalize: bool = True,
+        threads: int = 0,
+    ) -> None:
+        """
+        Initialize DenseCoreEmbeddings.
+
+        Args:
+            model_path: Path to GGUF embedding model file
+            pooling_strategy: Pooling strategy ("mean", "cls", "last", "max")
+            normalize: L2 normalize embeddings (recommended for cosine similarity)
+            threads: Number of CPU threads (0 = auto-detect optimal count)
+        """
+        from ..embedding import EmbeddingConfig, EmbeddingModel
+
+        self._model_path = model_path
+        self._pooling_strategy = pooling_strategy
+        self._normalize = normalize
+        self._threads = threads
+
+        config = EmbeddingConfig(
+            pooling=pooling_strategy,
+            normalize=normalize,
+        )
+
+        self._model = EmbeddingModel(
+            model_path=model_path,
+            config=config,
+            threads=threads,
+            verbose=False,
+        )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """
+        Embed a list of documents.
+
+        Uses batch embedding API when available for optimal performance.
+
+        Args:
+            texts: List of document texts to embed
+
+        Returns:
+            List of embedding vectors (each as list of floats)
+        """
+        if not texts:
+            return []
+
+        # Use batch API if available, otherwise fall back to sequential
+        if hasattr(self._model, "_has_batch_embedding") and self._model._has_batch_embedding:
+            embeddings = self._model.embed_batch(texts, show_progress=False)
+        else:
+            embeddings = self._model.embed(texts)
+
+        # Convert numpy arrays to list format for LangChain compatibility
+        return embeddings.tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        """
+        Embed a single query string.
+
+        Args:
+            text: Query text to embed
+
+        Returns:
+            Embedding vector as list of floats
+        """
+        embedding = self._model.embed(text)
+        return embedding.tolist()
+
+    @property
+    def dimension(self) -> int:
+        """Return embedding dimension."""
+        return self._model.dimension
+
+    def __repr__(self) -> str:
+        return (
+            f"DenseCoreEmbeddings("
+            f"dim={self._model.dimension}, "
+            f"pooling='{self._pooling_strategy}', "
+            f"normalize={self._normalize})"
+        )
