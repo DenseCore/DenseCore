@@ -438,29 +438,42 @@ Low-level C API defined in `densecore.h`.
 
 ```c
 DenseCoreHandle InitEngine(
-    const char *main_path,
-    int threads
+    const char *model_path,
+    const char *reserved,       // NULL (reserved for future use)
+    int threads,
+    int numa_node_id,
+    int pinning_policy
 );
 ```
 
-Initialize the inference engine.
+Initialize the inference engine with NUMA-aware configuration.
 
 **Parameters:**
-- `main_path`: Path to main GGUF model
-- `draft_path`: Path to draft model (NULL if not using speculative decoding)
+- `model_path`: Path to GGUF model file
+- `reserved`: Reserved for future use (pass NULL)
 - `threads`: Number of threads (0 = auto-detect)
+- `numa_node_id`: NUMA node for memory/thread binding (-1 = auto)
+- `pinning_policy`: Thread pinning strategy
+  - `0` = SCATTER (distribute across cores for max bandwidth)
+  - `1` = COMPACT (pack threads, share L2 cache)
 
 **Returns:**
 - Opaque handle to engine, or NULL on failure
 
 **Example:**
 ```c
-DenseCoreHandle engine = InitEngine("model.gguf", 4);
+// Default: auto NUMA, SCATTER pinning
+DenseCoreHandle engine = InitEngine("model.gguf", NULL, 8, -1, 0);
 if (!engine) {
     fprintf(stderr, "Failed to initialize engine\n");
     return -1;
 }
+
+// Multi-socket: bind to NUMA node 1 with COMPACT pinning
+DenseCoreHandle engine2 = InitEngine("model.gguf", NULL, 8, 1, 1);
 ```
+
+> 📖 See [NUMA Optimization Guide](NUMA_OPTIMIZATION.md) for advanced configuration.
 
 ---
 
