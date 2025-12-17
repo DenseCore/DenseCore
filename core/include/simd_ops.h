@@ -1054,12 +1054,14 @@ inline void ApplyRoPE_AVX512(float *out, const float *in, const float *cos_sin,
   }
 }
 
-#else // Non-AVX512 fallback
+#endif // __AVX512F__
 
 /**
- * @brief Apply Rotary Positional Embedding (scalar fallback)
+ * @brief Apply Rotary Positional Embedding (scalar implementation)
+ *
+ * Explicit scalar fallback for non-AVX512 builds or when scalar is preferred.
  */
-inline void ApplyRoPE_AVX512(float *out, const float *in, const float *cos_sin,
+inline void ApplyRoPE_Scalar(float *out, const float *in, const float *cos_sin,
                              const int *positions, int n_tokens, int head_dim,
                              int rope_dim, int ith = 0, int nth = 1) {
   const int tokens_per_thread = (n_tokens + nth - 1) / nth;
@@ -1090,55 +1092,27 @@ inline void ApplyRoPE_AVX512(float *out, const float *in, const float *cos_sin,
   }
 }
 
-#endif // __AVX512F__
-
 /**
- * @brief Apply RoPE to a batch of heads (for multi-head attention)
+ * @brief Apply Rotary Positional Embedding (unified entry point)
  *
- * Processes [n_tokens, n_heads, head_dim] tensor with same positions for all
- * heads.
- *
- * @param out Output [n_tokens, n_heads, head_dim]
- * @param in Input [n_tokens, n_heads, head_dim]
- * @param cos_sin Pre-computed [max_seq, head_dim]
- * @param positions [n_tokens]
- * @param n_tokens Number of tokens
- * @param n_heads Number of heads
- * @param head_dim Head dimension
- * @param rope_dim RoPE dimension
+ * Automatically dispatches to AVX-512 or scalar implementation based on
+ * compile-time detection.
  */
-inline void ApplyRoPE_MultiHead(float *out, const float *in,
-                                const float *cos_sin, const int *positions,
-                                int n_tokens, int n_heads, int head_dim,
-                                int rope_dim) {
-  const int stride = n_heads * head_dim;
-
-  for (int t = 0; t < n_tokens; t++) {
-    const int pos = positions[t];
-    const float *cs_ptr = cos_sin + pos * head_dim;
-
-    for (int h = 0; h < n_heads; h++) {
-      const float *in_ptr = in + t * stride + h * head_dim;
-      float *out_ptr = out + t * stride + h * head_dim;
-
-      // Apply RoPE to this head
-      for (int d = 0; d < rope_dim; d += 2) {
-        float x0 = in_ptr[d];
-        float x1 = in_ptr[d + 1];
-        float cos_val = cs_ptr[d];
-        float sin_val = cs_ptr[d + 1];
-
-        out_ptr[d] = x0 * cos_val - x1 * sin_val;
-        out_ptr[d + 1] = x0 * sin_val + x1 * cos_val;
-      }
-
-      // Copy dimensions beyond rope_dim
-      for (int dd = rope_dim; dd < head_dim; dd++) {
-        out_ptr[dd] = in_ptr[dd];
-      }
-    }
-  }
+inline void ApplyRoPE(float *out, const float *in, const float *cos_sin,
+                      const int *positions, int n_tokens, int head_dim,
+                      int rope_dim, int ith = 0, int nth = 1) {
+#if defined(__AVX512F__)
+  ApplyRoPE_AVX512(out, in, cos_sin, positions, n_tokens, head_dim, rope_dim,
+                   ith, nth);
+#else
+  ApplyRoPE_Scalar(out, in, cos_sin, positions, n_tokens, head_dim, rope_dim,
+                   ith, nth);
+#endif
 }
+
+// NOTE: ApplyRoPE_MultiHead was removed as it was unused.
+// If multi-head RoPE is needed, use cb_rope_avx512 callback in inference.cpp
+// which handles the [head_dim, n_heads, n_tokens] GGML tensor layout.
 
 // =============================================================================
 // INT4 Quantized GEMM (AVX512) - HIGHLY OPTIMIZED
@@ -1497,17 +1471,19 @@ inline __m512 _mm512_fast_exp_ps(__m512 x) {
   __m512i k = _mm512_cvttps_epi32(z);
   __m512 f = _mm512_sub_ps(x, _mm512_mul_ps(_mm512_cvtepi32_ps(k), c_log2));
 
-  // Polynomial approximation for 2^f (f in [0,1])
-  const __m512 c1 = _mm512_set1_ps(1.0f);
-  const __m512 c2 = _mm512_set1_ps(0.69314718f);
-  const __m512 c3 = _mm512_set1_ps(0.24022651f);
-  const __m512 c4 = _mm512_set1_ps(0.05550410f);
+  // Polynomial approximation for 2^f (f in [0,1]) via Taylor series:
+  // 2^f ≈ c0 + c1*f + c2*f² + c3*f³
+  // where c0=1, c1=ln(2), c2=ln(2)²/2!, c3=ln(2)³/3!
+  const __m512 c0 = _mm512_set1_ps(1.0f);        // 1.0
+  const __m512 c1 = _mm512_set1_ps(0.69314718f); // ln(2)
+  const __m512 c2 = _mm512_set1_ps(0.24022651f); // ln(2)^2 / 2
+  const __m512 c3 = _mm512_set1_ps(0.05550410f); // ln(2)^3 / 6
 
-  __m512 poly = c1;
+  // Horner's method: ((c3*f + c2)*f + c1)*f + c0
+  __m512 poly = c3;
   poly = _mm512_fmadd_ps(poly, f, c2);
-  poly = _mm512_fmadd_ps(poly, f, c3);
-  poly = _mm512_fmadd_ps(poly, f, c4);
   poly = _mm512_fmadd_ps(poly, f, c1);
+  poly = _mm512_fmadd_ps(poly, f, c0);
 
   // 2^k using bit manipulation
   k = _mm512_slli_epi32(_mm512_add_epi32(k, _mm512_set1_epi32(127)), 23);

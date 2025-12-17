@@ -41,13 +41,15 @@ struct FlashAttentionConfig {
  * Pre-allocate to avoid repeated allocations
  */
 struct FlashAttentionScratch {
-  std::vector<float> qk_block; // [block_m, block_n]
-  std::vector<float> pv_block; // [block_m, head_dim]
-  std::vector<float> row_max;  // [block_m]
-  std::vector<float> row_sum;  // [block_m]
-  std::vector<float> new_max;  // [block_m]
-  std::vector<float> exp_diff; // [block_m]
-  std::vector<float> o_block;  // [block_m, head_dim]
+  std::vector<float> qk_block;  // [block_m, block_n]
+  std::vector<float> pv_block;  // [block_m, head_dim]
+  std::vector<float> row_max;   // [block_m] - also used as block_max
+  std::vector<float> row_sum;   // [block_m] - also used as block_sum
+  std::vector<float> new_max;   // [block_m]
+  std::vector<float> exp_diff;  // [block_m]
+  std::vector<float> o_block;   // [block_m, head_dim]
+  std::vector<float> alpha_buf; // [block_m] - rescaling factor for previous O
+  std::vector<float> beta_buf;  // [block_m] - rescaling factor for new PV
 
   void Resize(int block_m, int block_n, int head_dim) {
     qk_block.resize(block_m * block_n);
@@ -57,6 +59,8 @@ struct FlashAttentionScratch {
     new_max.resize(block_m);
     exp_diff.resize(block_m);
     o_block.resize(block_m * head_dim);
+    alpha_buf.resize(block_m);
+    beta_buf.resize(block_m);
   }
 };
 
@@ -94,10 +98,6 @@ inline void FlashAttentionForward(const float *Q, const float *K,
   std::vector<float> L(seq_len_q, 0.0f);   // Cumulative sum of exp
   std::vector<float> M(seq_len_q, -1e10f); // Max value seen so far
 
-  // Temporary buffers for rescaling factors
-  std::vector<float> alpha_buf(Br);
-  std::vector<float> beta_buf(Br);
-
   // Process in tiles (outer KV loop for better cache locality)
   for (int j = 0; j < seq_len_kv; j += Bc) {
     const int kv_end = std::min(j + Bc, seq_len_kv);
@@ -127,9 +127,9 @@ inline void FlashAttentionForward(const float *Q, const float *K,
       // Step 3: Online softmax update (vectorized)
       bool first_kv_block = (j == 0);
 
-      // Use local buffers for this block's max/sum
-      std::vector<float> block_max(q_len);
-      std::vector<float> block_sum(q_len);
+      // Reuse scratch buffers for block_max/block_sum (no heap allocation)
+      float *block_max = scratch.row_max.data();
+      float *block_sum = scratch.row_sum.data();
 
       // Copy relevant portion of global stats
       for (int qi = 0; qi < q_len; qi++) {
@@ -137,9 +137,8 @@ inline void FlashAttentionForward(const float *Q, const float *K,
         block_sum[qi] = L[i + qi];
       }
 
-      simd::SoftmaxBlock_AVX512(scratch.qk_block.data(), block_max.data(),
-                                block_sum.data(), q_len, kv_len,
-                                first_kv_block);
+      simd::SoftmaxBlock_AVX512(scratch.qk_block.data(), block_max, block_sum,
+                                q_len, kv_len, first_kv_block);
 
       // Step 4: Compute P @ V for this tile
       // pv[qi] = sum_ki(softmax[qi, ki] * V[j + ki])
@@ -149,6 +148,9 @@ inline void FlashAttentionForward(const float *Q, const float *K,
 
       // Step 5: Update output with rescaling
       // O = (alpha * L * O + pv) / L_new
+      float *alpha_ptr = scratch.alpha_buf.data();
+      float *beta_ptr = scratch.beta_buf.data();
+
       for (int qi = 0; qi < q_len; qi++) {
         const int global_qi = i + qi;
 
@@ -162,8 +164,8 @@ inline void FlashAttentionForward(const float *Q, const float *K,
             (L_old > 0) ? (expf(m_old - m_new) * L_old / L_new) : 0.0f;
         float beta_val = 1.0f / L_new;
 
-        alpha_buf[qi] = alpha_val;
-        beta_buf[qi] = beta_val;
+        alpha_ptr[qi] = alpha_val;
+        beta_ptr[qi] = beta_val;
 
         // Update running stats
         M[global_qi] = m_new;
@@ -172,8 +174,7 @@ inline void FlashAttentionForward(const float *Q, const float *K,
 
       // Apply rescaling with vectorized kernel
       simd::UpdateOutput_AVX512(O + i * head_dim, scratch.pv_block.data(),
-                                alpha_buf.data(), beta_buf.data(), q_len,
-                                head_dim);
+                                alpha_ptr, beta_ptr, q_len, head_dim);
     }
   }
 }

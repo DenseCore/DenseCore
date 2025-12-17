@@ -111,7 +111,60 @@ void cb_rope_avx512(struct ggml_tensor *dst, const struct ggml_tensor *src,
           (const float *)src->data + head_dim * (h + n_heads * t);
       float *out_ptr = (float *)dst->data + head_dim * (h + n_heads * t);
 
-      // Apply RoPE to pairs
+#if defined(__AVX512F__)
+      // AVX-512 path: process 16 floats (8 pairs) at a time
+      int d = 0;
+      for (; d + 16 <= rope_dim; d += 16) {
+        // Load input: [x0, x1, x2, x3, ..., x14, x15]
+        __m512 x = _mm512_loadu_ps(in_ptr + d);
+
+        // Load cos/sin: [c0, s0, c1, s1, c2, s2, ...]
+        __m512 cs = _mm512_loadu_ps(cs_ptr + d);
+
+        // Deinterleave cos and sin using permute
+        // cos = [c0, c0, c1, c1, ...]  sin = [s0, s0, s1, s1, ...]
+        const __m512i idx_cos = _mm512_setr_epi32(0, 0, 2, 2, 4, 4, 6, 6, 8, 8,
+                                                  10, 10, 12, 12, 14, 14);
+        const __m512i idx_sin = _mm512_setr_epi32(1, 1, 3, 3, 5, 5, 7, 7, 9, 9,
+                                                  11, 11, 13, 13, 15, 15);
+
+        __m512 cos_vec = _mm512_permutexvar_ps(idx_cos, cs);
+        __m512 sin_vec = _mm512_permutexvar_ps(idx_sin, cs);
+
+        // Create swapped x: [x1, x0, x3, x2, x5, x4, ...]
+        const __m512i idx_swap = _mm512_setr_epi32(1, 0, 3, 2, 5, 4, 7, 6, 9, 8,
+                                                   11, 10, 13, 12, 15, 14);
+        __m512 x_swap = _mm512_permutexvar_ps(idx_swap, x);
+
+        // RoPE formula:
+        //   x'_{2d}   = x_{2d} * cos - x_{2d+1} * sin  (even positions)
+        //   x'_{2d+1} = x_{2d} * sin + x_{2d+1} * cos  (odd positions)
+        // Alternating sign: [-1, +1, -1, +1, ...]
+        const __m512 sign_mask =
+            _mm512_set_ps(1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
+                          1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f);
+
+        // out = x * cos + x_swap * sign * sin
+        __m512 result = _mm512_mul_ps(x, cos_vec);
+        __m512 term2 = _mm512_mul_ps(x_swap, sin_vec);
+        term2 = _mm512_mul_ps(term2, sign_mask);
+        result = _mm512_add_ps(result, term2);
+
+        _mm512_storeu_ps(out_ptr + d, result);
+      }
+
+      // Handle remainder (less than 16 floats)
+      for (; d < rope_dim; d += 2) {
+        float x0 = in_ptr[d];
+        float x1 = in_ptr[d + 1];
+        float cos_val = cs_ptr[d];
+        float sin_val = cs_ptr[d + 1];
+
+        out_ptr[d] = x0 * cos_val - x1 * sin_val;
+        out_ptr[d + 1] = x0 * sin_val + x1 * cos_val;
+      }
+#else
+      // Scalar fallback for non-AVX512 builds
       for (int d = 0; d < rope_dim; d += 2) {
         float x0 = in_ptr[d];
         float x1 = in_ptr[d + 1];
@@ -121,6 +174,7 @@ void cb_rope_avx512(struct ggml_tensor *dst, const struct ggml_tensor *src,
         out_ptr[d] = x0 * cos_val - x1 * sin_val;
         out_ptr[d + 1] = x0 * sin_val + x1 * cos_val;
       }
+#endif
 
       // Copy dimensions beyond rope_dim unchanged
       for (int dd = rope_dim; dd < head_dim; dd++) {
@@ -151,26 +205,13 @@ void InitRoPETable(TransformerModel *model) {
   const int head_dim = model->hparams.n_embd / model->hparams.n_head;
   const float freq_base = model->hparams.rope_freq_base;
 
-  // Allocate table: [n_ctx, head_dim] interleaved [cos, sin] pairs
-  model->rope_cos_sin.resize(static_cast<size_t>(n_ctx) * head_dim);
+  // Reuse RoPETable from simd_ops.h to avoid code duplication
+  densecore::simd::RoPETable table;
+  table.Init(n_ctx, head_dim, freq_base);
+
+  // Move the computed data to the model
+  model->rope_cos_sin = std::move(table.cos_sin);
   model->rope_head_dim = head_dim;
-
-  // Pre-compute frequencies: theta[d] = 1 / (freq_base ** (2d / head_dim))
-  std::vector<float> freqs(head_dim / 2);
-  for (int d = 0; d < head_dim / 2; d++) {
-    float exp_val = (2.0f * d) / static_cast<float>(head_dim);
-    freqs[d] = 1.0f / std::pow(freq_base, exp_val);
-  }
-
-  // Compute cos/sin for all positions
-  for (int pos = 0; pos < n_ctx; pos++) {
-    for (int d = 0; d < head_dim / 2; d++) {
-      float angle = static_cast<float>(pos) * freqs[d];
-      // Interleaved storage for cache efficiency
-      model->rope_cos_sin[pos * head_dim + 2 * d] = std::cos(angle);
-      model->rope_cos_sin[pos * head_dim + 2 * d + 1] = std::sin(angle);
-    }
-  }
 }
 
 // Custom callback to load K/V history from cache and append current K/V
