@@ -42,6 +42,9 @@ struct ggml_tensor *BuildTransformerGraph(
     struct ggml_cgraph *gf = nullptr, struct ggml_tensor **out_embd = nullptr,
     struct ggml_tensor **out_pos = nullptr);
 
+// Initialize pre-computed RoPE cos/sin table for optimized inference
+void InitRoPETable(TransformerModel *model);
+
 // Grammar constraint for structured output (e.g., JSON mode)
 enum class JSONState {
   EXPECT_OBJECT_START, // Expecting '{'

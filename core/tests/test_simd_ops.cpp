@@ -298,3 +298,108 @@ TEST(SimdOps, SimdCopy_Large) {
     EXPECT_EQ(dst[i], src[i]);
   }
 }
+
+// =============================================================================
+// RoPE (Rotary Positional Embedding) Tests
+// =============================================================================
+
+TEST(SimdOps, RoPETable_Init) {
+  RoPETable table;
+  table.Init(128, 64, 10000.0f);
+
+  EXPECT_EQ(table.max_seq_len, 128);
+  EXPECT_EQ(table.head_dim, 64);
+  EXPECT_EQ(table.cos_sin.size(), static_cast<size_t>(128 * 64));
+
+  // Position 0 should have cos=1, sin=0 for first pair
+  EXPECT_NEAR(table.Cos(0, 0), 1.0f, 1e-5);
+  EXPECT_NEAR(table.Sin(0, 0), 0.0f, 1e-5);
+
+  // Position 1 should have non-trivial values
+  // theta_0 = 1/10000^(0/64) = 1.0, so angle = 1 * 1.0 = 1.0 rad
+  EXPECT_NEAR(table.Cos(1, 0), std::cos(1.0f), 1e-5);
+  EXPECT_NEAR(table.Sin(1, 0), std::sin(1.0f), 1e-5);
+}
+
+TEST(SimdOps, ApplyRoPE_AVX512_Basic) {
+  constexpr int n_tokens = 4;
+  constexpr int head_dim = 16;
+  constexpr int rope_dim = 16;
+
+  // Initialize RoPE table
+  RoPETable table;
+  table.Init(128, head_dim, 10000.0f);
+
+  // Create input: [n_tokens, head_dim]
+  std::vector<float> input(n_tokens * head_dim);
+  for (int i = 0; i < n_tokens * head_dim; i++) {
+    input[i] = static_cast<float>(i % 10) * 0.1f;
+  }
+
+  std::vector<float> output(n_tokens * head_dim);
+  std::vector<float> reference(n_tokens * head_dim);
+
+  // Positions: [0, 1, 2, 3]
+  std::vector<int> positions = {0, 1, 2, 3};
+
+  // Apply RoPE using kernel
+  ApplyRoPE_AVX512(output.data(), input.data(), table.cos_sin.data(),
+                   positions.data(), n_tokens, head_dim, rope_dim);
+
+  // Compute reference using scalar
+  for (int t = 0; t < n_tokens; t++) {
+    const int pos = positions[t];
+    const float *cs_ptr = table.cos_sin.data() + pos * head_dim;
+
+    for (int d = 0; d < rope_dim; d += 2) {
+      float x0 = input[t * head_dim + d];
+      float x1 = input[t * head_dim + d + 1];
+      float cos_val = cs_ptr[d];
+      float sin_val = cs_ptr[d + 1];
+
+      reference[t * head_dim + d] = x0 * cos_val - x1 * sin_val;
+      reference[t * head_dim + d + 1] = x0 * sin_val + x1 * cos_val;
+    }
+  }
+
+  // Compare
+  for (int i = 0; i < n_tokens * head_dim; i++) {
+    EXPECT_NEAR(output[i], reference[i], 1e-5) << "Mismatch at index " << i;
+  }
+}
+
+TEST(SimdOps, ApplyRoPE_AVX512_PartialRopeDim) {
+  constexpr int n_tokens = 2;
+  constexpr int head_dim = 32;
+  constexpr int rope_dim = 16; // Only rotate first 16 dims
+
+  RoPETable table;
+  table.Init(64, head_dim, 10000.0f);
+
+  std::vector<float> input(n_tokens * head_dim, 1.0f);
+  std::vector<float> output(n_tokens * head_dim, 0.0f);
+  std::vector<int> positions = {5, 10};
+
+  ApplyRoPE_AVX512(output.data(), input.data(), table.cos_sin.data(),
+                   positions.data(), n_tokens, head_dim, rope_dim);
+
+  // Dimensions beyond rope_dim should be unchanged
+  for (int t = 0; t < n_tokens; t++) {
+    for (int d = rope_dim; d < head_dim; d++) {
+      EXPECT_FLOAT_EQ(output[t * head_dim + d], input[t * head_dim + d])
+          << "Non-rotated dimension was modified at token " << t << " dim "
+          << d;
+    }
+  }
+
+  // Rotated dimensions should be different (in general)
+  // At position 5 with non-zero input, cos/sin != (1, 0), so output != input
+  bool has_difference = false;
+  for (int d = 0; d < rope_dim; d++) {
+    if (std::abs(output[d] - input[d]) > 1e-6) {
+      has_difference = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(has_difference) << "Rotated dimensions should differ from input";
+}

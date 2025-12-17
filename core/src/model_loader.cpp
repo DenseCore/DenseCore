@@ -1,4 +1,5 @@
 #include "model_loader.h"
+#include "inference.h" // For InitRoPETable
 #include <ggml-cpu.h>
 #include <iostream>
 #include <string>
@@ -408,6 +409,13 @@ TransformerModel *LoadGGUFModel(const char *path) {
   std::cout << "[DenseCore] Head dimensions: n_embd_head_k="
             << model->hparams.n_embd_head_k
             << ", n_embd_head_v=" << model->hparams.n_embd_head_v << std::endl;
+
+  // Initialize pre-computed RoPE table for optimized inference
+  std::cout << "[DenseCore] Initializing RoPE table..." << std::endl;
+  InitRoPETable(model);
+  std::cout << "[DenseCore] RoPE table initialized: "
+            << model->rope_cos_sin.size() << " values (" << model->hparams.n_ctx
+            << " positions × " << model->rope_head_dim << " dims)" << std::endl;
 
   std::cout << "[DenseCore] Model loaded successfully" << std::endl;
   return model;

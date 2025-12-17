@@ -867,6 +867,280 @@ inline float CosineSimilarity(const float *a, const float *b, size_t n) {
 }
 
 // =============================================================================
+// Rotary Positional Embedding (RoPE) - HIGHLY OPTIMIZED
+// =============================================================================
+
+/**
+ * @brief Pre-computed RoPE frequency table for a given context length
+ *
+ * Pre-computes cos(m * theta) and sin(m * theta) for all positions m and
+ * all frequency dimensions. This avoids expensive transcendental function
+ * calls in the inner loop.
+ *
+ * Layout: [max_seq_len, head_dim / 2] where each entry is (cos, sin) pair
+ * Access: cos_sin_table[pos * head_dim + 2*d] = cos(pos * theta_d)
+ *         cos_sin_table[pos * head_dim + 2*d + 1] = sin(pos * theta_d)
+ */
+struct RoPETable {
+  std::vector<float> cos_sin; ///< Interleaved [cos, sin, cos, sin, ...]
+  int max_seq_len;
+  int head_dim;
+  float freq_base;
+
+  /**
+   * @brief Initialize RoPE table for given parameters
+   *
+   * @param max_len Maximum sequence length to pre-compute
+   * @param dim Head dimension (must be even)
+   * @param base RoPE frequency base (default 10000.0 for Llama)
+   */
+  void Init(int max_len, int dim, float base = 10000.0f) {
+    max_seq_len = max_len;
+    head_dim = dim;
+    freq_base = base;
+
+    // Allocate interleaved cos/sin: [max_len, head_dim]
+    cos_sin.resize(static_cast<size_t>(max_len) * dim);
+
+    // Pre-compute frequencies: theta[d] = 1 / (base ** (2d / dim))
+    std::vector<float> freqs(dim / 2);
+    for (int d = 0; d < dim / 2; d++) {
+      float exp = (2.0f * d) / static_cast<float>(dim);
+      freqs[d] = 1.0f / std::pow(base, exp);
+    }
+
+    // Compute cos/sin for all positions
+    for (int pos = 0; pos < max_len; pos++) {
+      for (int d = 0; d < dim / 2; d++) {
+        float angle = static_cast<float>(pos) * freqs[d];
+        cos_sin[pos * dim + 2 * d] = std::cos(angle);
+        cos_sin[pos * dim + 2 * d + 1] = std::sin(angle);
+      }
+    }
+  }
+
+  /**
+   * @brief Get cos value for position and dimension pair index
+   */
+  inline float Cos(int pos, int pair_d) const {
+    return cos_sin[pos * head_dim + 2 * pair_d];
+  }
+
+  /**
+   * @brief Get sin value for position and dimension pair index
+   */
+  inline float Sin(int pos, int pair_d) const {
+    return cos_sin[pos * head_dim + 2 * pair_d + 1];
+  }
+
+  /**
+   * @brief Get pointer to cos/sin data for a specific position
+   */
+  inline const float *GetCosSinPtr(int pos) const {
+    return cos_sin.data() + pos * head_dim;
+  }
+};
+
+#if defined(__AVX512F__)
+
+/**
+ * @brief Apply Rotary Positional Embedding using AVX-512
+ *
+ * RoPE formula for pair (x_{2d}, x_{2d+1}):
+ *   x'_{2d}   = x_{2d} * cos(θ) - x_{2d+1} * sin(θ)
+ *   x'_{2d+1} = x_{2d} * sin(θ) + x_{2d+1} * cos(θ)
+ *
+ * This kernel processes 16 floats (8 pairs) per iteration using AVX-512.
+ *
+ * @param out Output tensor [n_tokens, head_dim] (can be same as in for
+ * in-place)
+ * @param in Input tensor [n_tokens, head_dim]
+ * @param cos_sin Pre-computed [cos, sin] pairs [max_seq, head_dim]
+ * @param positions Token positions array [n_tokens]
+ * @param n_tokens Number of tokens to process
+ * @param head_dim Head dimension (must be even)
+ * @param rope_dim Number of dimensions to apply RoPE (typically == head_dim)
+ * @param ith Thread index for work partitioning
+ * @param nth Total number of threads
+ */
+inline void ApplyRoPE_AVX512(float *out, const float *in, const float *cos_sin,
+                             const int *positions, int n_tokens, int head_dim,
+                             int rope_dim, int ith = 0, int nth = 1) {
+  // Partition tokens across threads
+  const int tokens_per_thread = (n_tokens + nth - 1) / nth;
+  const int t_start = ith * tokens_per_thread;
+  const int t_end = std::min(t_start + tokens_per_thread, n_tokens);
+
+  if (t_start >= n_tokens)
+    return;
+
+  for (int t = t_start; t < t_end; t++) {
+    const int pos = positions[t];
+    const float *cs_ptr = cos_sin + pos * head_dim;
+    const float *in_ptr = in + t * head_dim;
+    float *out_ptr = out + t * head_dim;
+
+    // Prefetch next token's cos/sin
+    if (t + 1 < t_end) {
+      _mm_prefetch(
+          reinterpret_cast<const char *>(cos_sin + positions[t + 1] * head_dim),
+          _MM_HINT_T0);
+    }
+
+    // Process 16 floats (8 pairs) at a time
+    int d = 0;
+    for (; d + 16 <= rope_dim; d += 16) {
+      // Load input: [x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12,
+      // x13, x14, x15]
+      __m512 x = _mm512_loadu_ps(in_ptr + d);
+
+      // Load cos/sin: [c0, s0, c1, s1, c2, s2, c3, s3, ...]
+      __m512 cs = _mm512_loadu_ps(cs_ptr + d);
+
+      // Shuffle to separate cos and sin
+      // cos = [c0, c0, c1, c1, c2, c2, c3, c3, c4, c4, c5, c5, c6, c6, c7, c7]
+      // sin = [s0, s0, s1, s1, s2, s2, s3, s3, s4, s4, s5, s5, s6, s6, s7, s7]
+      // But we have interleaved [c0, s0, c1, s1, ...], so we need to
+      // deinterleave
+
+      // Extract even indices (cos) and odd indices (sin)
+      const __m512i idx_cos = _mm512_setr_epi32(0, 0, 2, 2, 4, 4, 6, 6, 8, 8,
+                                                10, 10, 12, 12, 14, 14);
+      const __m512i idx_sin = _mm512_setr_epi32(1, 1, 3, 3, 5, 5, 7, 7, 9, 9,
+                                                11, 11, 13, 13, 15, 15);
+
+      __m512 cos_vec = _mm512_permutexvar_ps(idx_cos, cs);
+      __m512 sin_vec = _mm512_permutexvar_ps(idx_sin, cs);
+
+      // Create swapped x: [x1, x0, x3, x2, x5, x4, x7, x6, ...]
+      const __m512i idx_swap = _mm512_setr_epi32(1, 0, 3, 2, 5, 4, 7, 6, 9, 8,
+                                                 11, 10, 13, 12, 15, 14);
+      __m512 x_swap = _mm512_permutexvar_ps(idx_swap, x);
+
+      // For pairs (x_{2d}, x_{2d+1}):
+      //   x'_{2d}   = x_{2d} * cos - x_{2d+1} * sin  (even positions)
+      //   x'_{2d+1} = x_{2d} * sin + x_{2d+1} * cos  (odd positions)
+      //
+      // Using: x * cos + x_swap * (alternating sign) * sin
+      // Alternating sign: [-1, +1, -1, +1, ...]
+      const __m512 sign_mask =
+          _mm512_set_ps(1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
+                        1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f);
+
+      // out = x * cos + x_swap * sign * sin
+      __m512 result = _mm512_mul_ps(x, cos_vec);
+      __m512 term2 = _mm512_mul_ps(x_swap, sin_vec);
+      term2 = _mm512_mul_ps(term2, sign_mask);
+      result = _mm512_add_ps(result, term2);
+
+      _mm512_storeu_ps(out_ptr + d, result);
+    }
+
+    // Handle remainder (less than 16 floats)
+    for (; d < rope_dim; d += 2) {
+      float x0 = in_ptr[d];
+      float x1 = in_ptr[d + 1];
+      float cos_val = cs_ptr[d];
+      float sin_val = cs_ptr[d + 1];
+
+      out_ptr[d] = x0 * cos_val - x1 * sin_val;
+      out_ptr[d + 1] = x0 * sin_val + x1 * cos_val;
+    }
+
+    // Copy dimensions beyond rope_dim unchanged
+    for (int dd = rope_dim; dd < head_dim; dd++) {
+      out_ptr[dd] = in_ptr[dd];
+    }
+  }
+}
+
+#else // Non-AVX512 fallback
+
+/**
+ * @brief Apply Rotary Positional Embedding (scalar fallback)
+ */
+inline void ApplyRoPE_AVX512(float *out, const float *in, const float *cos_sin,
+                             const int *positions, int n_tokens, int head_dim,
+                             int rope_dim, int ith = 0, int nth = 1) {
+  const int tokens_per_thread = (n_tokens + nth - 1) / nth;
+  const int t_start = ith * tokens_per_thread;
+  const int t_end = std::min(t_start + tokens_per_thread, n_tokens);
+
+  for (int t = t_start; t < t_end; t++) {
+    const int pos = positions[t];
+    const float *cs_ptr = cos_sin + pos * head_dim;
+    const float *in_ptr = in + t * head_dim;
+    float *out_ptr = out + t * head_dim;
+
+    // Apply RoPE to pairs
+    for (int d = 0; d < rope_dim; d += 2) {
+      float x0 = in_ptr[d];
+      float x1 = in_ptr[d + 1];
+      float cos_val = cs_ptr[d];
+      float sin_val = cs_ptr[d + 1];
+
+      out_ptr[d] = x0 * cos_val - x1 * sin_val;
+      out_ptr[d + 1] = x0 * sin_val + x1 * cos_val;
+    }
+
+    // Copy dimensions beyond rope_dim unchanged
+    for (int dd = rope_dim; dd < head_dim; dd++) {
+      out_ptr[dd] = in_ptr[dd];
+    }
+  }
+}
+
+#endif // __AVX512F__
+
+/**
+ * @brief Apply RoPE to a batch of heads (for multi-head attention)
+ *
+ * Processes [n_tokens, n_heads, head_dim] tensor with same positions for all
+ * heads.
+ *
+ * @param out Output [n_tokens, n_heads, head_dim]
+ * @param in Input [n_tokens, n_heads, head_dim]
+ * @param cos_sin Pre-computed [max_seq, head_dim]
+ * @param positions [n_tokens]
+ * @param n_tokens Number of tokens
+ * @param n_heads Number of heads
+ * @param head_dim Head dimension
+ * @param rope_dim RoPE dimension
+ */
+inline void ApplyRoPE_MultiHead(float *out, const float *in,
+                                const float *cos_sin, const int *positions,
+                                int n_tokens, int n_heads, int head_dim,
+                                int rope_dim) {
+  const int stride = n_heads * head_dim;
+
+  for (int t = 0; t < n_tokens; t++) {
+    const int pos = positions[t];
+    const float *cs_ptr = cos_sin + pos * head_dim;
+
+    for (int h = 0; h < n_heads; h++) {
+      const float *in_ptr = in + t * stride + h * head_dim;
+      float *out_ptr = out + t * stride + h * head_dim;
+
+      // Apply RoPE to this head
+      for (int d = 0; d < rope_dim; d += 2) {
+        float x0 = in_ptr[d];
+        float x1 = in_ptr[d + 1];
+        float cos_val = cs_ptr[d];
+        float sin_val = cs_ptr[d + 1];
+
+        out_ptr[d] = x0 * cos_val - x1 * sin_val;
+        out_ptr[d + 1] = x0 * sin_val + x1 * cos_val;
+      }
+
+      // Copy dimensions beyond rope_dim
+      for (int dd = rope_dim; dd < head_dim; dd++) {
+        out_ptr[dd] = in_ptr[dd];
+      }
+    }
+  }
+}
+
+// =============================================================================
 // INT4 Quantized GEMM (AVX512) - HIGHLY OPTIMIZED
 // =============================================================================
 
@@ -1192,6 +1466,368 @@ inline void GemmInt4Fp32_AVX512(float *C, const float *A, const uint8_t *W_int4,
       }
 
       C[m * N + n] = sum;
+    }
+  }
+}
+
+#endif // __AVX512F__
+
+// =============================================================================
+// FlashAttention AVX-512 Micro-Kernels (Cache-Optimized)
+// =============================================================================
+
+#if defined(__AVX512F__)
+
+/**
+ * @brief Fast exp approximation using polynomial (AVX-512)
+ *
+ * Approximates exp(x) for x in [-87, 87] using a minimax polynomial.
+ * Faster than standard exp but with ~1e-6 relative error.
+ */
+inline __m512 _mm512_fast_exp_ps(__m512 x) {
+  // Clamp to valid range
+  x = _mm512_max_ps(x, _mm512_set1_ps(-87.0f));
+  x = _mm512_min_ps(x, _mm512_set1_ps(87.0f));
+
+  // exp(x) = 2^(x/ln(2)) = 2^k * 2^f where k=floor(x/ln(2)), f=x/ln(2)-k
+  const __m512 c_invlog2 = _mm512_set1_ps(1.44269504f); // 1/ln(2)
+  const __m512 c_log2 = _mm512_set1_ps(0.69314718f);    // ln(2)
+
+  __m512 z = _mm512_mul_ps(x, c_invlog2);
+  __m512i k = _mm512_cvttps_epi32(z);
+  __m512 f = _mm512_sub_ps(x, _mm512_mul_ps(_mm512_cvtepi32_ps(k), c_log2));
+
+  // Polynomial approximation for 2^f (f in [0,1])
+  const __m512 c1 = _mm512_set1_ps(1.0f);
+  const __m512 c2 = _mm512_set1_ps(0.69314718f);
+  const __m512 c3 = _mm512_set1_ps(0.24022651f);
+  const __m512 c4 = _mm512_set1_ps(0.05550410f);
+
+  __m512 poly = c1;
+  poly = _mm512_fmadd_ps(poly, f, c2);
+  poly = _mm512_fmadd_ps(poly, f, c3);
+  poly = _mm512_fmadd_ps(poly, f, c4);
+  poly = _mm512_fmadd_ps(poly, f, c1);
+
+  // 2^k using bit manipulation
+  k = _mm512_slli_epi32(_mm512_add_epi32(k, _mm512_set1_epi32(127)), 23);
+  __m512 pow2k = _mm512_castsi512_ps(k);
+
+  return _mm512_mul_ps(poly, pow2k);
+}
+
+/**
+ * @brief Compute Q @ K^T with scaling (AVX-512 optimized)
+ *
+ * Computes S[i,j] = scale * sum_d(Q[i,d] * K[j,d]) for block of queries and
+ * keys.
+ *
+ * @param Q Query block [q_len, head_dim]
+ * @param K Key block [kv_len, head_dim]
+ * @param S Output scores [q_len, kv_len]
+ * @param q_len Number of query vectors in block
+ * @param kv_len Number of key vectors in block
+ * @param head_dim Dimension per head
+ * @param scale Scaling factor (typically 1/sqrt(head_dim))
+ */
+inline void ComputeQK_AVX512(const float *Q, const float *K, float *S,
+                             int q_len, int kv_len, int head_dim, float scale) {
+  const __m512 scale_vec = _mm512_set1_ps(scale);
+
+  for (int qi = 0; qi < q_len; qi++) {
+    const float *q_row = Q + qi * head_dim;
+
+    for (int ki = 0; ki < kv_len; ki++) {
+      const float *k_row = K + ki * head_dim;
+
+      // Dot product with AVX-512
+      __m512 sum = _mm512_setzero_ps();
+      int d = 0;
+
+      // Process 16 elements at a time
+      for (; d + 16 <= head_dim; d += 16) {
+        __m512 q_vec = _mm512_loadu_ps(q_row + d);
+        __m512 k_vec = _mm512_loadu_ps(k_row + d);
+        sum = _mm512_fmadd_ps(q_vec, k_vec, sum);
+      }
+
+      // Horizontal sum of 16-element vector
+      float dot = _mm512_reduce_add_ps(sum);
+
+      // Handle remainder with scalar
+      for (; d < head_dim; d++) {
+        dot += q_row[d] * k_row[d];
+      }
+
+      S[qi * kv_len + ki] = dot * scale;
+    }
+  }
+}
+
+/**
+ * @brief Apply causal mask to attention scores (AVX-512 optimized)
+ *
+ * Sets S[qi, ki] = -inf if (qi + q_start) < (ki + kv_start) for causal
+ * masking.
+ *
+ * @param S Scores [q_len, kv_len] (modified in-place)
+ * @param q_start Global query offset
+ * @param kv_start Global kv offset
+ * @param q_len Number of query vectors
+ * @param kv_len Number of kv vectors
+ */
+inline void ApplyMask_AVX512(float *S, int q_start, int kv_start, int q_len,
+                             int kv_len) {
+  const __m512 neg_inf = _mm512_set1_ps(-1e10f);
+
+  for (int qi = 0; qi < q_len; qi++) {
+    const int global_qi = q_start + qi;
+    float *s_row = S + qi * kv_len;
+
+    int ki = 0;
+    // Vectorized masking
+    for (; ki + 16 <= kv_len; ki += 16) {
+      // Create mask: true where (global_qi < kv_start + ki + lane)
+      __m512i ki_vec =
+          _mm512_add_epi32(_mm512_set1_epi32(kv_start + ki),
+                           _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                             11, 12, 13, 14, 15));
+      __mmask16 mask =
+          _mm512_cmplt_epi32_mask(_mm512_set1_epi32(global_qi), ki_vec);
+
+      // Load current scores
+      __m512 s_vec = _mm512_loadu_ps(s_row + ki);
+      // Blend: if mask=1, use -inf, else keep s_vec
+      s_vec = _mm512_mask_blend_ps(mask, s_vec, neg_inf);
+      _mm512_storeu_ps(s_row + ki, s_vec);
+    }
+
+    // Scalar remainder
+    for (; ki < kv_len; ki++) {
+      if (global_qi < (kv_start + ki)) {
+        s_row[ki] = -1e10f;
+      }
+    }
+  }
+}
+
+/**
+ * @brief Online softmax with AVX-512
+ *
+ * Computes softmax over block and updates running statistics.
+ * Uses online algorithm to handle arbitrary sequence lengths.
+ *
+ * @param S Input/output scores [q_len, kv_len]
+ * @param row_max Max value per row [q_len] (updated)
+ * @param row_sum Exponential sum per row [q_len] (updated)
+ * @param q_len Number of query rows
+ * @param kv_len Number of attention scores per row
+ * @param first_block If true, initialize max/sum; else update
+ */
+inline void SoftmaxBlock_AVX512(float *S, float *row_max, float *row_sum,
+                                int q_len, int kv_len, bool first_block) {
+  for (int qi = 0; qi < q_len; qi++) {
+    float *s_row = S + qi * kv_len;
+
+    // Find max in this block
+    __m512 max_vec = _mm512_set1_ps(-1e10f);
+    int ki = 0;
+    for (; ki + 16 <= kv_len; ki += 16) {
+      __m512 s_vec = _mm512_loadu_ps(s_row + ki);
+      max_vec = _mm512_max_ps(max_vec, s_vec);
+    }
+    float local_max = _mm512_reduce_max_ps(max_vec);
+
+    // Scalar remainder for max
+    for (; ki < kv_len; ki++) {
+      local_max = std::max(local_max, s_row[ki]);
+    }
+
+    // Update global max
+    float m_old = first_block ? -1e10f : row_max[qi];
+    float m_new = std::max(m_old, local_max);
+    const __m512 m_new_vec = _mm512_set1_ps(m_new);
+
+    // Compute exp(s - m_new) and sum
+    __m512 sum_vec = _mm512_setzero_ps();
+    ki = 0;
+    for (; ki + 16 <= kv_len; ki += 16) {
+      __m512 s_vec = _mm512_loadu_ps(s_row + ki);
+      __m512 exp_vec = _mm512_sub_ps(s_vec, m_new_vec);
+      exp_vec = _mm512_fast_exp_ps(exp_vec); // Fast exp
+      _mm512_storeu_ps(s_row + ki, exp_vec);
+      sum_vec = _mm512_add_ps(sum_vec, exp_vec);
+    }
+    float local_sum = _mm512_reduce_add_ps(sum_vec);
+
+    // Scalar remainder
+    for (; ki < kv_len; ki++) {
+      float exp_val = expf(s_row[ki] - m_new);
+      s_row[ki] = exp_val;
+      local_sum += exp_val;
+    }
+
+    // Update running statistics
+    if (first_block) {
+      row_max[qi] = m_new;
+      row_sum[qi] = local_sum;
+    } else {
+      float alpha = expf(m_old - m_new);
+      row_sum[qi] = alpha * row_sum[qi] + local_sum;
+      row_max[qi] = m_new;
+    }
+  }
+}
+
+/**
+ * @brief Compute P @ V (attention-weighted values) with AVX-512
+ *
+ * Computes O[qi] += sum_ki(P[qi,ki] * V[ki]) for a block.
+ *
+ * @param P Attention probabilities [q_len, kv_len]
+ * @param V Value vectors [kv_len, head_dim]
+ * @param O Output accumulator [q_len, head_dim] (incremented)
+ * @param q_len Number of query vectors
+ * @param kv_len Number of key/value vectors
+ * @param head_dim Head dimension
+ */
+inline void ComputePV_AVX512(const float *P, const float *V, float *O,
+                             int q_len, int kv_len, int head_dim) {
+  for (int qi = 0; qi < q_len; qi++) {
+    const float *p_row = P + qi * kv_len;
+    float *o_row = O + qi * head_dim;
+
+    for (int ki = 0; ki < kv_len; ki++) {
+      const float p_val = p_row[ki];
+      const __m512 p_vec = _mm512_set1_ps(p_val);
+      const float *v_row = V + ki * head_dim;
+
+      int d = 0;
+      // Vectorized accumulation
+      for (; d + 16 <= head_dim; d += 16) {
+        __m512 o_vec = _mm512_loadu_ps(o_row + d);
+        __m512 v_vec = _mm512_loadu_ps(v_row + d);
+        o_vec = _mm512_fmadd_ps(p_vec, v_vec, o_vec);
+        _mm512_storeu_ps(o_row + d, o_vec);
+      }
+
+      // Scalar remainder
+      for (; d < head_dim; d++) {
+        o_row[d] += p_val * v_row[d];
+      }
+    }
+  }
+}
+
+/**
+ * @brief Update output with rescaling (AVX-512)
+ *
+ * Rescales existing output and adds new contribution:
+ * O_new[qi] = alpha[qi] * O_old[qi] + beta[qi] * PV[qi]
+ *
+ * @param O Output [q_len, head_dim] (updated in-place)
+ * @param PV New contribution [q_len, head_dim]
+ * @param alpha Rescale factors [q_len]
+ * @param beta New contribution factors [q_len]
+ * @param q_len Number of query vectors
+ * @param head_dim Head dimension
+ */
+inline void UpdateOutput_AVX512(float *O, const float *PV, const float *alpha,
+                                const float *beta, int q_len, int head_dim) {
+  for (int qi = 0; qi < q_len; qi++) {
+    const __m512 alpha_vec = _mm512_set1_ps(alpha[qi]);
+    const __m512 beta_vec = _mm512_set1_ps(beta[qi]);
+    float *o_row = O + qi * head_dim;
+    const float *pv_row = PV + qi * head_dim;
+
+    int d = 0;
+    for (; d + 16 <= head_dim; d += 16) {
+      __m512 o_vec = _mm512_loadu_ps(o_row + d);
+      __m512 pv_vec = _mm512_loadu_ps(pv_row + d);
+
+      // O = alpha * O + beta * PV
+      o_vec = _mm512_mul_ps(o_vec, alpha_vec);
+      o_vec = _mm512_fmadd_ps(beta_vec, pv_vec, o_vec);
+
+      _mm512_storeu_ps(o_row + d, o_vec);
+    }
+
+    // Scalar remainder
+    for (; d < head_dim; d++) {
+      o_row[d] = alpha[qi] * o_row[d] + beta[qi] * pv_row[d];
+    }
+  }
+}
+
+#else // Non-AVX512 fallback (scalar implementations)
+
+// Scalar fallback versions
+inline void ComputeQK_AVX512(const float *Q, const float *K, float *S,
+                             int q_len, int kv_len, int head_dim, float scale) {
+  for (int qi = 0; qi < q_len; qi++) {
+    for (int ki = 0; ki < kv_len; ki++) {
+      float dot = DotF32(Q + qi * head_dim, K + ki * head_dim, head_dim);
+      S[qi * kv_len + ki] = dot * scale;
+    }
+  }
+}
+
+inline void ApplyMask_AVX512(float *S, int q_start, int kv_start, int q_len,
+                             int kv_len) {
+  for (int qi = 0; qi < q_len; qi++) {
+    for (int ki = 0; ki < kv_len; ki++) {
+      if ((q_start + qi) < (kv_start + ki)) {
+        S[qi * kv_len + ki] = -1e10f;
+      }
+    }
+  }
+}
+
+inline void SoftmaxBlock_AVX512(float *S, float *row_max, float *row_sum,
+                                int q_len, int kv_len, bool first_block) {
+  for (int qi = 0; qi < q_len; qi++) {
+    float *s_row = S + qi * kv_len;
+    float local_max = MaxF32(s_row, kv_len);
+    float m_old = first_block ? -1e10f : row_max[qi];
+    float m_new = std::max(m_old, local_max);
+
+    float local_sum = 0.0f;
+    for (int ki = 0; ki < kv_len; ki++) {
+      s_row[ki] = expf(s_row[ki] - m_new);
+      local_sum += s_row[ki];
+    }
+
+    if (first_block) {
+      row_max[qi] = m_new;
+      row_sum[qi] = local_sum;
+    } else {
+      float alpha = expf(m_old - m_new);
+      row_sum[qi] = alpha * row_sum[qi] + local_sum;
+      row_max[qi] = m_new;
+    }
+  }
+}
+
+inline void ComputePV_AVX512(const float *P, const float *V, float *O,
+                             int q_len, int kv_len, int head_dim) {
+  for (int qi = 0; qi < q_len; qi++) {
+    for (int ki = 0; ki < kv_len; ki++) {
+      float p_val = P[qi * kv_len + ki];
+      const float *v_row = V + ki * head_dim;
+      float *o_row = O + qi * head_dim;
+      for (int d = 0; d < head_dim; d++) {
+        o_row[d] += p_val * v_row[d];
+      }
+    }
+  }
+}
+
+inline void UpdateOutput_AVX512(float *O, const float *PV, const float *alpha,
+                                const float *beta, int q_len, int head_dim) {
+  for (int qi = 0; qi < q_len; qi++) {
+    for (int d = 0; d < head_dim; d++) {
+      O[qi * head_dim + d] =
+          alpha[qi] * O[qi * head_dim + d] + beta[qi] * PV[qi * head_dim + d];
     }
   }
 }

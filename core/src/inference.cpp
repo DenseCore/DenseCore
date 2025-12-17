@@ -40,6 +40,139 @@ inline KVCacheUserData *GetKVCacheUserData(int layer, bool is_k) {
   return &g_kv_userdata_pool[idx];
 }
 
+// ============================================================================
+// Custom RoPE Callback (AVX-512 Optimized)
+// ============================================================================
+
+/**
+ * User data for custom RoPE operation
+ */
+struct RoPEUserData {
+  const float *cos_sin_table; ///< Pre-computed [max_seq, head_dim] table
+  const int *positions;       ///< Token positions [n_tokens]
+  int n_tokens;               ///< Number of tokens
+  int n_heads;                ///< Number of heads (Q or KV)
+  int head_dim;               ///< Dimension per head
+  int rope_dim;               ///< Number of dimensions to rotate
+};
+
+// Thread-local pool for RoPE user data (avoids allocation per layer)
+static constexpr int kMaxRoPEUserDataSlots = 512;
+static thread_local RoPEUserData g_rope_userdata_pool[kMaxRoPEUserDataSlots];
+static thread_local int g_rope_userdata_index = 0;
+
+inline RoPEUserData *GetRoPEUserData() {
+  int idx = g_rope_userdata_index++;
+  if (idx >= kMaxRoPEUserDataSlots) {
+    g_rope_userdata_index = 0;
+    idx = 0;
+  }
+  return &g_rope_userdata_pool[idx];
+}
+
+/**
+ * Custom RoPE callback using AVX-512 kernel
+ *
+ * Input tensor shape: [head_dim, n_heads, n_tokens] (GGML standard for Q/K)
+ * Applies RoPE rotation in-place using pre-computed cos/sin tables.
+ *
+ * Threading: Work is partitioned across n_heads dimension.
+ */
+void cb_rope_avx512(struct ggml_tensor *dst, const struct ggml_tensor *src,
+                    int ith, int nth, void *userdata) {
+  auto *ud = (RoPEUserData *)userdata;
+  if (!ud || !ud->cos_sin_table || !ud->positions)
+    return;
+
+  // Tensor layout: [head_dim, n_heads, n_tokens]
+  const int head_dim = ud->head_dim;
+  const int n_heads = ud->n_heads;
+  const int n_tokens = ud->n_tokens;
+  const int rope_dim = ud->rope_dim;
+
+  // Partition work across heads
+  const int heads_per_thread = (n_heads + nth - 1) / nth;
+  const int h_start = ith * heads_per_thread;
+  const int h_end = std::min(h_start + heads_per_thread, n_heads);
+
+  if (h_start >= n_heads)
+    return;
+
+  // Process assigned heads
+  for (int h = h_start; h < h_end; h++) {
+    for (int t = 0; t < n_tokens; t++) {
+      const int pos = ud->positions[t];
+      const float *cs_ptr = ud->cos_sin_table + pos * head_dim;
+
+      // Input/output pointers for this head and token
+      // Layout: [head_dim, n_heads, n_tokens] -> offset = head_dim * (h +
+      // n_heads * t)
+      const float *in_ptr =
+          (const float *)src->data + head_dim * (h + n_heads * t);
+      float *out_ptr = (float *)dst->data + head_dim * (h + n_heads * t);
+
+      // Apply RoPE to pairs
+      for (int d = 0; d < rope_dim; d += 2) {
+        float x0 = in_ptr[d];
+        float x1 = in_ptr[d + 1];
+        float cos_val = cs_ptr[d];
+        float sin_val = cs_ptr[d + 1];
+
+        out_ptr[d] = x0 * cos_val - x1 * sin_val;
+        out_ptr[d + 1] = x0 * sin_val + x1 * cos_val;
+      }
+
+      // Copy dimensions beyond rope_dim unchanged
+      for (int dd = rope_dim; dd < head_dim; dd++) {
+        out_ptr[dd] = in_ptr[dd];
+      }
+    }
+  }
+}
+
+// ============================================================================
+// RoPE Table Initialization
+// ============================================================================
+
+/**
+ * @brief Initialize pre-computed RoPE cos/sin table for the model
+ *
+ * Populates model->rope_cos_sin with values for all positions and dimensions.
+ * Layout: [pos * head_dim + d] = cos/sin pair for position 'pos', dimension 'd'
+ * Interleaved format: [cos0, sin0, cos1, sin1, ...]
+ *
+ * @param model Model to initialize RoPE table for
+ */
+void InitRoPETable(TransformerModel *model) {
+  if (!model)
+    return;
+
+  const int n_ctx = model->hparams.n_ctx;
+  const int head_dim = model->hparams.n_embd / model->hparams.n_head;
+  const float freq_base = model->hparams.rope_freq_base;
+
+  // Allocate table: [n_ctx, head_dim] interleaved [cos, sin] pairs
+  model->rope_cos_sin.resize(static_cast<size_t>(n_ctx) * head_dim);
+  model->rope_head_dim = head_dim;
+
+  // Pre-compute frequencies: theta[d] = 1 / (freq_base ** (2d / head_dim))
+  std::vector<float> freqs(head_dim / 2);
+  for (int d = 0; d < head_dim / 2; d++) {
+    float exp_val = (2.0f * d) / static_cast<float>(head_dim);
+    freqs[d] = 1.0f / std::pow(freq_base, exp_val);
+  }
+
+  // Compute cos/sin for all positions
+  for (int pos = 0; pos < n_ctx; pos++) {
+    for (int d = 0; d < head_dim / 2; d++) {
+      float angle = static_cast<float>(pos) * freqs[d];
+      // Interleaved storage for cache efficiency
+      model->rope_cos_sin[pos * head_dim + 2 * d] = std::cos(angle);
+      model->rope_cos_sin[pos * head_dim + 2 * d + 1] = std::sin(angle);
+    }
+  }
+}
+
 // Custom callback to load K/V history from cache and append current K/V
 // This gathers the full context (history + current) into the destination tensor
 // AND writes the current K/V into the cache for future steps.
@@ -422,14 +555,39 @@ struct ggml_tensor *BuildTransformerGraph(
     if (rope_dim > head_dim_q)
       rope_dim = head_dim_q;
 
-    Qcur =
-        ggml_rope_ext(ctx_c, Qcur, pos, nullptr, rope_dim, 0, n_ctx,
-                      model->hparams.rope_freq_base,
-                      model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
-    Kcur =
-        ggml_rope_ext(ctx_c, Kcur, pos, nullptr, rope_dim, 0, n_ctx,
-                      model->hparams.rope_freq_base,
-                      model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+    // Use custom RoPE if pre-computed table is available
+    if (!model->rope_cos_sin.empty()) {
+      // Apply custom RoPE using pre-computed table
+      // Q: [head_dim_q, n_head, N]
+      RoPEUserData *q_ud = GetRoPEUserData();
+      *q_ud = {model->rope_cos_sin.data(),
+               batch.pos.data(),
+               N,
+               n_head,
+               head_dim_q,
+               rope_dim};
+      Qcur = ggml_map_custom1(ctx_c, Qcur, cb_rope_avx512, 1, q_ud);
+
+      // K: [head_dim_kv, n_head_kv, N]
+      RoPEUserData *k_ud = GetRoPEUserData();
+      *k_ud = {model->rope_cos_sin.data(),
+               batch.pos.data(),
+               N,
+               n_head_kv,
+               head_dim_kv,
+               rope_dim};
+      Kcur = ggml_map_custom1(ctx_c, Kcur, cb_rope_avx512, 1, k_ud);
+    } else {
+      // Fallback to standard GGML RoPE
+      Qcur =
+          ggml_rope_ext(ctx_c, Qcur, pos, nullptr, rope_dim, 0, n_ctx,
+                        model->hparams.rope_freq_base,
+                        model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+      Kcur =
+          ggml_rope_ext(ctx_c, Kcur, pos, nullptr, rope_dim, 0, n_ctx,
+                        model->hparams.rope_freq_base,
+                        model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+    }
 
     // =========================================================================
     // KV CACHE INTEGRATION (Universal Paged Attention)

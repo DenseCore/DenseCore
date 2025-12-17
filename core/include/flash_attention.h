@@ -94,7 +94,11 @@ inline void FlashAttentionForward(const float *Q, const float *K,
   std::vector<float> L(seq_len_q, 0.0f);   // Cumulative sum of exp
   std::vector<float> M(seq_len_q, -1e10f); // Max value seen so far
 
-  // Process in tiles
+  // Temporary buffers for rescaling factors
+  std::vector<float> alpha_buf(Br);
+  std::vector<float> beta_buf(Br);
+
+  // Process in tiles (outer KV loop for better cache locality)
   for (int j = 0; j < seq_len_kv; j += Bc) {
     const int kv_end = std::min(j + Bc, seq_len_kv);
     const int kv_len = kv_end - j;
@@ -109,71 +113,67 @@ inline void FlashAttentionForward(const float *Q, const float *K,
         continue;
       }
 
-      // Compute Q @ K^T for this tile
-      // S_ij = Q[i:i+Br] @ K[j:j+Bc]^T / sqrt(d)
-      for (int qi = 0; qi < q_len; qi++) {
-        for (int ki = 0; ki < kv_len; ki++) {
-          // Causal mask: skip future positions
-          if (config.causal && (j + ki) > (i + qi)) {
-            scratch.qk_block[qi * Bc + ki] = -1e10f;
-          } else {
-            float dot = simd::DotF32(Q + (i + qi) * head_dim,
-                                     K + (j + ki) * head_dim, head_dim);
-            scratch.qk_block[qi * Bc + ki] = dot * scale;
-          }
-        }
+      // Step 1: Compute Q @ K^T for this tile
+      // S_ij = Q[i:i+Br] @ K[j:j+Bc]^T * scale
+      simd::ComputeQK_AVX512(Q + i * head_dim, K + j * head_dim,
+                             scratch.qk_block.data(), q_len, kv_len, head_dim,
+                             scale);
+
+      // Step 2: Apply causal mask (vectorized)
+      if (config.causal) {
+        simd::ApplyMask_AVX512(scratch.qk_block.data(), i, j, q_len, kv_len);
       }
 
-      // Online softmax update
+      // Step 3: Online softmax update (vectorized)
+      bool first_kv_block = (j == 0);
+
+      // Use local buffers for this block's max/sum
+      std::vector<float> block_max(q_len);
+      std::vector<float> block_sum(q_len);
+
+      // Copy relevant portion of global stats
+      for (int qi = 0; qi < q_len; qi++) {
+        block_max[qi] = M[i + qi];
+        block_sum[qi] = L[i + qi];
+      }
+
+      simd::SoftmaxBlock_AVX512(scratch.qk_block.data(), block_max.data(),
+                                block_sum.data(), q_len, kv_len,
+                                first_kv_block);
+
+      // Step 4: Compute P @ V for this tile
+      // pv[qi] = sum_ki(softmax[qi, ki] * V[j + ki])
+      memset(scratch.pv_block.data(), 0, q_len * head_dim * sizeof(float));
+      simd::ComputePV_AVX512(scratch.qk_block.data(), V + j * head_dim,
+                             scratch.pv_block.data(), q_len, kv_len, head_dim);
+
+      // Step 5: Update output with rescaling
+      // O = (alpha * L * O + pv) / L_new
       for (int qi = 0; qi < q_len; qi++) {
         const int global_qi = i + qi;
-        float *qk_row = scratch.qk_block.data() + qi * Bc;
 
-        // Find local max
-        float local_max = simd::MaxF32(qk_row, kv_len);
-
-        // New global max
-        float m_new = std::max(M[global_qi], local_max);
-
-        // Compute exp(qk - new_max) and local sum
-        float local_sum = 0.0f;
-        for (int ki = 0; ki < kv_len; ki++) {
-          qk_row[ki] = expf(qk_row[ki] - m_new);
-          local_sum += qk_row[ki];
-        }
+        float m_old = M[global_qi];
+        float m_new = block_max[qi];
+        float L_old = L[global_qi];
+        float L_new = block_sum[qi];
 
         // Rescale factor for previous accumulator
-        float alpha = expf(M[global_qi] - m_new);
+        float alpha_val =
+            (L_old > 0) ? (expf(m_old - m_new) * L_old / L_new) : 0.0f;
+        float beta_val = 1.0f / L_new;
 
-        // Update running sum: L = alpha * L + local_sum
-        float L_new = alpha * L[global_qi] + local_sum;
-
-        // Compute P @ V for this tile
-        // pv[qi] = sum_ki(softmax[qi, ki] * V[j + ki])
-        float *pv_row = scratch.pv_block.data() + qi * head_dim;
-        memset(pv_row, 0, head_dim * sizeof(float));
-        for (int ki = 0; ki < kv_len; ki++) {
-          float p = qk_row[ki];
-          const float *v_row = V + (j + ki) * head_dim;
-          for (int d = 0; d < head_dim; d++) {
-            pv_row[d] += p * v_row[d];
-          }
-        }
-
-        // Update output: O = (alpha * L * O + pv) / L_new
-        float *o_row = O + global_qi * head_dim;
-        float factor =
-            (L[global_qi] > 0) ? (alpha * L[global_qi] / L_new) : 0.0f;
-        float pv_factor = 1.0f / L_new;
-
-        for (int d = 0; d < head_dim; d++) {
-          o_row[d] = factor * o_row[d] + pv_factor * pv_row[d];
-        }
+        alpha_buf[qi] = alpha_val;
+        beta_buf[qi] = beta_val;
 
         // Update running stats
         M[global_qi] = m_new;
         L[global_qi] = L_new;
       }
+
+      // Apply rescaling with vectorized kernel
+      simd::UpdateOutput_AVX512(O + i * head_dim, scratch.pv_block.data(),
+                                alpha_buf.data(), beta_buf.data(), q_len,
+                                head_dim);
     }
   }
 }
