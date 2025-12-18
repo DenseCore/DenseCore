@@ -27,7 +27,7 @@ struct InferenceConfig {
   int prefetch_lookahead = 1;  // Layers to prefetch ahead
 
   // Performance options
-  int num_threads = 1; // Thread count for parallel ops
+  int num_threads = 0; // Thread count (0 = auto-detect physical cores)
 
   // Singleton instance
   static InferenceConfig &Instance() {

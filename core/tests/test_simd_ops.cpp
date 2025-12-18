@@ -321,7 +321,7 @@ TEST(SimdOps, RoPETable_Init) {
   EXPECT_NEAR(table.Sin(1, 0), std::sin(1.0f), 1e-5);
 }
 
-TEST(SimdOps, ApplyRoPE_AVX512_Basic) {
+TEST(SimdOps, ApplyRoPE_Basic) {
   constexpr int n_tokens = 4;
   constexpr int head_dim = 16;
   constexpr int rope_dim = 16;
@@ -342,9 +342,9 @@ TEST(SimdOps, ApplyRoPE_AVX512_Basic) {
   // Positions: [0, 1, 2, 3]
   std::vector<int> positions = {0, 1, 2, 3};
 
-  // Apply RoPE using kernel
-  ApplyRoPE_AVX512(output.data(), input.data(), table.cos_sin.data(),
-                   positions.data(), n_tokens, head_dim, rope_dim);
+  // Apply RoPE using unified dispatcher (picks AVX512 or scalar automatically)
+  ApplyRoPE(output.data(), input.data(), table.cos_sin.data(), positions.data(),
+            n_tokens, head_dim, rope_dim);
 
   // Compute reference using scalar
   for (int t = 0; t < n_tokens; t++) {
@@ -368,7 +368,7 @@ TEST(SimdOps, ApplyRoPE_AVX512_Basic) {
   }
 }
 
-TEST(SimdOps, ApplyRoPE_AVX512_PartialRopeDim) {
+TEST(SimdOps, ApplyRoPE_PartialRopeDim) {
   constexpr int n_tokens = 2;
   constexpr int head_dim = 32;
   constexpr int rope_dim = 16; // Only rotate first 16 dims
@@ -380,8 +380,9 @@ TEST(SimdOps, ApplyRoPE_AVX512_PartialRopeDim) {
   std::vector<float> output(n_tokens * head_dim, 0.0f);
   std::vector<int> positions = {5, 10};
 
-  ApplyRoPE_AVX512(output.data(), input.data(), table.cos_sin.data(),
-                   positions.data(), n_tokens, head_dim, rope_dim);
+  // Apply RoPE using unified dispatcher (picks AVX512 or scalar automatically)
+  ApplyRoPE(output.data(), input.data(), table.cos_sin.data(), positions.data(),
+            n_tokens, head_dim, rope_dim);
 
   // Dimensions beyond rope_dim should be unchanged
   for (int t = 0; t < n_tokens; t++) {

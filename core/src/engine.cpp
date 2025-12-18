@@ -16,6 +16,9 @@
 #include <sstream>
 #include <thread>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 // API implementations
 
 int SubmitEmbeddingRequest(DenseCoreHandle handle, const char *prompt,
@@ -99,23 +102,36 @@ int GetEmbeddingDimension(DenseCoreHandle handle) {
   return -1;
 }
 
-DenseCoreHandle InitEngine(const char *model_path, const char * /*reserved*/,
-                           int threads, int numa_node_id, int pinning_policy) {
+DENSECORE_API DenseCoreHandle InitEngine(const char *model_path,
+                                         const char * /*reserved*/,
+                                         int threads) {
   try {
-    (void)threads; // Reserved for future use
-#ifdef _OPENMP
-    if (threads > 0) {
-      // omp_set_num_threads(threads);
+    // =========================================================================
+    // THREAD CONFIGURATION (Critical for performance)
+    // =========================================================================
+    // Auto-detect optimal thread count if not specified
+    if (threads <= 0) {
+      threads = densecore::simd::GetNumCores();
     }
+
+#ifdef _OPENMP
+    omp_set_num_threads(threads);
+    std::cout << "[DenseCore] OpenMP configured: " << threads << " threads"
+              << std::endl;
 #endif
+
+    // Update global inference config for Flash Attention and other parallel ops
+    InferenceConfig::Instance().num_threads = threads;
 
     TransformerModel *model = LoadGGUFModel(model_path);
     if (!model)
       return nullptr;
 
     EngineState *state = new EngineState();
-    state->numa_node_id = numa_node_id;     // Store NUMA configuration
-    state->pinning_policy = pinning_policy; // Store pinning policy
+    // Default values
+    state->numa_node_id = -1;
+    state->pinning_policy = 0;
+    state->n_threads = threads; // Store for worker thread
 
     // Calculate optimal KV cache size based on model dimensions
     const int head_dim = model->hparams.n_embd / model->hparams.n_head;
@@ -156,14 +172,14 @@ DenseCoreHandle InitEngine(const char *model_path, const char * /*reserved*/,
     }
 
     // Log NUMA configuration
-    if (numa_node_id >= 0) {
-      std::cout << "[DenseCore] NUMA binding: node " << numa_node_id
+    if (state->numa_node_id >= 0) {
+      std::cout << "[DenseCore] NUMA binding: node " << state->numa_node_id
                 << std::endl;
     }
 
     // Initialize Paged KV Cache with NUMA-aware allocation
-    PagedKVCache *cache = InitPagedKVCache(model, 1, optimal_seq_len,
-                                           GGML_TYPE_F16, numa_node_id);
+    PagedKVCache *cache =
+        InitPagedKVCache(model, 1, optimal_seq_len, GGML_TYPE_F16, -1);
     if (!cache) {
       delete model;
       delete state;
@@ -181,6 +197,22 @@ DenseCoreHandle InitEngine(const char *model_path, const char * /*reserved*/,
 
     state->models["default"] = std::move(entry);
     state->default_model_id = "default";
+
+    // Initialize Scheduler with the default model's block manager
+    // Note: The scheduler takes a raw pointer to BlockManager, ownership
+    // remains with PagedKVCache
+    if (state->models["default"]->kv_cache &&
+        state->models["default"]->kv_cache->block_manager) {
+      state->scheduler = std::make_unique<densecore::Scheduler>(
+          state->models["default"]->kv_cache->block_manager);
+      std::cout << "[DenseCore] Scheduler initialized." << std::endl;
+    } else {
+      std::cerr << "[DenseCore] FATAL: Failed to initialize Scheduler. "
+                   "BlockManager is missing."
+                << std::endl;
+      delete state;
+      return nullptr;
+    }
 
     // Start background thread
     state->status = EngineStatus::RUNNING;
@@ -220,7 +252,10 @@ int SubmitRequest(DenseCoreHandle handle, const char *prompt, int max_tokens,
   req->user_data = user_data;
 
   // Tokenize immediately (outside hot path)
+  std::cout << "[DEBUG] Tokenizing prompt..." << std::endl;
   req->tokens = Tokenizer::Tokenize(model_entry->model.get(), prompt, true);
+  std::cout << "[DEBUG] Tokenized: " << req->tokens.size() << " tokens"
+            << std::endl;
 
   // Record arrival time for metrics
   req->arrival_time = std::chrono::steady_clock::now();
@@ -240,6 +275,7 @@ int SubmitRequest(DenseCoreHandle handle, const char *prompt, int max_tokens,
     std::lock_guard<std::mutex> lock(state->queue_mu);
     state->pending_requests.push(req);
   }
+  std::cout << "[DEBUG] Enqueued request " << req->id << std::endl;
   state->queue_cv.notify_one();
 
   return req->id;
@@ -247,8 +283,9 @@ int SubmitRequest(DenseCoreHandle handle, const char *prompt, int max_tokens,
 
 int SubmitRequestIds(DenseCoreHandle handle, const int *tokens, int n_tokens,
                      int max_tokens, TokenCallback callback, void *user_data) {
-  if (!handle || !tokens || n_tokens <= 0)
+  if (!handle || !tokens || n_tokens <= 0) {
     return -1;
+  }
   EngineState *state = (EngineState *)handle;
 
   Request *req = state->request_pool.Acquire();

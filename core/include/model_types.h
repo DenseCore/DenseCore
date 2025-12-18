@@ -114,6 +114,15 @@ struct TransformerModel {
   std::vector<float> rope_cos_sin;
   int rope_head_dim = 0; // Head dim used for RoPE table
 
+  // =========================================================================
+  // NUMA-Aware Memory Tracking
+  // =========================================================================
+  // Stores (ptr, size) pairs for tensor data that was rebind to NUMA nodes.
+  // These buffers are NOT owned by ggml_context and MUST be freed manually
+  // in the destructor. Failing to do so will cause memory leaks.
+  // =========================================================================
+  std::vector<std::pair<void *, size_t>> numa_buffers;
+
   ~TransformerModel();
 };
 

@@ -292,6 +292,9 @@ struct EngineState {
   // NUMA binding configuration (-1 = auto, >= 0 = specific node)
   int numa_node_id = -1;
 
+  // Number of threads for compute (0 = auto-detect)
+  int n_threads = 0;
+
   // Thread pinning policy for compute threads
   // 0 = SCATTER (maximize L3/bandwidth, best for latency-sensitive single-user)
   // 1 = COMPACT (share L2, leave room for other processes, best for throughput)

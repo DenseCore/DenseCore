@@ -260,6 +260,16 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(densecore PRIVATE Threads::Threads)
 
+# OpenMP Support (Enable for Performance)
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(densecore PRIVATE OpenMP::OpenMP_CXX)
+    message(STATUS "OpenMP found - enabling parallel execution")
+else()
+    message(WARNING "OpenMP not found - performance will be limited")
+endif()
+
+
 # ==========================================================================
 # NUMA / hwloc Support (Optional)
 # ==========================================================================
@@ -386,6 +396,7 @@ if(DENSECORE_BUILD_TESTS)
 
     target_include_directories(densecore_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_BINARY_DIR}/include  # Generated headers (densecore_version.h)
         ${GGML_DIR}/include
         ${GGML_DIR}/src
         ${GGML_DIR}/src/ggml-cpu

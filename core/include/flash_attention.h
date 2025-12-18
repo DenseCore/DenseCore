@@ -186,33 +186,46 @@ inline void FlashAttentionForward(const float *Q, const float *K,
  * @param K Key [batch, n_head, seq_len_kv, head_dim]
  * @param V Value [batch, n_head, seq_len_kv, head_dim]
  * @param O Output [batch, n_head, seq_len_q, head_dim]
+ * @param ith Thread index (0-based) for work partitioning
+ * @param nth Total number of threads for work partitioning
+ *
+ * Threading Model:
+ * - Work is partitioned across threads using ith/nth pattern
+ * - For GGML callbacks: ith/nth are provided by GGML's thread pool
+ * - For standalone usage: defaults ith=0, nth=1 (single-threaded)
  */
 inline void FlashAttentionBatched(const float *Q, const float *K,
                                   const float *V, float *O, int batch,
                                   int n_head, int seq_len_q, int seq_len_kv,
                                   int head_dim,
-                                  const FlashAttentionConfig &config) {
+                                  const FlashAttentionConfig &config,
+                                  int ith = 0, int nth = 1) {
   const int head_stride_q = seq_len_q * head_dim;
   const int head_stride_kv = seq_len_kv * head_dim;
   const int batch_stride_q = n_head * head_stride_q;
   const int batch_stride_kv = n_head * head_stride_kv;
 
+  // Thread-local scratch buffer
   FlashAttentionScratch scratch;
   scratch.Resize(config.block_m, config.block_n, head_dim);
 
-// Process each batch and head
-#pragma omp parallel for collapse(2) if (config.num_threads > 1)               \
-    firstprivate(scratch)
-  for (int b = 0; b < batch; b++) {
-    for (int h = 0; h < n_head; h++) {
-      const float *q_ptr = Q + b * batch_stride_q + h * head_stride_q;
-      const float *k_ptr = K + b * batch_stride_kv + h * head_stride_kv;
-      const float *v_ptr = V + b * batch_stride_kv + h * head_stride_kv;
-      float *o_ptr = O + b * batch_stride_q + h * head_stride_q;
+  // Work partitioning: flatten batch × head loop and distribute across threads
+  const int total_work = batch * n_head;
+  const int work_per_thread = (total_work + nth - 1) / nth;
+  const int work_start = ith * work_per_thread;
+  const int work_end = std::min(work_start + work_per_thread, total_work);
 
-      FlashAttentionForward(q_ptr, k_ptr, v_ptr, o_ptr, seq_len_q, seq_len_kv,
-                            head_dim, config, scratch);
-    }
+  for (int idx = work_start; idx < work_end; idx++) {
+    const int b = idx / n_head;
+    const int h = idx % n_head;
+
+    const float *q_ptr = Q + b * batch_stride_q + h * head_stride_q;
+    const float *k_ptr = K + b * batch_stride_kv + h * head_stride_kv;
+    const float *v_ptr = V + b * batch_stride_kv + h * head_stride_kv;
+    float *o_ptr = O + b * batch_stride_q + h * head_stride_q;
+
+    FlashAttentionForward(q_ptr, k_ptr, v_ptr, o_ptr, seq_len_q, seq_len_kv,
+                          head_dim, config, scratch);
   }
 }
 
@@ -222,34 +235,42 @@ inline void FlashAttentionBatched(const float *Q, const float *K,
  *
  * @param n_head_q Number of query heads
  * @param n_head_kv Number of key/value heads (must divide n_head_q)
+ * @param ith Thread index (0-based) for work partitioning
+ * @param nth Total number of threads for work partitioning
  */
 inline void FlashAttentionGQA(const float *Q, const float *K, const float *V,
                               float *O, int batch, int n_head_q, int n_head_kv,
                               int seq_len_q, int seq_len_kv, int head_dim,
-                              const FlashAttentionConfig &config) {
+                              const FlashAttentionConfig &config, int ith = 0,
+                              int nth = 1) {
   const int n_rep = n_head_q / n_head_kv; // KV head repetition factor
   const int head_stride_q = seq_len_q * head_dim;
   const int head_stride_kv = seq_len_kv * head_dim;
   const int batch_stride_q = n_head_q * head_stride_q;
   const int batch_stride_kv = n_head_kv * head_stride_kv;
 
+  // Thread-local scratch buffer
   FlashAttentionScratch scratch;
   scratch.Resize(config.block_m, config.block_n, head_dim);
 
-#pragma omp parallel for collapse(2) if (config.num_threads > 1)               \
-    firstprivate(scratch)
-  for (int b = 0; b < batch; b++) {
-    for (int h = 0; h < n_head_q; h++) {
-      const int kv_head = h / n_rep; // Which KV head to use
+  // Work partitioning: flatten batch × n_head_q loop and distribute
+  const int total_work = batch * n_head_q;
+  const int work_per_thread = (total_work + nth - 1) / nth;
+  const int work_start = ith * work_per_thread;
+  const int work_end = std::min(work_start + work_per_thread, total_work);
 
-      const float *q_ptr = Q + b * batch_stride_q + h * head_stride_q;
-      const float *k_ptr = K + b * batch_stride_kv + kv_head * head_stride_kv;
-      const float *v_ptr = V + b * batch_stride_kv + kv_head * head_stride_kv;
-      float *o_ptr = O + b * batch_stride_q + h * head_stride_q;
+  for (int idx = work_start; idx < work_end; idx++) {
+    const int b = idx / n_head_q;
+    const int h = idx % n_head_q;
+    const int kv_head = h / n_rep; // Which KV head to use
 
-      FlashAttentionForward(q_ptr, k_ptr, v_ptr, o_ptr, seq_len_q, seq_len_kv,
-                            head_dim, config, scratch);
-    }
+    const float *q_ptr = Q + b * batch_stride_q + h * head_stride_q;
+    const float *k_ptr = K + b * batch_stride_kv + kv_head * head_stride_kv;
+    const float *v_ptr = V + b * batch_stride_kv + kv_head * head_stride_kv;
+    float *o_ptr = O + b * batch_stride_q + h * head_stride_q;
+
+    FlashAttentionForward(q_ptr, k_ptr, v_ptr, o_ptr, seq_len_q, seq_len_kv,
+                          head_dim, config, scratch);
   }
 }
 

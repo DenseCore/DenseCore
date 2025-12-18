@@ -76,6 +76,7 @@ C++ core with **AVX-512 & AVX2** hand-tuned kernels.
 - **INT4 Quantization**: 7× compression, 5-6× faster inference.
 - **Continuous Batching**: Maximizes throughput.
 - **Graph Caching**: Reduces overhead by 40%.
+- **OpenMP Threading**: Full CPU core utilization.
 
 </td>
 <td width="50%">
@@ -103,6 +104,7 @@ Slash your cloud bills by **90%**.
 - **Kubernetes Native**: Helm charts & manifests included.
 - **Observability**: Prometheus metrics & OpenTelemetry tracing.
 - **Security**: Enterprise-grade API key management.
+- **NUMA-Aware**: Optimized for multi-socket servers.
 
 </td>
 </tr>

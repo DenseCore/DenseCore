@@ -1,7 +1,8 @@
 #include "inference.h"
 #include "flash_attention.h"
-#include "ggml.h"              // Required for ggml_tensor definition
-#include "hardware_topology.h" // For compute thread affinity
+#include "ggml.h"                // Required for ggml_tensor definition
+#include "hardware_topology.h"   // For compute thread affinity
+#include "optimization_bridge.h" // Runtime SIMD dispatch
 
 #ifndef GGML_KQ_MASK_PAD
 #define GGML_KQ_MASK_PAD 32
@@ -387,7 +388,8 @@ void cb_int4_gemm(struct ggml_tensor *dst, const struct ggml_tensor *src,
   }
 
   // Call the INT4 GEMM kernel for this thread's partition
-  densecore::simd::GemmInt4Fp32_AVX512(
+  // Uses OpsRegistry for runtime dispatch (AVX512 vs Scalar)
+  densecore::OpsRegistry::Instance().GemmInt4(
       C_local,       // Temporary output [M × n_local]
       A,             // Full activations [M × K]
       W_int4_local,  // Subset of weights [n_local × K]
@@ -480,9 +482,9 @@ inline struct ggml_tensor *smart_mul_mat(struct ggml_context *ctx,
                                          struct ggml_tensor *weight,
                                          struct ggml_tensor *input) {
 
-  // Check if INT4 quantization is available and should be used
-  static const bool use_int4_kernel = (densecore::simd::DetectSimdLevel() >=
-                                       densecore::simd::SimdLevel::AVX512);
+  // Check if INT4 quantization is available (OpsRegistry provides fallback)
+  // Always enabled - OpsRegistry::Init() selects best available kernel
+  static const bool use_int4_kernel = densecore::OpsRegistry::IsInitialized();
 
   if (use_int4_kernel && IsINT4Quantized(weight)) {
     // Use custom INT4 GEMM kernel
@@ -747,7 +749,10 @@ struct ggml_tensor *BuildTransformerGraph(
     // - AVX-512+: Use Flash Attention (ggml_flash_attn_ext) for efficiency
     // - Other: Use standard Q*K^T -> softmax -> V for compatibility
     // =========================================================================
+    // Note: Flash Attention still requires AVX-512 for correctness
+    // (uses GGML's ggml_flash_attn_ext which has AVX-512 requirement)
     static const bool use_flash_attention =
+        densecore::OpsRegistry::IsInitialized() &&
         (densecore::simd::DetectSimdLevel() >=
          densecore::simd::SimdLevel::AVX512);
 
