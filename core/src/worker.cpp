@@ -397,11 +397,12 @@ void EngineLoop(EngineState *state) {
         if (!cacheable) {
           // Temp context for one-off graphs (Prefill etc)
           struct ggml_init_params params = {
-              .mem_size = 16 * 1024 * 1024,
+              .mem_size = 512 * 1024 * 1024, // Increased to 512MB to fix OOM with deep models
               .mem_buffer = nullptr,
               .no_alloc = false,
           };
           ctx_temp_guard = densecore::GGMLContextGuard(ggml_init(params));
+          std::cerr << "[DenseCore] Worker Graph Context initialized: 512 MB" << std::endl;
           ctx_nodes = ctx_temp_guard.get();
         }
 

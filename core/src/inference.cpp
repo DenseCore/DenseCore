@@ -508,6 +508,10 @@ struct ggml_tensor *BuildTransformerGraph(
     const BatchSpec &batch, bool embedding_mode, struct ggml_cgraph *gf,
     struct ggml_tensor **out_embd, struct ggml_tensor **out_pos) {
 
+  // ENSURE: ctx_c must be initialized with sufficient memory (e.g. 128MB+)
+  // to hold the compute graph nodes, especially for deep models like Qwen.
+  // This initialization happens in worker.cpp (InitGraphCache or temp context).
+
   const int N = batch.tokens.size();
   const int n_embd = model->hparams.n_embd;
   const int n_head = model->hparams.n_head;

@@ -247,6 +247,7 @@ def _find_library() -> str:
         Path(__file__).parent / "lib",
         Path(__file__).parent.parent,
         Path(__file__).parent.parent.parent / "build",
+        Path(__file__).parent.parent.parent / "core" / "build",  # Added: correctly locate core build artifacts
         Path("/usr/local/lib"),
         Path("/usr/lib"),
     ]
@@ -332,6 +333,7 @@ class DenseCore:
         self._handle = None
         self._closed = True
         self._requests: dict[int, Any] = {}
+        self._active_ctypes_refs: dict[int, list] = {}  # Prevent GC of ctypes objects
         self._req_id_counter = 0
         self._lock = threading.Lock()
         self._verbose = verbose
@@ -567,6 +569,7 @@ class DenseCore:
         if finished:
             with self._lock:
                 self._requests.pop(req_id, None)
+                self._active_ctypes_refs.pop(req_id, None)  # Release ctypes refs
 
     def _register_request(self, handler: Callable[[str, bool], None]) -> int:
         """Register a request handler and return request ID."""
@@ -596,6 +599,9 @@ class DenseCore:
 
         tokens = self.tokenizer.encode(prompt, add_special_tokens=True)
         tokens_array = (ctypes.c_int * len(tokens))(*tokens)
+        # CRITICAL: Keep ctypes array reference alive until C++ is done!
+        with self._lock:
+            self._active_ctypes_refs[req_id] = [tokens_array]
         res = self._lib.SubmitRequestIds(
             self._handle,
             tokens_array,
@@ -786,6 +792,9 @@ class DenseCore:
         if prompt_tokens is not None:
             # Use tokenized input
             tokens_array = (ctypes.c_int * len(prompt_tokens))(*prompt_tokens)
+            # CRITICAL: Keep ctypes array reference alive until C++ is done!
+            with self._lock:
+                self._active_ctypes_refs[req_id] = [tokens_array]
             ret = self._lib.SubmitRequestIds(
                 self._handle,
                 tokens_array,
@@ -801,6 +810,7 @@ class DenseCore:
         if ret < 0:
             with self._lock:
                 self._requests.pop(req_id, None)
+                self._active_ctypes_refs.pop(req_id, None)
             raise _error_code_to_exception(ret, context="in generate()")
 
         # Collect generated tokens
@@ -1061,6 +1071,7 @@ class DenseCore:
         if ret < 0:
             with self._lock:
                 self._requests.pop(req_id, None)
+                self._active_ctypes_refs.pop(req_id, None)
             raise _error_code_to_exception(ret, context="in stream_async()")
 
         while True:

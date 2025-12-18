@@ -5,6 +5,7 @@
 #include "kv_cache.h"
 #include "model_loader.h"
 #include "model_types.h"
+#include "optimization_bridge.h" // Runtime SIMD dispatch
 #include "simd_ops.h"
 #include "tokenizer.h"
 #include <algorithm>
@@ -119,6 +120,17 @@ DENSECORE_API DenseCoreHandle InitEngine(const char *model_path,
     std::cout << "[DenseCore] OpenMP configured: " << threads << " threads"
               << std::endl;
 #endif
+
+    // =========================================================================
+    // SIMD DISPATCH TABLE INITIALIZATION (Must happen before any inference!)
+    // =========================================================================
+    // OpsRegistry selects optimal kernel implementations based on CPU caps.
+    // Initializing here ensures the dispatch table is ready before generate()
+    // is called, even if the worker thread hasn't started yet.
+    // =========================================================================
+    if (!densecore::OpsRegistry::IsInitialized()) {
+      densecore::OpsRegistry::Init();
+    }
 
     // Update global inference config for Flash Attention and other parallel ops
     InferenceConfig::Instance().num_threads = threads;

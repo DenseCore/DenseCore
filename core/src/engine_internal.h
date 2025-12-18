@@ -355,11 +355,13 @@ struct EngineState {
     // Initialize persistent graph context (holds node definitions)
     // 16MB should be enough for graph topology metadata
     struct ggml_init_params params = {
-        .mem_size = 16 * 1024 * 1024,
+        .mem_size = 512 * 1024 * 1024, // 512 MB for complex graph caching
         .mem_buffer = nullptr,
         .no_alloc = false,
     };
     graph_ctx = ggml_init(params);
+    std::cerr << "[DenseCore] InitGraphCache: Context initialized with 512 MB"
+              << std::endl;
   }
 
   void FreeGraphCache() {

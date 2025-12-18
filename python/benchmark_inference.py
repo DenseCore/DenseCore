@@ -7,17 +7,18 @@ def run_benchmark(model_id, duration_seconds=10):
     # Use native API
     try:
         model_path = densecore.download_model(model_id)
-        # Use original repo for tokenizer
-        tokenizer_id = "Qwen/Qwen2.5-0.5B-Instruct"
+        # Derive tokenizer from model_id (strip -GGUF suffix if present)
+        tokenizer_id = model_id.replace("-GGUF", "").replace("-Instruct-GGUF", "-Instruct")
         print(f"Loading model from {model_path} with tokenizer from {tokenizer_id}")
-        model = densecore.DenseCore(model_path, hf_repo_id=tokenizer_id, threads=4)
+        model = densecore.DenseCore(model_path, hf_repo_id=tokenizer_id, threads=16)
     except Exception as e:
         print(f"Error loading model: {e}")
         return
 
     print("Warming up...")
     try:
-        model.generate("Hello", max_tokens=1) # Warmup
+        result1 = model.generate("Hello", max_tokens=24) # Warmup
+        print(result1)
     except Exception as e:
         print(f"Warmup warning: {e}")
 
@@ -28,7 +29,8 @@ def run_benchmark(model_id, duration_seconds=10):
     
     try:
         # Use generate for reliable token counting
-        result = model.generate(prompt, max_tokens=256)
+        result = model.generate(prompt, max_tokens=32)
+        print(result)
         # Rough token count based on output (space-separated)
         token_count = len(result.split())
     except Exception as e:
@@ -45,7 +47,7 @@ def run_benchmark(model_id, duration_seconds=10):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct-GGUF", help="Model to benchmark")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-GGUF", help="Model to benchmark")
     args = parser.parse_args()
     
     run_benchmark(args.model)
