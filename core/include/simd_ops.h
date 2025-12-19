@@ -2672,9 +2672,18 @@ inline void ComputeQKV_AVX512(float *q, float *k, float *v, const float *x,
 
 /**
  * @brief Fused Add + RMSNorm in one pass (AVX2 optimized)
+ *
+ * SAFETY: This function handles arbitrary dimension sizes (dim % 8 != 0) via:
+ *   - Main loop: processes 8 elements at a time (i + 8 <= n)
+ *   - Scalar fallback: handles remaining 0-7 elements
+ *   - Uses _mm256_loadu_ps (unaligned loads) for safety with arbitrary pointers
  */
 inline void AddRMSNorm_AVX2(float *x_out, const float *x, const float *residual,
                             const float *rms_w, size_t n, float eps = 1e-5f) {
+  // Early exit for empty input
+  if (n == 0)
+    return;
+
   __m256 sos_vec = _mm256_setzero_ps();
   size_t i = 0;
 
@@ -2738,6 +2747,19 @@ inline void AddRMSNorm_AVX2(float *x_out, const float *x, const float *residual,
 
 /**
  * @brief Fused Q/K/V projection (AVX2 optimized)
+ *
+ * SAFETY: This function handles arbitrary dimension sizes (dim % 8 != 0) via:
+ *   - Main loop: processes 8 elements at a time for dot product (d + 8 <=
+ * n_embd)
+ *   - Scalar fallback: handles remaining 0-7 elements in inner dimension
+ *   - Output loop handles odd output dimensions via single-element remainder
+ * loop
+ *   - Uses _mm256_loadu_ps (unaligned loads) for safety with arbitrary pointers
+ *
+ * Structure:
+ *   - Q projection with 2x unrolling + scalar remainder
+ *   - K projection with 2x unrolling + scalar remainder
+ *   - V projection with 2x unrolling + scalar remainder
  */
 inline void ComputeQKV_AVX2(float *q, float *k, float *v, const float *x,
                             const float *w_q, const float *w_k,
@@ -2821,6 +2843,7 @@ inline void ComputeQKV_AVX2(float *q, float *k, float *v, const float *x,
       acc1 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w1 + d), acc1);
     }
 
+    // Helper lambda for reduction
     auto hsum256 = [](__m256 v) -> float {
       __m128 hi = _mm256_extractf128_ps(v, 1);
       __m128 lo = _mm256_castps256_ps128(v);
@@ -2839,21 +2862,24 @@ inline void ComputeQKV_AVX2(float *q, float *k, float *v, const float *x,
     }
   }
 
+  // Remaining K outputs (handles dim_k % UNROLL != 0)
   for (; ok < dim_k; ok++) {
     __m256 acc = _mm256_setzero_ps();
     const float *w = w_k + ok * n_embd;
     int d = 0;
+    // Vectorized dot product
     for (; d + 8 <= n_embd; d += 8) {
       acc =
           _mm256_fmadd_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(w + d), acc);
     }
+    // Horizontal reduction
     __m128 hi = _mm256_extractf128_ps(acc, 1);
     __m128 lo = _mm256_castps256_ps128(acc);
     __m128 s = _mm_add_ps(lo, hi);
     s = _mm_add_ps(s, _mm_movehl_ps(s, s));
     s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
     float sum = _mm_cvtss_f32(s);
-
+    // Scalar remainder for n_embd % 8 != 0
     for (; d < n_embd; d++) {
       sum += x[d] * w[d];
     }
@@ -2894,21 +2920,24 @@ inline void ComputeQKV_AVX2(float *q, float *k, float *v, const float *x,
     }
   }
 
+  // Remaining V outputs (handles dim_v % UNROLL != 0)
   for (; ov < dim_v; ov++) {
     __m256 acc = _mm256_setzero_ps();
     const float *w = w_v + ov * n_embd;
     int d = 0;
+    // Vectorized dot product
     for (; d + 8 <= n_embd; d += 8) {
       acc =
           _mm256_fmadd_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(w + d), acc);
     }
+    // Horizontal reduction
     __m128 hi = _mm256_extractf128_ps(acc, 1);
     __m128 lo = _mm256_castps256_ps128(acc);
     __m128 s = _mm_add_ps(lo, hi);
     s = _mm_add_ps(s, _mm_movehl_ps(s, s));
     s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
     float sum = _mm_cvtss_f32(s);
-
+    // Scalar remainder for n_embd % 8 != 0
     for (; d < n_embd; d++) {
       sum += x[d] * w[d];
     }

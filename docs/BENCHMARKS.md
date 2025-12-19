@@ -1,6 +1,6 @@
 # 🚀 DenseCore Performance Benchmark Report
 
-**Last Updated**: 2025-12-19
+**Last Updated**: 2025-12-20
 **Platform**: Intel Core i7-10870H (Comet Lake, 8C/16T)
 **Quantization**: Q4_K_M (INT4)
 **SIMD**: AVX2 + FMA3 (Runtime CPUID detection - portable binary)
@@ -13,12 +13,20 @@ Tested on Intel Comet Lake CPU with AVX2 optimized kernels.
 
 | Model | Size | Load Time | **TPS** | Context |
 |-------|------|-----------|---------|---------|
-| **Qwen2.5-0.5B** | 0.5 GB | 11.6s | **28.5** | 4096 |
-| **TinyLlama-1.1B** | 0.7 GB | 6.9s | **22.1** | 4096 |
-| **Qwen3-4B** | 2.5 GB | 17.8s | **6.6** | 4096 |
-| **Qwen3-8B** | 4.7 GB | 384s | **4.0** | 3640 |
+| **Qwen2.5-0.5B** | 0.5 GB | - | **Failed (Segfault)** | - |
+| **TinyLlama-1.1B** | 0.7 GB | 6.9s | **22.1*** | 4096 |
+| **Qwen3-4B** | 2.5 GB | - | **Failed (Hang)** | - |
+| **Llama-3-8B** | 5.2 GB | - | **Failed (Hang)** | - |
+| **Qwen3-8B** | 4.7 GB | - | **Failed (Hang)** | - |
 
-> ✅ **Performance Jump:** Recent optimizations (Graph Caching, Smart Preemption) have improved throughput by **~50%** across all models.
+> *TinyLlama result from previous stable checkpoint.
+
+> ⚠️ **Stability Alert:** Current build exhibits persistent segmentation faults and threading deadlocks on pure AVX2 environments (e.g. i7-10870H). Known issues:
+> 1. Thread pool race condition (Segfaults during warmup).
+> 2. AVX2 Kernel alignment sensitivity.
+> 3. Qwen3-4B/8B RoPE table mismatch (Fixed in codebase, but hanging).
+
+> ✅ **Fixes Applied:** memory alignment (64-byte), buffer initialization, Qwen3 RoPE table size. Race condition investigation ongoing.
 
 ---
 
@@ -26,9 +34,10 @@ Tested on Intel Comet Lake CPU with AVX2 optimized kernels.
 
 | Model | DenseCore TPS | Transformers TPS | **Speedup** |
 |-------|---------------|-----------------|-------------|
-| Qwen2.5-0.5B | **28.5** | ~3-4 | **7-9x** |
+| Qwen2.5-0.5B | **-** | ~3-4 | **-** |
 | TinyLlama-1.1B | **22.1** | ~2 | **11x** |
-| Qwen3-8B | **4.0** | ~0.5 | **8x** |
+| Llama-3-8B | **-** | ~0.8 | **-** |
+| Qwen3-8B | **-** | ~0.5 | **-** |
 
 > Note: Transformers benchmarks run on same hardware with standard FP32/FP16 execution.
 
@@ -40,10 +49,12 @@ Tested on Intel Comet Lake CPU with AVX2 optimized kernels.
 
 | Instance | vCPU | Cost/hr | TPS | Cost per 1M tok |
 |----------|------|---------|-----|-----------------|
-| **DenseCore (c7i.large)** | 2 | $0.085 | ~28 | **$0.84** |
+| **DenseCore (c7i.large)** | 2 | $0.085 | ~28* | **$0.84** |
 | **GPU (g4dn.xlarge)** | 4 | $0.526 | ~50 | $2.92 |
 
-> 💰 **Savings:** DenseCore is **3.5x cheaper** per token generated compared to GPU instances for SLMs.
+> *Estimated based on architectural targets.
+
+> 💰 **Savings:** DenseCore is targetting **3.5x cheaper** per token generated compared to GPU instances for SLMs.
 
 ---
 
@@ -51,12 +62,13 @@ Tested on Intel Comet Lake CPU with AVX2 optimized kernels.
 
 ```
 Small Models (0.5-1B):
-  ├─ Qwen2.5-0.5B: 28.5 tok/s  ████████████████████████████
+  ├─ Qwen2.5-0.5B: TBD (Unstable)
   └─ TinyLlama-1.1B: 22.1 tok/s ██████████████████████
 
 Medium Models (4-8B):
-  ├─ Qwen3-4B: 6.6 tok/s       ██████
-  └─ Qwen3-8B: 4.0 tok/s       ████
+  ├─ Qwen3-4B: TBD (Hang)
+  ├─ Llama-3-8B: TBD (Hang)
+  └─ Qwen3-8B: TBD (Hang)
 ```
 
 ---
@@ -78,7 +90,8 @@ Medium Models (4-8B):
 
 | Architecture | Models | Status |
 |--------------|--------|--------|
-| **qwen2** | Qwen2.5-0.5B, Qwen2.5-1.5B | ✅ Verified |
+| **qwen2** | Qwen2.5-0.5B, Qwen2.5-1.5B | ⚠️ Unstable (AVX2) |
+| **qwen3** | Qwen3-4B, Qwen3-8B | ⚠️ Unstable (AVX2) |
 | **llama** | TinyLlama-1.1B, Llama-3.2 | ✅ Verified |
 | **phi3** | Phi-3.5-Mini | ⚠️ In Progress (Q8_0 verified, Q4 pending) |
 
@@ -88,6 +101,6 @@ Medium Models (4-8B):
 
 | Use Case | Recommended Model | Expected TPS |
 |----------|-------------------|--------------|
-| **Real-time Chat** | Qwen2.5-0.5B | 25+ tok/s |
+| **Real-time Chat** | Qwen2.5-0.5B | 25+ tok/s (Pending Fix) |
 | **function_calling** | TinyLlama-1.1B | 20+ tok/s |
-| **RAG / Analytics** | Qwen3-8B | 6+ tok/s |
+| **RAG / Analytics** | Qwen3-8B | 6+ tok/s (Pending Fix) |

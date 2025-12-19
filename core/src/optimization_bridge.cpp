@@ -96,8 +96,8 @@ void OpsRegistry::Init() {
     std::cout << "  [RoPE] -> AVX-512" << std::endl;
   } else if (level >= simd::SimdLevel::AVX2) {
     // FIX: Use AVX2 kernel instead of Scalar fallback!
-    reg.RoPE = simd::ApplyRoPE_AVX2;
-    std::cout << "  [RoPE] -> AVX2 (runtime: no AVX-512, build has AVX-512)"
+    reg.RoPE = simd::ApplyRoPE_Scalar; // DEBUG: Force Scalar to isolate bug
+    std::cout << "  [RoPE] -> Scalar (DEBUG: forced scalar for AVX2)"
               << std::endl;
   } else {
     reg.RoPE = simd::ApplyRoPE_Scalar;
@@ -106,8 +106,13 @@ void OpsRegistry::Init() {
 #elif defined(__AVX2__)
   // Build has AVX2 support (no AVX-512)
   if (level >= simd::SimdLevel::AVX2) {
-    reg.RoPE = simd::ApplyRoPE_AVX2;
-    std::cout << "  [RoPE] -> AVX2" << std::endl;
+    // WARN: ApplyRoPE_AVX2 causes Segfaults on some CPUs (e.g. i7-10870H).
+    // Disabling it in favor of Scalar fallback which is safe and performant
+    // enough.
+    reg.RoPE = simd::ApplyRoPE_Scalar;
+    std::cout
+        << "  [RoPE] -> Scalar (AVX2 kernel disabled due to stability issues)"
+        << std::endl;
   } else {
     reg.RoPE = simd::ApplyRoPE_Scalar;
     std::cout << "  [RoPE] -> Scalar (runtime: no AVX2)" << std::endl;

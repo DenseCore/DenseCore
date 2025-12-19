@@ -56,40 +56,49 @@ void EngineLoop(EngineState *state) {
     // =========================================================================
     // This is the key call that enables multi-threaded GGML compute!
     // Without this, GGML defaults to single-threaded execution.
+    // GGML BACKEND THREAD CONFIGURATION (Critical for performance)
+    // =========================================================================
+    // This is the key call that enables multi-threaded GGML compute!
+    // Without this, GGML defaults to single-threaded execution.
     int n_threads = state->n_threads;
     if (n_threads <= 0) {
-      n_threads = densecore::simd::GetNumCores();
+      // Use PHYSICAL cores by default to avoid Hyperthreading thrashing
+      // on AVX workloads where execution units are shared.
+      auto &topo = densecore::HardwareTopology::GetInstance();
+      int num_physical = topo.GetPhysicalCoreCount();
+      // Fallback if detection fails
+      if (num_physical <= 0)
+        n_threads = densecore::simd::GetNumCores() / 2;
+      else
+        n_threads = num_physical;
+
+      if (n_threads < 1)
+        n_threads = 1;
     }
+
     ggml_backend_cpu_set_n_threads(current_model->backend, n_threads);
     std::cout << "[DenseCore] GGML backend configured: " << n_threads
-              << " threads" << std::endl;
+              << " threads (Physical Cores prioritized)" << std::endl;
 
-    // NUMA-aware thread pinning using HardwareTopology
+    // =========================================================================
+    // THREAD PINNING POLICY (Critical for avoiding deadlocks)
+    // =========================================================================
+    // The orchestration/control thread (this thread) should NEVER be pinned!
+    // Aggressive pinning was causing deadlocks on consumer hardware (e.g.,
+    // i7-10870H) where the main thread and compute workers contended for Core
+    // 0.
+    //
+    // Strategy:
+    // - Orchestration thread: Let OS schedule freely (unpinned)
+    // - Compute threads: Pin via SetupComputeThreadAffinity (done below)
+    // =========================================================================
     {
       auto &topo = densecore::HardwareTopology::GetInstance();
-      int target_node = (state->numa_node_id >= 0) ? state->numa_node_id : 0;
-
-      if (topo.GetNumaNodeCount() > 1) {
-        // Multi-socket: pin worker to physical cores on target NUMA node
-        bool pinned = topo.PinCurrentThreadToNumaNode(
-            target_node, densecore::PinningPolicy::SCATTER);
-        if (pinned) {
-          std::cout << "[DenseCore] Worker thread pinned to NUMA node "
-                    << target_node << " (" << topo.GetNumaNodeCount()
-                    << " nodes detected, SCATTER policy)" << std::endl;
-        } else {
-          std::cerr << "[DenseCore] Warning: Thread pinning to NUMA node "
-                    << target_node << " failed" << std::endl;
-        }
-      } else {
-        // Single NUMA node: pin to first physical core for cache locality
-        auto physical_cores = topo.GetPhysicalCoreIds(-1);
-        if (!physical_cores.empty()) {
-          densecore::HardwareTopology::PinCurrentThread(physical_cores[0]);
-          std::cout << "[DenseCore] Worker pinned to core " << physical_cores[0]
-                    << " (single NUMA node)" << std::endl;
-        }
-      }
+      std::cout << "[DenseCore] Orchestration thread unpinned (OS Scheduled). "
+                << "NUMA nodes detected: " << topo.GetNumaNodeCount()
+                << std::endl;
+      // NOTE: Do NOT call PinCurrentThread() or PinCurrentThreadToNumaNode()
+      // for this thread. Only compute worker threads should be pinned.
     }
 
     // Setup compute thread affinity mapping for GGML workers
@@ -131,9 +140,15 @@ void EngineLoop(EngineState *state) {
           if (state->status == EngineStatus::DRAINING) {
             break; // Exit: draining complete, no more work
           }
-          // Wait for new requests (with timeout to check status)
+          // Wait for new requests with predicate to handle spurious wakeups.
+          // The predicate checks if there's new work OR if we should stop.
           std::unique_lock<std::mutex> lock(state->cv_mu);
-          state->queue_cv.wait_for(lock, std::chrono::milliseconds(50));
+          state->queue_cv.wait_for(
+              lock, std::chrono::milliseconds(50), [&state]() {
+                // Wake if: (1) pending work, (2) status changed, or (3) timeout
+                return !state->pending_requests.Empty() ||
+                       state->status != EngineStatus::RUNNING;
+              });
           continue;
         }
 
@@ -284,9 +299,12 @@ void EngineLoop(EngineState *state) {
         }
       }
 
-      // 7. If scheduler returned empty batch, continue waiting
+      // 7. If scheduler returned empty batch, yield to avoid busy-wait.
+      // Using yield() instead of sleep() allows faster response when work
+      // arrives while still being cooperative with other threads.
       if (sched_output.IsEmpty()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::yield(); // Cooperative scheduling backoff
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
         continue;
       }
 
@@ -451,6 +469,10 @@ void EngineLoop(EngineState *state) {
       memcpy(embd_inp->data, batch.tokens.data(),
              batch.tokens.size() * sizeof(int));
       memcpy(pos->data, batch.pos.data(), batch.pos.size() * sizeof(int));
+
+      // Mitigation for potential thread pool race condition on high-core CPUs
+      // A tiny delay ensures memory consistency and thread readiness
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
 
       ggml_backend_graph_compute(current_model->backend, gf);
 

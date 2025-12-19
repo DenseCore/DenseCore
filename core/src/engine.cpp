@@ -221,6 +221,9 @@ DENSECORE_API DenseCoreHandle InitEngine(const char *model_path,
       return nullptr;
     }
 
+    // Initialize compute buffer (Persistent, Aligned)
+    state->InitComputeBuffer();
+
     // Start background thread
     state->status = EngineStatus::RUNNING;
     state->worker_thread = std::thread(EngineLoop, state);

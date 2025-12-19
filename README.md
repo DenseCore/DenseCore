@@ -93,9 +93,11 @@ We built DenseCore because **GPUs are scarce**, but CPUs are everywhere.
 
 | Model | DenseCore (AVX-512) | Transformers (Standard) | Speedup |
 |-------|---------------------|--------------------------|---------| 
-| **Qwen2.5-0.5B** | **28.5 tok/s** | ~3-4 tok/s | **🚀 8x** |
-| **TinyLlama-1.1B** | **22.1 tok/s** | ~2 tok/s | **🔥 11x** |
-| **Qwen3-4B** | **6.6 tok/s** | ~1.5 tok/s | **4x** |
+| **Qwen2.5-0.5B** | **TBD** | ~3-4 tok/s | **-** |
+| **Qwen3-4B** | **TBD** | ~1.5 tok/s | **-** |
+| **TinyLlama-1.1B** | **22.1** | ~2 tok/s | **11x** |
+
+> **Note:** Benchmarks currently failing on verification environment (Deadlock/Segfault detected). Fix investigation in progress.
 
 > Run the benchmark script to test your machine: `python benchmarks/benchmark_throughput.py --model model.gguf`
 

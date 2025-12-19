@@ -274,7 +274,10 @@ void InitRoPETable(TransformerModel *model) {
     return;
 
   const int n_ctx = model->hparams.n_ctx;
-  const int head_dim = model->hparams.n_embd / model->hparams.n_head;
+  int head_dim = model->hparams.n_embd / model->hparams.n_head;
+  if (model->hparams.n_embd_head_k > 0) {
+    head_dim = model->hparams.n_embd_head_k;
+  }
   const float freq_base = model->hparams.rope_freq_base;
 
   // Reuse RoPETable from simd_ops.h to avoid code duplication

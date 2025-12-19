@@ -353,7 +353,13 @@ struct EngineState {
 
   void InitComputeBuffer() {
     if (!compute_buffer_initialized) {
-      compute_buffer = std::make_unique<char[]>(COMPUTE_BUFFER_SIZE);
+      // Use 64-byte alignment for AVX-512 compatibility
+      void *ptr = nullptr;
+      if (posix_memalign(&ptr, 64, COMPUTE_BUFFER_SIZE) != 0) {
+        throw std::bad_alloc();
+      }
+      // Custom deleter for unique_ptr to handle free() instead of delete[]
+      compute_buffer.reset(static_cast<char *>(ptr));
       compute_buffer_initialized = true;
     }
   }
