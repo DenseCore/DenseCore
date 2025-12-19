@@ -17,10 +17,10 @@ namespace densecore {
 // =============================================================================
 
 /**
- * Scalar INT4 GEMM fallback (when AVX512 not available at runtime)
+ * Scalar INT4 GEMM fallback (when AVX512/AVX2 not available at runtime)
  *
  * This is a standalone scalar implementation that's always available,
- * not guarded by __AVX512F__ preprocessor.
+ * not guarded by __AVX512F__ or __AVX2__ preprocessor.
  */
 static void GemmInt4Fp32_Scalar(float *C, const float *A, const uint8_t *W_int4,
                                 const float *scales, const float *zero_points,
@@ -86,37 +86,71 @@ void OpsRegistry::Init() {
   // ---------------------------------------------------------------------
   // RoPE Dispatch
   // ---------------------------------------------------------------------
-  // ApplyRoPE_Scalar is always available (no SIMD guard)
-  // ApplyRoPE_AVX512 is available only if compiled with AVX512 support
-  // AND CPU has AVX512 at runtime
+  // Dispatch chain: AVX512 -> AVX2 -> Scalar
+  // NOTE: Runtime detection + compile-time guards for multi-ISA support
+
 #if defined(__AVX512F__)
+  // Build has AVX-512 support
   if (level >= simd::SimdLevel::AVX512) {
     reg.RoPE = simd::ApplyRoPE_AVX512;
     std::cout << "  [RoPE] -> AVX-512" << std::endl;
+  } else if (level >= simd::SimdLevel::AVX2) {
+    // FIX: Use AVX2 kernel instead of Scalar fallback!
+    reg.RoPE = simd::ApplyRoPE_AVX2;
+    std::cout << "  [RoPE] -> AVX2 (runtime: no AVX-512, build has AVX-512)"
+              << std::endl;
   } else {
     reg.RoPE = simd::ApplyRoPE_Scalar;
-    std::cout << "  [RoPE] -> Scalar (CPU lacks AVX-512)" << std::endl;
+    std::cout << "  [RoPE] -> Scalar (runtime: no AVX2)" << std::endl;
+  }
+#elif defined(__AVX2__)
+  // Build has AVX2 support (no AVX-512)
+  if (level >= simd::SimdLevel::AVX2) {
+    reg.RoPE = simd::ApplyRoPE_AVX2;
+    std::cout << "  [RoPE] -> AVX2" << std::endl;
+  } else {
+    reg.RoPE = simd::ApplyRoPE_Scalar;
+    std::cout << "  [RoPE] -> Scalar (runtime: no AVX2)" << std::endl;
   }
 #else
-  // Compiled without AVX512 support
+  // Build without AVX2/AVX512 support
   reg.RoPE = simd::ApplyRoPE_Scalar;
-  std::cout << "  [RoPE] -> Scalar (build without AVX-512)" << std::endl;
+  std::cout << "  [RoPE] -> Scalar (build without AVX2/AVX-512)" << std::endl;
 #endif
 
   // ---------------------------------------------------------------------
   // GemmInt4 Dispatch
   // ---------------------------------------------------------------------
+  // Dispatch chain: AVX512 -> AVX2 -> Scalar
+
 #if defined(__AVX512F__)
+  // Build has AVX-512 support
   if (level >= simd::SimdLevel::AVX512) {
     reg.GemmInt4 = simd::GemmInt4Fp32_AVX512;
     std::cout << "  [GemmInt4] -> AVX-512" << std::endl;
+  } else if (level >= simd::SimdLevel::AVX2) {
+    // FIX: Use AVX2 kernel instead of Scalar fallback!
+    reg.GemmInt4 = simd::GemmInt4Fp32_AVX2;
+    std::cout << "  [GemmInt4] -> AVX2 (runtime: no AVX-512, build has AVX-512)"
+              << std::endl;
   } else {
     reg.GemmInt4 = GemmInt4Fp32_Scalar;
-    std::cout << "  [GemmInt4] -> Scalar (CPU lacks AVX-512)" << std::endl;
+    std::cout << "  [GemmInt4] -> Scalar (runtime: no AVX2)" << std::endl;
+  }
+#elif defined(__AVX2__)
+  // Build has AVX2 support (no AVX-512)
+  if (level >= simd::SimdLevel::AVX2) {
+    reg.GemmInt4 = simd::GemmInt4Fp32_AVX2;
+    std::cout << "  [GemmInt4] -> AVX2" << std::endl;
+  } else {
+    reg.GemmInt4 = GemmInt4Fp32_Scalar;
+    std::cout << "  [GemmInt4] -> Scalar (runtime: no AVX2)" << std::endl;
   }
 #else
+  // Build without AVX2/AVX512 support
   reg.GemmInt4 = GemmInt4Fp32_Scalar;
-  std::cout << "  [GemmInt4] -> Scalar (build without AVX-512)" << std::endl;
+  std::cout << "  [GemmInt4] -> Scalar (build without AVX2/AVX-512)"
+            << std::endl;
 #endif
 
   // ---------------------------------------------------------------------

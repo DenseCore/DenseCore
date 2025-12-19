@@ -18,7 +18,7 @@ core/third_party/
 *.test
 *.out
 vendor/
-
+.mypy_cache/
 # Python build artifacts
 __pycache__/
 *.py[cod]

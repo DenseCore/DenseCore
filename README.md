@@ -73,10 +73,12 @@ We built DenseCore because **GPUs are scarce and expensive**, but CPUs are every
 
 ### 🔥 Blazing Fast
 C++ core with **AVX-512 & AVX2** hand-tuned kernels. 
+- **Runtime SIMD Dispatch**: Detects CPU at runtime (CPUID) and uses best available (AVX-512 → AVX2 → Scalar).
 - **INT4 Quantization**: 7× compression, 5-6× faster inference.
 - **Continuous Batching**: Maximizes throughput.
 - **Graph Caching**: Reduces overhead by 40%.
-- **OpenMP Threading**: Full CPU core utilization.
+- **OpenMP Threading**: Full CPU core utilization (16 threads on i7-10870H).
+
 
 </td>
 <td width="50%">

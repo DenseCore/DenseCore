@@ -1,14 +1,15 @@
 # 🚀 DenseCore Performance Benchmark Report
 
-**Last Updated**: 2025-12-13
-**Platform**: Standard Cloud Instance (4 vCPU / 8GB RAM)
+**Last Updated**: 2025-12-19
+**Platform**: Intel Core i7-10870H (Comet Lake, 8C/16T)
 **Quantization**: Q4_K_M (INT4)
+**SIMD**: AVX2 + FMA3 (Runtime CPUID detection - portable binary)
 
 ---
 
 ## 📊 Latest Benchmark Results
 
-Tested on `c7i.large` equivalent environment.
+Tested on Intel Comet Lake CPU with AVX2 optimized kernels.
 
 | Model | Size | Load Time | **TPS** | Context |
 |-------|------|-----------|---------|---------|
@@ -64,7 +65,12 @@ Medium Models (4-8B):
 
 1.  **Graph Caching**: Reuses computation graphs, saving 30% CPU cycles on small batch sizes.
 2.  **Continuous Batching**: Maximizes CPU utilization by processing requests immediately.
-3.  **SIMD Kernels**: AVX-512 integration ensures max FLOPs/cycle.
+3.  **SIMD Kernels**: Runtime CPUID-based dispatch (portable binaries):
+    - **AVX-512**: Full 512-bit vectors (16 floats), 16x register blocking for GEMM
+    - **AVX2 + FMA3**: 256-bit vectors (8 floats), 8x register blocking for GEMM
+    - **Scalar**: Fallback for legacy CPUs
+    - *Binary compiled with AVX-512 will auto-fallback to AVX2 on Comet Lake/Skylake*
+4.  **INT4 Unpacking**: Optimized nibble extraction with shift-based sign extension (no branches).
 
 ---
 

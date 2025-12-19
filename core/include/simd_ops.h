@@ -67,10 +67,70 @@ enum class SimdLevel {
 
 inline SimdLevel DetectSimdLevel() {
 #ifdef DENSECORE_X86
-  // Check CPUID for x86 - ordered from highest to lowest capability
-#if defined(__AMX_TILE__)
-  return SimdLevel::AMX;
-#elif defined(__AVX512F__)
+  // -------------------------------------------------------------------------
+  // Runtime CPUID-based detection (portable binary support)
+  // -------------------------------------------------------------------------
+#if defined(_MSC_VER)
+  // MSVC: Use __cpuid intrinsic
+  int cpuid_info[4] = {0};
+
+  // Check for AVX-512F: CPUID(7, 0).EBX bit 16
+  __cpuidex(cpuid_info, 7, 0);
+  bool has_avx512f = (cpuid_info[1] & (1 << 16)) != 0;
+
+  // Check for AVX2: CPUID(7, 0).EBX bit 5
+  bool has_avx2 = (cpuid_info[1] & (1 << 5)) != 0;
+
+  // Check for FMA: CPUID(1, 0).ECX bit 12
+  __cpuid(cpuid_info, 1);
+  bool has_fma = (cpuid_info[2] & (1 << 12)) != 0;
+
+  // Check for AVX: CPUID(1, 0).ECX bit 28
+  bool has_avx = (cpuid_info[2] & (1 << 28)) != 0;
+
+  // Check for SSE4.1: CPUID(1, 0).ECX bit 19
+  bool has_sse41 = (cpuid_info[2] & (1 << 19)) != 0;
+
+  // Check for AMX-TILE: CPUID(7, 0).EDX bit 24
+  __cpuidex(cpuid_info, 7, 0);
+  bool has_amx_tile = (cpuid_info[3] & (1 << 24)) != 0;
+
+  if (has_amx_tile && has_avx512f) {
+    return SimdLevel::AMX;
+  } else if (has_avx512f) {
+    return SimdLevel::AVX512;
+  } else if (has_avx2 && has_fma) {
+    return SimdLevel::AVX2;
+  } else if (has_avx) {
+    return SimdLevel::AVX;
+  } else if (has_sse41) {
+    return SimdLevel::SSE41;
+  } else {
+    return SimdLevel::NONE;
+  }
+
+#elif defined(__GNUC__) || defined(__clang__)
+  // GCC/Clang: Use __builtin_cpu_supports (simpler and reliable)
+  // NOTE: __builtin_cpu_init() is called automatically on modern compilers
+
+  // Check from highest to lowest capability
+  if (__builtin_cpu_supports("amx-tile") && __builtin_cpu_supports("avx512f")) {
+    return SimdLevel::AMX;
+  } else if (__builtin_cpu_supports("avx512f")) {
+    return SimdLevel::AVX512;
+  } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+    return SimdLevel::AVX2;
+  } else if (__builtin_cpu_supports("avx")) {
+    return SimdLevel::AVX;
+  } else if (__builtin_cpu_supports("sse4.1")) {
+    return SimdLevel::SSE41;
+  } else {
+    return SimdLevel::NONE;
+  }
+
+#else
+  // Unknown compiler: Fallback to compile-time detection
+#if defined(__AVX512F__)
   return SimdLevel::AVX512;
 #elif defined(__AVX2__)
   return SimdLevel::AVX2;
@@ -81,6 +141,8 @@ inline SimdLevel DetectSimdLevel() {
 #else
   return SimdLevel::NONE;
 #endif
+#endif
+
 #elif defined(DENSECORE_ARM)
   return SimdLevel::NEON;
 #else
@@ -1056,6 +1118,114 @@ inline void ApplyRoPE_AVX512(float *out, const float *in, const float *cos_sin,
 
 #endif // __AVX512F__
 
+#if defined(__AVX2__)
+
+/**
+ * @brief Apply Rotary Positional Embedding using AVX2
+ *
+ * RoPE formula for pair (x_{2d}, x_{2d+1}):
+ *   x'_{2d}   = x_{2d} * cos(θ) - x_{2d+1} * sin(θ)
+ *   x'_{2d+1} = x_{2d} * sin(θ) + x_{2d+1} * cos(θ)
+ *
+ * This kernel processes 8 floats (4 pairs) per iteration using AVX2.
+ *
+ * @param out Output tensor [n_tokens, head_dim] (can be same as in for
+ * in-place)
+ * @param in Input tensor [n_tokens, head_dim]
+ * @param cos_sin Pre-computed [cos, sin] pairs [max_seq, head_dim]
+ * @param positions Token positions array [n_tokens]
+ * @param n_tokens Number of tokens to process
+ * @param head_dim Head dimension (must be even)
+ * @param rope_dim Number of dimensions to apply RoPE (typically == head_dim)
+ * @param ith Thread index for work partitioning
+ * @param nth Total number of threads
+ */
+inline void ApplyRoPE_AVX2(float *out, const float *in, const float *cos_sin,
+                           const int *positions, int n_tokens, int head_dim,
+                           int rope_dim, int ith = 0, int nth = 1) {
+  // Partition tokens across threads
+  const int tokens_per_thread = (n_tokens + nth - 1) / nth;
+  const int t_start = ith * tokens_per_thread;
+  const int t_end = std::min(t_start + tokens_per_thread, n_tokens);
+
+  if (t_start >= n_tokens)
+    return;
+
+  // Permutation indices for cos/sin deinterleaving:
+  // Input [c0, s0, c1, s1, c2, s2, c3, s3]
+  // cos_idx: [0, 0, 2, 2, 4, 4, 6, 6] -> [c0, c0, c1, c1, c2, c2, c3, c3]
+  // sin_idx: [1, 1, 3, 3, 5, 5, 7, 7] -> [s0, s0, s1, s1, s2, s2, s3, s3]
+  const __m256i idx_cos = _mm256_setr_epi32(0, 0, 2, 2, 4, 4, 6, 6);
+  const __m256i idx_sin = _mm256_setr_epi32(1, 1, 3, 3, 5, 5, 7, 7);
+
+  // Permutation indices for swapping pairs: [1, 0, 3, 2, 5, 4, 7, 6]
+  const __m256i idx_swap = _mm256_setr_epi32(1, 0, 3, 2, 5, 4, 7, 6);
+
+  // Sign mask for RoPE: [-1, 1, -1, 1, -1, 1, -1, 1]
+  const __m256 sign_mask =
+      _mm256_set_ps(1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f);
+
+  for (int t = t_start; t < t_end; t++) {
+    const int pos = positions[t];
+    const float *cs_ptr = cos_sin + pos * head_dim;
+    const float *in_ptr = in + t * head_dim;
+    float *out_ptr = out + t * head_dim;
+
+    // Prefetch next token's cos/sin
+    if (t + 1 < t_end) {
+      _mm_prefetch(
+          reinterpret_cast<const char *>(cos_sin + positions[t + 1] * head_dim),
+          _MM_HINT_T0);
+    }
+
+    // Process 8 floats (4 pairs) at a time
+    int d = 0;
+    for (; d + 8 <= rope_dim; d += 8) {
+      // Load input: [x0, x1, x2, x3, x4, x5, x6, x7]
+      __m256 x = _mm256_loadu_ps(in_ptr + d);
+
+      // Load cos/sin: [c0, s0, c1, s1, c2, s2, c3, s3]
+      __m256 cs = _mm256_loadu_ps(cs_ptr + d);
+
+      // Deinterleave cos and sin using permute
+      __m256 cos_vec = _mm256_permutevar8x32_ps(cs, idx_cos);
+      __m256 sin_vec = _mm256_permutevar8x32_ps(cs, idx_sin);
+
+      // Create swapped x: [x1, x0, x3, x2, x5, x4, x7, x6]
+      __m256 x_swap = _mm256_permutevar8x32_ps(x, idx_swap);
+
+      // Compute: x * cos + x_swap * sign * sin
+      // For pairs (x_{2d}, x_{2d+1}):
+      //   x'_{2d}   = x_{2d} * cos - x_{2d+1} * sin  (even positions)
+      //   x'_{2d+1} = x_{2d} * sin + x_{2d+1} * cos  (odd positions)
+      __m256 result = _mm256_mul_ps(x, cos_vec);
+      __m256 term2 = _mm256_mul_ps(x_swap, sin_vec);
+      term2 = _mm256_mul_ps(term2, sign_mask);
+      result = _mm256_add_ps(result, term2);
+
+      _mm256_storeu_ps(out_ptr + d, result);
+    }
+
+    // Handle remainder (less than 8 floats) with scalar
+    for (; d < rope_dim; d += 2) {
+      float x0 = in_ptr[d];
+      float x1 = in_ptr[d + 1];
+      float cos_val = cs_ptr[d];
+      float sin_val = cs_ptr[d + 1];
+
+      out_ptr[d] = x0 * cos_val - x1 * sin_val;
+      out_ptr[d + 1] = x0 * sin_val + x1 * cos_val;
+    }
+
+    // Copy dimensions beyond rope_dim unchanged
+    for (int dd = rope_dim; dd < head_dim; dd++) {
+      out_ptr[dd] = in_ptr[dd];
+    }
+  }
+}
+
+#endif // __AVX2__
+
 /**
  * @brief Apply Rotary Positional Embedding (scalar implementation)
  *
@@ -1095,7 +1265,7 @@ inline void ApplyRoPE_Scalar(float *out, const float *in, const float *cos_sin,
 /**
  * @brief Apply Rotary Positional Embedding (unified entry point)
  *
- * Automatically dispatches to AVX-512 or scalar implementation based on
+ * Automatically dispatches to AVX-512, AVX2, or scalar implementation based on
  * compile-time detection.
  */
 inline void ApplyRoPE(float *out, const float *in, const float *cos_sin,
@@ -1104,6 +1274,9 @@ inline void ApplyRoPE(float *out, const float *in, const float *cos_sin,
 #if defined(__AVX512F__)
   ApplyRoPE_AVX512(out, in, cos_sin, positions, n_tokens, head_dim, rope_dim,
                    ith, nth);
+#elif defined(__AVX2__)
+  ApplyRoPE_AVX2(out, in, cos_sin, positions, n_tokens, head_dim, rope_dim, ith,
+                 nth);
 #else
   ApplyRoPE_Scalar(out, in, cos_sin, positions, n_tokens, head_dim, rope_dim,
                    ith, nth);
@@ -1445,6 +1618,221 @@ inline void GemmInt4Fp32_AVX512(float *C, const float *A, const uint8_t *W_int4,
 }
 
 #endif // __AVX512F__
+
+#if defined(__AVX2__)
+
+/**
+ * @brief High-performance AVX2 GEMM kernel: C = A * W^T (INT4 weights)
+ *
+ * Optimizations:
+ * - 8x register blocking along N dimension (vs 16x for AVX-512)
+ * - Shift-based sign extension (no branches, no masks)
+ * - Prefetching for weights and activations
+ * - FMA3 instructions for dot products
+ * - Processes 16 weights per iteration (vs 32 for AVX-512)
+ *
+ * @param C Output [M, N]
+ * @param A Input activations [M, K]
+ * @param W_int4 Packed INT4 weights [N, K/2]
+ * @param scales Per-group scales [N, num_groups]
+ * @param zero_points Per-group zero points [N, num_groups]
+ * @param M Batch dimension
+ * @param N Output features
+ * @param K Input features
+ * @param group_size Quantization group size (K must be divisible)
+ */
+inline void GemmInt4Fp32_AVX2(float *C, const float *A, const uint8_t *W_int4,
+                              const float *scales, const float *zero_points,
+                              int M, int N, int K, int group_size) {
+  if (K % group_size != 0)
+    return;
+
+  const int num_groups = K / group_size;
+  const int packed_K = K / 2; // Bytes per weight row
+
+  // Constants for prefetch distance
+  constexpr int PREFETCH_DIST = 64; // Bytes ahead
+
+  // Outer loop: rows of output
+  for (int m = 0; m < M; m++) {
+    const float *a_row = A + m * K;
+
+    // Middle loop: columns of output in blocks of 8 (REGISTER BLOCKING)
+    int n = 0;
+    for (; n + 8 <= N; n += 8) {
+      // 8 accumulators for 8 output elements
+      __m256 acc0 = _mm256_setzero_ps();
+      __m256 acc1 = _mm256_setzero_ps();
+      __m256 acc2 = _mm256_setzero_ps();
+      __m256 acc3 = _mm256_setzero_ps();
+      __m256 acc4 = _mm256_setzero_ps();
+      __m256 acc5 = _mm256_setzero_ps();
+      __m256 acc6 = _mm256_setzero_ps();
+      __m256 acc7 = _mm256_setzero_ps();
+
+      // Loop over quantization groups
+      for (int g = 0; g < num_groups; g++) {
+        const int k_offset = g * group_size;
+        const int packed_offset = g * (group_size / 2);
+        const float *a_ptr = a_row + k_offset;
+
+        // Prefetch activations for next group
+        if (g + 1 < num_groups) {
+          _mm_prefetch(
+              reinterpret_cast<const char *>(a_row + (g + 1) * group_size),
+              _MM_HINT_T0);
+        }
+
+        // Process 16 weights at a time (8 bytes packed)
+        for (int k = 0; k < group_size; k += 16) {
+          // Load 1 × 8 floats from activations
+          __m256 a0 = _mm256_loadu_ps(a_ptr + k);
+          __m256 a1 = _mm256_loadu_ps(a_ptr + k + 8);
+
+// Process all 8 weight rows
+#define PROCESS_ROW_AVX2(idx)                                                  \
+  do {                                                                         \
+    const int row = n + (idx);                                                 \
+    const float scale = scales[row * num_groups + g];                          \
+    const float zero = zero_points[row * num_groups + g];                      \
+    const __m256 vscale = _mm256_set1_ps(scale);                               \
+    const __m256 vzero = _mm256_set1_ps(zero);                                 \
+                                                                               \
+    const uint8_t *w_ptr = W_int4 + row * packed_K + packed_offset + k / 2;    \
+    _mm_prefetch(reinterpret_cast<const char *>(w_ptr + PREFETCH_DIST),        \
+                 _MM_HINT_T0);                                                 \
+                                                                               \
+    /* Load 8 bytes = 16 packed weights */                                     \
+    __m128i packed_64 =                                                        \
+        _mm_loadl_epi64(reinterpret_cast<const __m128i *>(w_ptr));             \
+    __m128i packed_16 = _mm_cvtepu8_epi16(packed_64);                          \
+                                                                               \
+    /* Extract low nibbles (bits 0-3) */                                       \
+    __m128i low = _mm_and_si128(packed_16, _mm_set1_epi16(0x0F));              \
+    /* Extract high nibbles (bits 4-7) */                                      \
+    __m128i high = _mm_srli_epi16(packed_16, 4);                               \
+    high = _mm_and_si128(high, _mm_set1_epi16(0x0F));                          \
+                                                                               \
+    /* Sign extension via shift trick */                                       \
+    low = _mm_slli_epi16(low, 12);                                             \
+    low = _mm_srai_epi16(low, 12);                                             \
+    high = _mm_slli_epi16(high, 12);                                           \
+    high = _mm_srai_epi16(high, 12);                                           \
+                                                                               \
+    /* Interleave to restore order: [l0, h0, l1, h1, l2, h2, l3, h3] */        \
+    __m128i interleaved_lo = _mm_unpacklo_epi16(low, high);                    \
+    __m128i interleaved_hi = _mm_unpackhi_epi16(low, high);                    \
+                                                                               \
+    /* Convert to FP32 via int32 */                                            \
+    __m256i w32_0 = _mm256_cvtepi16_epi32(interleaved_lo);                     \
+    __m256i w32_1 = _mm256_cvtepi16_epi32(interleaved_hi);                     \
+    __m256 wf0 = _mm256_cvtepi32_ps(w32_0);                                    \
+    __m256 wf1 = _mm256_cvtepi32_ps(w32_1);                                    \
+                                                                               \
+    /* Dequantize: w_dequant = scale * (q - zero) */                           \
+    wf0 = _mm256_mul_ps(vscale, _mm256_sub_ps(wf0, vzero));                    \
+    wf1 = _mm256_mul_ps(vscale, _mm256_sub_ps(wf1, vzero));                    \
+                                                                               \
+    /* FMA */                                                                  \
+    acc##idx = _mm256_fmadd_ps(a0, wf0, acc##idx);                             \
+    acc##idx = _mm256_fmadd_ps(a1, wf1, acc##idx);                             \
+  } while (0)
+
+          PROCESS_ROW_AVX2(0);
+          PROCESS_ROW_AVX2(1);
+          PROCESS_ROW_AVX2(2);
+          PROCESS_ROW_AVX2(3);
+          PROCESS_ROW_AVX2(4);
+          PROCESS_ROW_AVX2(5);
+          PROCESS_ROW_AVX2(6);
+          PROCESS_ROW_AVX2(7);
+
+#undef PROCESS_ROW_AVX2
+        }
+      }
+
+      // Horizontal reduction and store results
+      // AVX2 doesn't have _mm256_reduce_add_ps, so we do it manually
+      auto hsum_avx2 = [](__m256 v) -> float {
+        __m128 hi = _mm256_extractf128_ps(v, 1);
+        __m128 lo = _mm256_castps256_ps128(v);
+        __m128 sum128 = _mm_add_ps(lo, hi);
+        sum128 = _mm_hadd_ps(sum128, sum128);
+        sum128 = _mm_hadd_ps(sum128, sum128);
+        return _mm_cvtss_f32(sum128);
+      };
+
+      C[m * N + n + 0] = hsum_avx2(acc0);
+      C[m * N + n + 1] = hsum_avx2(acc1);
+      C[m * N + n + 2] = hsum_avx2(acc2);
+      C[m * N + n + 3] = hsum_avx2(acc3);
+      C[m * N + n + 4] = hsum_avx2(acc4);
+      C[m * N + n + 5] = hsum_avx2(acc5);
+      C[m * N + n + 6] = hsum_avx2(acc6);
+      C[m * N + n + 7] = hsum_avx2(acc7);
+    }
+
+    // Handle remaining columns (N % 8)
+    for (; n < N; n++) {
+      __m256 acc = _mm256_setzero_ps();
+
+      for (int g = 0; g < num_groups; g++) {
+        const int k_offset = g * group_size;
+        const float *a_ptr = a_row + k_offset;
+        const float scale = scales[n * num_groups + g];
+        const float zero = zero_points[n * num_groups + g];
+        const __m256 vscale = _mm256_set1_ps(scale);
+        const __m256 vzero = _mm256_set1_ps(zero);
+        const uint8_t *w_ptr = W_int4 + n * packed_K + g * (group_size / 2);
+
+        for (int k = 0; k < group_size; k += 16) {
+          // Load 8 bytes = 16 packed weights
+          __m128i packed_64 =
+              _mm_loadl_epi64(reinterpret_cast<const __m128i *>(w_ptr + k / 2));
+          __m128i packed_16 = _mm_cvtepu8_epi16(packed_64);
+
+          // Extract and sign-extend nibbles
+          __m128i low = _mm_and_si128(packed_16, _mm_set1_epi16(0x0F));
+          __m128i high = _mm_srli_epi16(packed_16, 4);
+          high = _mm_and_si128(high, _mm_set1_epi16(0x0F));
+
+          low = _mm_slli_epi16(low, 12);
+          low = _mm_srai_epi16(low, 12);
+          high = _mm_slli_epi16(high, 12);
+          high = _mm_srai_epi16(high, 12);
+
+          // Interleave
+          __m128i lo128 = _mm_unpacklo_epi16(low, high);
+          __m128i hi128 = _mm_unpackhi_epi16(low, high);
+
+          // Convert and dequantize
+          __m256 wf0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(lo128));
+          __m256 wf1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(hi128));
+
+          wf0 = _mm256_mul_ps(vscale, _mm256_sub_ps(wf0, vzero));
+          wf1 = _mm256_mul_ps(vscale, _mm256_sub_ps(wf1, vzero));
+
+          // Load activations and FMA
+          __m256 a0 = _mm256_loadu_ps(a_ptr + k);
+          __m256 a1 = _mm256_loadu_ps(a_ptr + k + 8);
+
+          acc = _mm256_fmadd_ps(a0, wf0, acc);
+          acc = _mm256_fmadd_ps(a1, wf1, acc);
+        }
+      }
+
+      // Horizontal sum
+      __m128 hi = _mm256_extractf128_ps(acc, 1);
+      __m128 lo = _mm256_castps256_ps128(acc);
+      __m128 sum128 = _mm_add_ps(lo, hi);
+      sum128 = _mm_hadd_ps(sum128, sum128);
+      sum128 = _mm_hadd_ps(sum128, sum128);
+      C[m * N + n] = _mm_cvtss_f32(sum128);
+    }
+  }
+}
+
+#endif // __AVX2__
 
 // =============================================================================
 // FlashAttention AVX-512 Micro-Kernels (Cache-Optimized)
