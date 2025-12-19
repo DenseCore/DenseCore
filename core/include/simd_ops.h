@@ -2,6 +2,20 @@
  * @file simd_ops.h
  * @brief SIMD-optimized operations for CPU inference
  *
+ * THREADING CONTRACT:
+ * -------------------
+ * All functions in this file are SINGLE-THREADED kernels designed to be
+ * called from GGML worker threads. DO NOT add #pragma omp parallel to any
+ * function as this would cause thread oversubscription.
+ *
+ * For functions that support parallel execution across tokens/heads, they
+ * accept (ith, nth) parameters for manual work partitioning, where:
+ *   - ith: Current thread index (0 to nth-1)
+ *   - nth: Total number of threads
+ *
+ * The caller (GGML callback or inference engine) is responsible for invoking
+ * these functions from multiple threads with appropriate (ith, nth) values.
+ *
  * Supports:
  * - AVX-512 (Intel Skylake-X+)
  * - AVX2 (Intel Haswell+, AMD Zen+)
@@ -19,7 +33,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib> // For std::abort, posix_memalign, free
 #include <cstring>
+#include <new>         // For std::bad_alloc
+#include <type_traits> // For std::true_type
 #include <vector>
 
 #if defined(__linux__)
@@ -48,8 +65,161 @@ extern "C" {
 #include "ggml.h"
 }
 
+// =============================================================================
+// Aligned Memory Allocation for SIMD (64-byte for AVX-512)
+// =============================================================================
+// AVX-512 instructions like vmovaps require 64-byte aligned memory.
+// std::vector does NOT guarantee this alignment. Use AlignedVector<T> instead.
+// =============================================================================
+
 namespace densecore {
 namespace simd {
+
+/// AVX-512 cache line size (64 bytes)
+constexpr size_t SIMD_ALIGNMENT = 64;
+
+/**
+ * @brief Check if pointer is aligned to given boundary
+ *
+ * @param ptr Pointer to check
+ * @param alignment Required alignment (must be power of 2)
+ * @return true if aligned, false otherwise
+ */
+inline bool IsAligned(const void *ptr, size_t alignment) {
+  return ((uintptr_t)ptr & (alignment - 1)) == 0;
+}
+
+/**
+ * @brief Check if pointer is 64-byte aligned (AVX-512 compatible)
+ */
+inline bool IsAligned64(const void *ptr) { return IsAligned(ptr, 64); }
+
+} // namespace simd
+} // namespace densecore
+
+/**
+ * Alignment assertion macro for DEBUG builds.
+ * In DEBUG mode: aborts if pointer is not properly aligned.
+ * In RELEASE mode: no-op (zero overhead).
+ */
+#ifdef NDEBUG
+#define DENSECORE_ASSERT_ALIGNED(ptr, alignment) ((void)0)
+#else
+#define DENSECORE_ASSERT_ALIGNED(ptr, alignment)                               \
+  do {                                                                         \
+    if (!densecore::simd::IsAligned((ptr), (alignment))) {                     \
+      std::fprintf(stderr,                                                     \
+                   "[DenseCore] FATAL: Pointer %p not %zu-byte aligned at "    \
+                   "%s:%d\n",                                                  \
+                   (void *)(ptr), (size_t)(alignment), __FILE__, __LINE__);    \
+      std::abort();                                                            \
+    }                                                                          \
+  } while (0)
+#endif
+
+/// Convenience macro for 64-byte alignment assertion (AVX-512)
+#define DENSECORE_ASSERT_ALIGNED_64(ptr) DENSECORE_ASSERT_ALIGNED(ptr, 64)
+
+namespace densecore {
+namespace simd {
+
+/**
+ * @brief STL-compatible allocator providing aligned memory allocation
+ *
+ * Required for AVX-512 instructions that benefit from aligned loads/stores.
+ * Default alignment is 64 bytes (AVX-512 cache line size).
+ *
+ * Usage:
+ *   std::vector<float, AlignedAllocator<float>> vec;
+ *   // or use the convenience alias:
+ *   AlignedVector<float> vec;
+ *
+ * @tparam T Element type
+ * @tparam Alignment Alignment in bytes (default: 64 for AVX-512)
+ */
+template <typename T, size_t Alignment = SIMD_ALIGNMENT>
+struct AlignedAllocator {
+  using value_type = T;
+  using size_type = std::size_t;
+  using difference_type = std::ptrdiff_t;
+  using propagate_on_container_move_assignment = std::true_type;
+  using is_always_equal = std::true_type;
+
+  // Required for std::vector rebind compatibility (C++17 allocator
+  // requirements)
+  template <class U> struct rebind {
+    using other = AlignedAllocator<U, Alignment>;
+  };
+
+  static_assert((Alignment & (Alignment - 1)) == 0,
+                "Alignment must be a power of 2");
+  static_assert(Alignment >= alignof(T),
+                "Alignment must be at least alignof(T)");
+
+  constexpr AlignedAllocator() noexcept = default;
+  constexpr AlignedAllocator(const AlignedAllocator &) noexcept = default;
+
+  template <class U>
+  constexpr AlignedAllocator(
+      const AlignedAllocator<U, Alignment> & /*other*/) noexcept {}
+
+  [[nodiscard]] T *allocate(size_type n) {
+    if (n == 0)
+      return nullptr;
+
+    size_t bytes = n * sizeof(T);
+    T *ptr = nullptr;
+
+#if defined(_WIN32)
+    ptr = static_cast<T *>(_aligned_malloc(bytes, Alignment));
+#else
+    void *raw_ptr = nullptr;
+    if (posix_memalign(&raw_ptr, Alignment, bytes) == 0) {
+      ptr = static_cast<T *>(raw_ptr);
+    }
+#endif
+
+    if (!ptr) {
+      throw std::bad_alloc();
+    }
+
+    return ptr;
+  }
+
+  void deallocate(T *ptr, size_type /*n*/) noexcept {
+    if (!ptr)
+      return;
+
+#if defined(_WIN32)
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+  }
+
+  template <class U>
+  bool
+  operator==(const AlignedAllocator<U, Alignment> & /*other*/) const noexcept {
+    return true;
+  }
+
+  template <class U>
+  bool
+  operator!=(const AlignedAllocator<U, Alignment> & /*other*/) const noexcept {
+    return false;
+  }
+};
+
+/**
+ * @brief Convenience type alias for 64-byte aligned vectors
+ *
+ * Use this instead of std::vector<T> when the data will be passed to
+ * AVX-512 kernels that require or benefit from aligned memory.
+ *
+ * @tparam T Element type
+ */
+template <typename T>
+using AlignedVector = std::vector<T, AlignedAllocator<T, 64>>;
 
 // =============================================================================
 // Runtime SIMD Detection

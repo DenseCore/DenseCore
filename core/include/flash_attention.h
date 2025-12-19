@@ -37,19 +37,22 @@ struct FlashAttentionConfig {
 };
 
 /**
- * Scratch buffer for Flash Attention computation
- * Pre-allocate to avoid repeated allocations
+ * Scratch buffer for Flash Attention computation.
+ * Pre-allocate to avoid repeated allocations.
+ *
+ * IMPORTANT: All buffers use 64-byte aligned memory (simd::AlignedVector)
+ * to ensure compatibility with AVX-512 aligned load/store instructions.
  */
 struct FlashAttentionScratch {
-  std::vector<float> qk_block;  // [block_m, block_n]
-  std::vector<float> pv_block;  // [block_m, head_dim]
-  std::vector<float> row_max;   // [block_m] - also used as block_max
-  std::vector<float> row_sum;   // [block_m] - also used as block_sum
-  std::vector<float> new_max;   // [block_m]
-  std::vector<float> exp_diff;  // [block_m]
-  std::vector<float> o_block;   // [block_m, head_dim]
-  std::vector<float> alpha_buf; // [block_m] - rescaling factor for previous O
-  std::vector<float> beta_buf;  // [block_m] - rescaling factor for new PV
+  simd::AlignedVector<float> qk_block;  // [block_m, block_n] (64-byte aligned)
+  simd::AlignedVector<float> pv_block;  // [block_m, head_dim] (64-byte aligned)
+  simd::AlignedVector<float> row_max;   // [block_m] (64-byte aligned)
+  simd::AlignedVector<float> row_sum;   // [block_m] (64-byte aligned)
+  simd::AlignedVector<float> new_max;   // [block_m] (64-byte aligned)
+  simd::AlignedVector<float> exp_diff;  // [block_m] (64-byte aligned)
+  simd::AlignedVector<float> o_block;   // [block_m, head_dim] (64-byte aligned)
+  simd::AlignedVector<float> alpha_buf; // [block_m] (64-byte aligned)
+  simd::AlignedVector<float> beta_buf;  // [block_m] (64-byte aligned)
 
   void Resize(int block_m, int block_n, int head_dim) {
     qk_block.resize(block_m * block_n);

@@ -549,6 +549,15 @@ PagedKVCache *InitPagedKVCache(TransformerModel *model, int max_num_seqs,
     return nullptr;
   }
 
+  // ==========================================================================
+  // ALIGNMENT CHECK: Verify 64-byte alignment for AVX-512 safety
+  // ==========================================================================
+  // The NumaAllocator should provide 64-byte aligned memory.
+  // If this assertion fails, AVX-512 aligned load/store will SIGSEGV.
+  // ==========================================================================
+  DENSECORE_ASSERT_ALIGNED_64(cache->k_cache->data);
+  DENSECORE_ASSERT_ALIGNED_64(cache->v_cache->data);
+
   // Zero-initialize
   if (type == GGML_TYPE_F32 || type == GGML_TYPE_F16) {
     ggml_set_zero(cache->k_cache);

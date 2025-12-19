@@ -10,10 +10,6 @@
 #include <unordered_map>
 #include <vector>
 
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-
 #include "utils/raii_guards.h"
 
 // Worker Loop (Continuous Batching) - Uses Scheduler for batch formation
@@ -30,18 +26,20 @@ void EngineLoop(EngineState *state) {
     }
 
     // =========================================================================
-    // CRITICAL: Disable OpenMP nested parallelism
+    // THREADING MODEL (DenseCore Unified Threading):
     // =========================================================================
-    // GGML spawns its own thread pool (n_threads workers). If any function
-    // called by GGML workers uses #pragma omp parallel (e.g. FlashAttention),
-    // OpenMP would spawn ANOTHER thread team per GGML worker, causing:
-    //   Total threads = n_threads × OMP_NUM_THREADS (thread explosion)
-    // Setting omp_set_num_threads(1) forces OpenMP to run sequentially,
-    // allowing GGML's thread pool to be the sole source of parallelism.
+    // DenseCore uses a two-level parallelism strategy WITHOUT OpenMP:
+    //
+    // 1. Request-level parallelism: std::thread workers in worker.cpp
+    //    - Each worker processes requests from the scheduler queue
+    //
+    // 2. Compute-level parallelism: GGML's internal thread pool
+    //    - Configured via ggml_backend_cpu_set_n_threads() below
+    //    - All SIMD kernels in simd_ops.h are single-threaded
+    //    - GGML callbacks invoke kernels with (ith, nth) for work partitioning
+    //
+    // OpenMP is NOT used to avoid thread oversubscription (nested parallelism).
     // =========================================================================
-#ifdef _OPENMP
-    omp_set_num_threads(1);
-#endif
 
     // Resolve model once at loop start (for performance)
     ModelEntry *model_entry = state->GetDefaultModel();
@@ -121,23 +119,30 @@ void EngineLoop(EngineState *state) {
     while (state->status != EngineStatus::STOPPED) {
       // 1. Fetch new requests and register with scheduler
       {
-        std::unique_lock<std::mutex> lock(state->queue_mu);
+        // Check exit conditions (lock-free check on pending queue)
+        bool pending_empty = state->pending_requests.Empty();
+        bool active_empty;
+        {
+          std::lock_guard<std::mutex> lock(state->active_mu);
+          active_empty = state->active_requests.empty();
+        }
 
-        // Check exit conditions
-        if (state->active_requests.empty() && state->pending_requests.empty()) {
+        if (active_empty && pending_empty) {
           if (state->status == EngineStatus::DRAINING) {
             break; // Exit: draining complete, no more work
           }
+          // Wait for new requests (with timeout to check status)
+          std::unique_lock<std::mutex> lock(state->cv_mu);
           state->queue_cv.wait_for(lock, std::chrono::milliseconds(50));
           continue;
         }
 
         // Move pending to active and register with scheduler
         // Skip if DRAINING - don't accept new requests, only drain active
-        while (state->status == EngineStatus::RUNNING &&
-               !state->pending_requests.empty()) {
-          Request *req = state->pending_requests.top();
-          state->pending_requests.pop();
+        while (state->status == EngineStatus::RUNNING) {
+          Request *req = state->pending_requests.Pop();
+          if (!req)
+            break; // Queue empty
 
           // Check if cancelled before even starting
           if (req->cancelled) {
@@ -197,14 +202,17 @@ void EngineLoop(EngineState *state) {
         continue;
 
       // Check if we should exit (DRAINING and no more active work)
-      if (state->status == EngineStatus::DRAINING &&
-          state->active_requests.empty()) {
-        break;
+      {
+        std::lock_guard<std::mutex> lock(state->active_mu);
+        if (state->status == EngineStatus::DRAINING &&
+            state->active_requests.empty()) {
+          break;
+        }
       }
 
       // 2. Process cancelled/finished requests first
       {
-        std::lock_guard<std::mutex> lock(state->queue_mu);
+        std::lock_guard<std::mutex> lock(state->active_mu);
         auto it = state->active_requests.begin();
         while (it != state->active_requests.end()) {
           Request *req = *it;
@@ -397,12 +405,15 @@ void EngineLoop(EngineState *state) {
         if (!cacheable) {
           // Temp context for one-off graphs (Prefill etc)
           struct ggml_init_params params = {
-              .mem_size = 512 * 1024 * 1024, // Increased to 512MB to fix OOM with deep models
+              .mem_size =
+                  512 * 1024 *
+                  1024, // Increased to 512MB to fix OOM with deep models
               .mem_buffer = nullptr,
               .no_alloc = false,
           };
           ctx_temp_guard = densecore::GGMLContextGuard(ggml_init(params));
-          std::cerr << "[DenseCore] Worker Graph Context initialized: 512 MB" << std::endl;
+          std::cerr << "[DenseCore] Worker Graph Context initialized: 512 MB"
+                    << std::endl;
           ctx_nodes = ctx_temp_guard.get();
         }
 
@@ -617,7 +628,7 @@ void EngineLoop(EngineState *state) {
 
       // 11. Sync active_requests: remove finished requests
       {
-        std::lock_guard<std::mutex> lock(state->queue_mu);
+        std::lock_guard<std::mutex> lock(state->active_mu);
         auto it = state->active_requests.begin();
         while (it != state->active_requests.end()) {
           Request *req = *it;

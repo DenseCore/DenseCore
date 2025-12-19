@@ -260,14 +260,18 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(densecore PRIVATE Threads::Threads)
 
-# OpenMP Support (Enable for Performance)
-find_package(OpenMP)
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(densecore PRIVATE OpenMP::OpenMP_CXX)
-    message(STATUS "OpenMP found - enabling parallel execution")
-else()
-    message(WARNING "OpenMP not found - performance will be limited")
-endif()
+# ==========================================================================
+# Threading Model: GGML Thread Pool + std::thread (NO OpenMP)
+# ==========================================================================
+# DenseCore uses a unified threading model:
+# - Request-level parallelism: std::thread workers in worker.cpp
+# - Compute-level parallelism: GGML's internal thread pool
+#
+# OpenMP is NOT used to avoid thread oversubscription (nested parallelism).
+# All SIMD kernels in simd_ops.h are single-threaded and rely on the caller
+# (GGML callbacks or worker.cpp) to manage parallel execution.
+# ==========================================================================
+message(STATUS "Threading: GGML thread pool + std::thread (OpenMP disabled)")
 
 
 # ==========================================================================

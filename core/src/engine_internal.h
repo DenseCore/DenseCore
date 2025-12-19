@@ -5,6 +5,7 @@
 #include "embedding.h"
 #include "inference.h"
 #include "kv_cache.h"
+#include "lockfree_queue.h" // Lock-free sharded priority queue
 #include "model_loader.h"
 #include "model_types.h"
 #include "scheduler.h"
@@ -303,19 +304,25 @@ struct EngineState {
   // Advanced scheduler (vLLM-style)
   std::unique_ptr<densecore::Scheduler> scheduler; // Smart pointer ownership
 
-  // Request queues
-  // Note: priority_queue stores raw pointers, actual ownership in request_pool
-  std::priority_queue<Request *, std::vector<Request *>,
-                      RequestPriorityComparator>
-      pending_requests;
+  // ===========================================================================
+  // Lock-Free Request Queue (replaces mutex-protected priority_queue)
+  // ===========================================================================
+  // Uses sharded FIFO queues per priority tier with tagged pointer ABA
+  // protection. Much lower contention than mutex under high concurrency.
+  // ===========================================================================
+  densecore::ShardedPriorityQueue<Request> pending_requests;
 
   std::vector<Request *> active_requests; // Non-owning pointers
 
   // Object Pool for requests (thread-safe)
   ObjectPool<Request> request_pool;
 
-  std::mutex queue_mu;
+  // Mutex only for active_requests (rarely contested, not on hot path)
+  std::mutex active_mu;
+  // Condition variable for blocking wait when queue is empty
   std::condition_variable queue_cv;
+  std::mutex cv_mu; // Mutex for condition variable (required by
+                    // std::condition_variable)
 
   // Worker thread
   std::thread worker_thread;
@@ -447,7 +454,7 @@ struct EngineState {
 
     while (true) {
       {
-        std::lock_guard<std::mutex> lock(queue_mu);
+        std::lock_guard<std::mutex> lock(active_mu);
         if (active_requests.empty()) {
           LOG_INFO("All active requests drained successfully.");
           break;
@@ -456,7 +463,7 @@ struct EngineState {
 
       auto elapsed = std::chrono::steady_clock::now() - start_time;
       if (elapsed >= kShutdownTimeout) {
-        std::lock_guard<std::mutex> lock(queue_mu);
+        std::lock_guard<std::mutex> lock(active_mu);
         LOG_WARNING("Shutdown timeout after 5 seconds. Force-killing ",
                     active_requests.size(), " active requests.");
         // Mark remaining requests as finished to allow cleanup
