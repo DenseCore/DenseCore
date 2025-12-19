@@ -404,3 +404,86 @@ TEST(SimdOps, ApplyRoPE_PartialRopeDim) {
   }
   EXPECT_TRUE(has_difference) << "Rotated dimensions should differ from input";
 }
+
+// =============================================================================
+// Fused Kernels Tests (ComputeQKV, AddRMSNorm)
+// =============================================================================
+
+TEST(SimdOps, AddRMSNorm_Correctness) {
+  constexpr size_t N = 128;
+  std::vector<float> x(N);
+  std::vector<float> residual(N);
+  std::vector<float> rms_w(N);
+  std::vector<float> out_ref(N);
+  std::vector<float> out_test(N);
+
+  for (size_t i = 0; i < N; i++) {
+    x[i] = 1.0f * (i % 10);
+    residual[i] = 0.5f * (i % 5);
+    rms_w[i] = 1.0f; // Identity weight initially
+  }
+
+  // Reference implementation (Scalar)
+  float eps = 1e-5f;
+  float sos = 0.0f;
+  for (size_t i = 0; i < N; i++) {
+    float val = x[i] + residual[i];
+    out_ref[i] = val; // Intermediate store
+    sos += val * val;
+  }
+  float rms = std::sqrt(sos / N + eps);
+  float scale = 1.0f / rms;
+  for (size_t i = 0; i < N; i++) {
+    out_ref[i] *= scale;
+  }
+
+  // Test Unified Dispatcher (which calls AVX512/AVX2/Scalar based on hardware)
+  AddRMSNorm(out_test.data(), x.data(), residual.data(), rms_w.data(), N, eps);
+
+  for (size_t i = 0; i < N; i++) {
+    EXPECT_NEAR(out_test[i], out_ref[i], 1e-4f) << "Mismatch at index " << i;
+  }
+}
+
+TEST(SimdOps, ComputeQKV_Correctness) {
+  constexpr int n_embd = 64;
+  constexpr int dim_q = 32;
+  constexpr int dim_k = 16;
+  constexpr int dim_v = 16;
+
+  std::vector<float> x(n_embd, 1.0f); // Input all 1.0
+
+  // Weights: Identity-like or simple patterns
+  std::vector<float> w_q(n_embd * dim_q, 1.0f);
+  std::vector<float> w_k(n_embd * dim_k, 0.5f);
+  std::vector<float> w_v(n_embd * dim_v);
+  for (int i = 0; i < n_embd * dim_v; ++i)
+    w_v[i] = (i / n_embd) % 2 == 0 ? 1.0f : 0.0f;
+
+  std::vector<float> q(dim_q);
+  std::vector<float> k(dim_k);
+  std::vector<float> v(dim_v);
+
+  // Run unified dispatcher
+  ComputeQKV(q.data(), k.data(), v.data(), x.data(), w_q.data(), w_k.data(),
+             w_v.data(), n_embd, dim_q, dim_k, dim_v);
+
+  // Verify Q
+  for (int i = 0; i < dim_q; i++) {
+    EXPECT_NEAR(q[i], (float)n_embd, 1e-4f);
+  }
+
+  // Verify K
+  for (int i = 0; i < dim_k; i++) {
+    EXPECT_NEAR(k[i], (float)n_embd * 0.5f, 1e-4f);
+  }
+
+  // Verify V
+  for (int i = 0; i < dim_v; i++) {
+    float row_sum = 0.0f;
+    for (int d = 0; d < n_embd; ++d) {
+      row_sum += w_v[i * n_embd + d];
+    }
+    EXPECT_NEAR(v[i], row_sum, 1e-4f);
+  }
+}

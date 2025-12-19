@@ -186,6 +186,77 @@ void cb_rope_avx512(struct ggml_tensor *dst, const struct ggml_tensor *src,
 }
 
 // ============================================================================
+// Fused Add + RMSNorm Callback (AVX-512 Optimized)
+// ============================================================================
+// Combines residual connection (x += residual) and RMSNorm in a single pass
+// to reduce memory bandwidth by loading/storing data once instead of twice.
+// ============================================================================
+
+/**
+ * User data for fused Add+RMSNorm operation
+ */
+struct AddRMSNormUserData {
+  const float *residual;   ///< Residual tensor data [n_embd, N]
+  const float *rms_weight; ///< RMSNorm weight [n_embd]
+  int n_embd;              ///< Embedding dimension
+  int n_tokens;            ///< Number of tokens
+  float eps;               ///< RMSNorm epsilon
+};
+
+// Thread-local pool for AddRMSNorm user data
+static constexpr int kMaxAddRMSNormSlots = 256;
+static thread_local AddRMSNormUserData g_add_rmsnorm_pool[kMaxAddRMSNormSlots];
+static thread_local int g_add_rmsnorm_index = 0;
+
+inline AddRMSNormUserData *GetAddRMSNormUserData() {
+  int idx = g_add_rmsnorm_index++;
+  if (idx >= kMaxAddRMSNormSlots) {
+    g_add_rmsnorm_index = 0;
+    idx = 0;
+  }
+  return &g_add_rmsnorm_pool[idx];
+}
+
+/**
+ * Custom callback for fused Add + RMSNorm
+ *
+ * Input tensor (src): Current tensor to add residual to and normalize
+ * Output tensor (dst): Result of (src + residual) normalized with RMSNorm
+ *
+ * Uses AVX-512 fused kernel for optimal memory bandwidth utilization.
+ */
+void cb_residual_rmsnorm_fused(struct ggml_tensor *dst,
+                               const struct ggml_tensor *src, int ith, int nth,
+                               void *userdata) {
+  auto *ud = (AddRMSNormUserData *)userdata;
+  if (!ud || !ud->residual || !ud->rms_weight)
+    return;
+
+  const int n_embd = ud->n_embd;
+  const int n_tokens = ud->n_tokens;
+  const float eps = ud->eps;
+
+  // Partition work across tokens
+  const int tokens_per_thread = (n_tokens + nth - 1) / nth;
+  const int t_start = ith * tokens_per_thread;
+  const int t_end = std::min(t_start + tokens_per_thread, n_tokens);
+
+  if (t_start >= n_tokens)
+    return;
+
+  // Process assigned tokens
+  for (int t = t_start; t < t_end; t++) {
+    const float *x_ptr = (const float *)src->data + t * n_embd;
+    const float *res_ptr = ud->residual + t * n_embd;
+    float *out_ptr = (float *)dst->data + t * n_embd;
+
+    // Use unified AddRMSNorm dispatcher (Runtime AVX512/AVX2/Scalar)
+    densecore::simd::AddRMSNorm(out_ptr, x_ptr, res_ptr, ud->rms_weight,
+                                static_cast<size_t>(n_embd), eps);
+  }
+}
+
+// ============================================================================
 // RoPE Table Initialization
 // ============================================================================
 

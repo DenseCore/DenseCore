@@ -1,8 +1,10 @@
 #ifndef DENSECORE_KV_CACHE_H
 #define DENSECORE_KV_CACHE_H
 
+#include "block_allocator.h"
 #include "model_types.h"
 #include "numa_allocator.h"
+#include <memory>
 #include <unordered_map>
 
 // ============================================================================
@@ -148,9 +150,9 @@ struct BlockManager {
 struct PagedKVCache {
   struct ggml_context *ctx = nullptr;
 
-  // The pre-allocated KV cache tensors
-  // Layout: [head_dim, n_head_kv, BLOCK_SIZE, num_blocks * n_layer]
-  // This interleaves layers within blocks for better cache locality
+  // Legacy ggml tensor pointers (kept for compatibility, data points to
+  // allocator arena)
+  // TODO: Remove once all code paths use allocator directly
   struct ggml_tensor *k_cache = nullptr;
   struct ggml_tensor *v_cache = nullptr;
 
@@ -171,6 +173,14 @@ struct PagedKVCache {
   int numa_node_id = -1;       // NUMA node where buffer was allocated
   densecore::AllocationType numa_allocation_type =
       densecore::AllocationType::Aligned;
+
+  // Fixed-size block allocators for K and V (memory pool) - PRIMARY STORAGE
+  // These own the actual KV cache memory as a pre-allocated arena
+  std::unique_ptr<densecore::KVBlockAllocator> k_allocator;
+  std::unique_ptr<densecore::KVBlockAllocator> v_allocator;
+
+  // Flag to indicate allocator-based storage is active
+  bool use_block_allocator = false;
 
   ~PagedKVCache();
 

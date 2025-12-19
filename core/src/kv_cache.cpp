@@ -1,4 +1,5 @@
 #include "kv_cache.h"
+#include "block_allocator.h"
 #include "numa_allocator.h"
 #include "simd_ops.h"
 #include <cstring>
@@ -322,12 +323,15 @@ PagedKVCache::~PagedKVCache() {
   if (ctx)
     ggml_free(ctx);
 
-  // Free NUMA-allocated buffer if we allocated it
-  if (numa_buffer && numa_buffer_size > 0) {
+  // Free NUMA-allocated buffer if we allocated it (only for legacy ggml path)
+  if (!use_block_allocator && numa_buffer && numa_buffer_size > 0) {
     densecore::NumaAllocator::Free(numa_buffer, numa_buffer_size);
     numa_buffer = nullptr;
     numa_buffer_size = 0;
   }
+
+  // Block allocators are unique_ptr, will be auto-deleted
+  // k_allocator.reset() and v_allocator.reset() called automatically
 
   if (block_manager)
     delete block_manager;
@@ -346,13 +350,22 @@ size_t PagedKVCache::GetBytesPerBlock() const {
 }
 
 void *PagedKVCache::GetKBlockPtr(int block_id, int layer) {
-  if (!k_cache || block_id < 0)
+  if (block_id < 0)
     return nullptr;
 
   // Layout: [head_dim, n_head_kv, BLOCK_SIZE, num_blocks * n_layer]
   // Block index in 4th dimension = block_id * n_layer + layer
   int64_t block_index = (int64_t)block_id * n_layer + layer;
-  return (char *)k_cache->data + block_index * GetBytesPerBlock();
+  size_t byte_offset = block_index * GetBytesPerBlock();
+
+  if (use_block_allocator && k_allocator) {
+    // Use block allocator arena
+    return static_cast<char *>(k_allocator->ArenaBase()) + byte_offset;
+  } else if (k_cache) {
+    // Legacy: use ggml tensor
+    return (char *)k_cache->data + byte_offset;
+  }
+  return nullptr;
 }
 
 const void *PagedKVCache::GetKBlockPtr(int block_id, int layer) const {
@@ -360,11 +373,20 @@ const void *PagedKVCache::GetKBlockPtr(int block_id, int layer) const {
 }
 
 void *PagedKVCache::GetVBlockPtr(int block_id, int layer) {
-  if (!v_cache || block_id < 0)
+  if (block_id < 0)
     return nullptr;
 
   int64_t block_index = (int64_t)block_id * n_layer + layer;
-  return (char *)v_cache->data + block_index * GetBytesPerBlock();
+  size_t byte_offset = block_index * GetBytesPerBlock();
+
+  if (use_block_allocator && v_allocator) {
+    // Use block allocator arena
+    return static_cast<char *>(v_allocator->ArenaBase()) + byte_offset;
+  } else if (v_cache) {
+    // Legacy: use ggml tensor
+    return (char *)v_cache->data + byte_offset;
+  }
+  return nullptr;
 }
 
 const void *PagedKVCache::GetVBlockPtr(int block_id, int layer) const {
@@ -462,7 +484,7 @@ PagedKVCache *InitPagedKVCache(TransformerModel *model, int max_num_seqs,
   // Initialize BlockManager
   cache->block_manager = new BlockManager(cache->max_blocks, BLOCK_SIZE);
 
-  // Calculate memory size
+  // Calculate memory size per tensor (K or V)
   // Layout: [head_dim, n_head_kv, BLOCK_SIZE, num_blocks * n_layer]
   int64_t n_layer_blocks = (int64_t)cache->max_blocks * cache->n_layer;
   int64_t nelements =
@@ -473,99 +495,42 @@ PagedKVCache *InitPagedKVCache(TransformerModel *model, int max_num_seqs,
   size_t tensor_size = nelements * type_size / blck_size;
   size_t total_size = tensor_size * 2; // K and V
 
-  // Add extra buffer for ggml overhead
-  size_t mem_size = total_size + 1024 * 1024 * 10;
+  // ==========================================================================
+  // KVBlockAllocator-based memory pool (PRIMARY PATH)
+  // Pre-allocates a single contiguous arena per K/V to eliminate fragmentation
+  // ==========================================================================
 
-  // NUMA-aware memory allocation with graceful fallback
-  void *numa_buffer = nullptr;
-  bool on_preferred_node = false;
-  int actual_numa_node = -1;
+  // Block stride: bytes per "block" in our linear arena
+  // Each block_id maps to: block_id * n_layer + layer_idx
+  // So total "logical blocks" = max_blocks * n_layer
+  size_t block_stride = cache->GetBytesPerBlock();
+  size_t total_logical_blocks = static_cast<size_t>(n_layer_blocks);
 
-  if (numa_node_id >= 0) {
-    // Use AllocatePreferred for graceful degradation on OOM
-    auto alloc_result =
-        densecore::NumaAllocator::AllocatePreferred(mem_size, 64, numa_node_id);
+  // Create K allocator with NUMA awareness
+  cache->k_allocator = std::make_unique<densecore::KVBlockAllocator>(
+      total_logical_blocks, block_stride, 64, numa_node_id);
 
-    numa_buffer = alloc_result.ptr;
-    on_preferred_node = alloc_result.on_preferred_node;
-    actual_numa_node = alloc_result.actual_node;
+  // Create V allocator with NUMA awareness
+  cache->v_allocator = std::make_unique<densecore::KVBlockAllocator>(
+      total_logical_blocks, block_stride, 64, numa_node_id);
 
-    if (numa_buffer) {
-      // Store NUMA allocation info for proper cleanup
-      cache->numa_buffer = numa_buffer;
-      cache->numa_buffer_size = mem_size;
-      cache->numa_node_id = actual_numa_node;
-
-      // Log allocation status
-      if (on_preferred_node) {
-        std::cout << "[KVCache] Allocated " << (mem_size / 1024 / 1024)
-                  << " MB on NUMA node " << actual_numa_node << " (OPTIMAL)"
-                  << std::endl;
-      } else if (actual_numa_node >= 0) {
-        std::cerr << "[KVCache] WARNING: Fallback allocation on NUMA node "
-                  << actual_numa_node << " (requested: " << numa_node_id
-                  << ") - may impact performance" << std::endl;
-      } else {
-        std::cerr << "[KVCache] WARNING: Using interleaved/standard memory - "
-                  << "NUMA optimization disabled" << std::endl;
-      }
-    } else {
-      std::cerr << "[KVCache] Error: All NUMA allocation attempts failed for "
-                << (mem_size / 1024 / 1024) << " MB" << std::endl;
-    }
-  }
-
-  struct ggml_init_params params = {
-      .mem_size = mem_size,
-      .mem_buffer = numa_buffer,
-      .no_alloc = false,
-  };
-
-  cache->ctx = ggml_init(params);
-  if (!cache->ctx) {
-    std::cerr << "[KVCache] Error: Failed to allocate "
-              << (total_size / 1024 / 1024)
-              << " MB for KV cache. Try reducing max_seq_len." << std::endl;
-    if (numa_buffer) {
-      densecore::NumaAllocator::Free(numa_buffer, mem_size);
-      cache->numa_buffer = nullptr;
-      cache->numa_buffer_size = 0;
-    }
+  if (!cache->k_allocator->IsValid() || !cache->v_allocator->IsValid()) {
+    std::cerr
+        << "[KVCache] Error: Failed to allocate " << (total_size / 1024 / 1024)
+        << " MB for KV cache via block allocators. Try reducing max_seq_len."
+        << std::endl;
     delete cache;
     return nullptr;
   }
 
-  // Create cache tensors
-  cache->k_cache =
-      ggml_new_tensor_4d(cache->ctx, type, cache->head_dim, cache->n_head_kv,
-                         BLOCK_SIZE, n_layer_blocks);
-
-  cache->v_cache =
-      ggml_new_tensor_4d(cache->ctx, type, cache->head_dim, cache->n_head_kv,
-                         BLOCK_SIZE, n_layer_blocks);
-
-  if (!cache->k_cache || !cache->v_cache) {
-    delete cache;
-    return nullptr;
-  }
+  // Enable block allocator mode
+  cache->use_block_allocator = true;
 
   // ==========================================================================
   // ALIGNMENT CHECK: Verify 64-byte alignment for AVX-512 safety
   // ==========================================================================
-  // The NumaAllocator should provide 64-byte aligned memory.
-  // If this assertion fails, AVX-512 aligned load/store will SIGSEGV.
-  // ==========================================================================
-  DENSECORE_ASSERT_ALIGNED_64(cache->k_cache->data);
-  DENSECORE_ASSERT_ALIGNED_64(cache->v_cache->data);
-
-  // Zero-initialize
-  if (type == GGML_TYPE_F32 || type == GGML_TYPE_F16) {
-    ggml_set_zero(cache->k_cache);
-    ggml_set_zero(cache->v_cache);
-  } else {
-    memset(cache->k_cache->data, 0, ggml_nbytes(cache->k_cache));
-    memset(cache->v_cache->data, 0, ggml_nbytes(cache->v_cache));
-  }
+  DENSECORE_ASSERT_ALIGNED_64(cache->k_allocator->ArenaBase());
+  DENSECORE_ASSERT_ALIGNED_64(cache->v_allocator->ArenaBase());
 
   // Type name for logging
   const char *type_name = "F32";
@@ -574,24 +539,24 @@ PagedKVCache *InitPagedKVCache(TransformerModel *model, int max_num_seqs,
   else if (type == GGML_TYPE_Q8_0)
     type_name = "Q8_0 (INT8)";
 
-  std::cout << "[KVCache] Initialized PagedKVCache (vLLM-style):" << std::endl;
+  std::cout << "[KVCache] Initialized PagedKVCache (Block Allocator):"
+            << std::endl;
   std::cout << "  - max_blocks: " << cache->max_blocks << std::endl;
   std::cout << "  - block_size: " << BLOCK_SIZE << " tokens" << std::endl;
   std::cout << "  - n_layer: " << cache->n_layer << std::endl;
   std::cout << "  - head_dim: " << cache->head_dim << std::endl;
   std::cout << "  - n_head_kv: " << cache->n_head_kv << std::endl;
   std::cout << "  - cache_type: " << type_name << std::endl;
+  std::cout << "  - k_arena: "
+            << (cache->k_allocator->ArenaSize() / 1024 / 1024) << " MB"
+            << std::endl;
+  std::cout << "  - v_arena: "
+            << (cache->v_allocator->ArenaSize() / 1024 / 1024) << " MB"
+            << std::endl;
   std::cout << "  - total_memory: " << (total_size / 1024 / 1024) << " MB"
             << std::endl;
-  if (numa_node_id >= 0 && numa_buffer) {
-    std::cout << "  - numa_node: " << numa_node_id << std::endl;
-  }
-
-  // Run diagnostic report to verify NUMA placement and huge page status
-  if (numa_buffer) {
-    densecore::MemoryDiagnostics::PrintSystemTopologyReport(
-        numa_buffer, mem_size, numa_node_id, "KV Cache");
-  }
+  std::cout << "  - allocation_mode: BLOCK_ALLOCATOR (zero-fragmentation)"
+            << std::endl;
 
   return cache;
 }

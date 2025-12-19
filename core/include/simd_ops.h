@@ -2368,6 +2368,674 @@ inline void UpdateOutput_AVX512(float *O, const float *PV, const float *alpha,
 
 #endif // __AVX512F__
 
+// =============================================================================
+// Fused Kernels for Memory Bandwidth Optimization
+// =============================================================================
+
+#if defined(__AVX512F__)
+
+/**
+ * @brief Fused Add + RMSNorm in one pass (AVX-512 optimized)
+ *
+ * Combines residual addition and RMSNorm into a single kernel to reduce
+ * memory bandwidth by loading/storing data once instead of twice.
+ *
+ * Operation:
+ *   1. x_out[i] = x[i] + residual[i]  (residual add)
+ *   2. Compute sum_of_squares for RMSNorm
+ *   3. Apply normalization: x_out[i] = (x_out[i] * rms_w[i]) / sqrt(sos/n +
+ * eps)
+ *
+ * @param x_out Output tensor [n] (can be same as x for in-place)
+ * @param x Input tensor [n]
+ * @param residual Residual tensor [n]
+ * @param rms_w RMSNorm weight tensor [n]
+ * @param n Number of elements
+ * @param eps Epsilon for numerical stability (default: 1e-5)
+ */
+inline void AddRMSNorm_AVX512(float *x_out, const float *x,
+                              const float *residual, const float *rms_w,
+                              size_t n, float eps = 1e-5f) {
+  // Pass 1: Add residual and compute sum of squares simultaneously
+  __m512 sos_vec = _mm512_setzero_ps();
+  size_t i = 0;
+
+  // Vectorized: add and accumulate sum-of-squares
+  for (; i + 16 <= n; i += 16) {
+    __m512 x_vec = _mm512_loadu_ps(x + i);
+    __m512 res_vec = _mm512_loadu_ps(residual + i);
+
+    // Fused add: x_out = x + residual
+    __m512 sum = _mm512_add_ps(x_vec, res_vec);
+    _mm512_storeu_ps(x_out + i, sum);
+
+    // Accumulate sum of squares for RMSNorm
+    sos_vec = _mm512_fmadd_ps(sum, sum, sos_vec);
+  }
+
+  // Scalar remainder for pass 1
+  float sos_scalar = _mm512_reduce_add_ps(sos_vec);
+  for (; i < n; i++) {
+    float val = x[i] + residual[i];
+    x_out[i] = val;
+    sos_scalar += val * val;
+  }
+
+  // Compute normalization factor: 1 / sqrt(mean(x^2) + eps)
+  float rms = sqrtf(sos_scalar / static_cast<float>(n) + eps);
+  float scale = 1.0f / rms;
+  const __m512 scale_vec = _mm512_set1_ps(scale);
+
+  // Pass 2: Apply normalized weight multiplication
+  i = 0;
+  for (; i + 16 <= n; i += 16) {
+    __m512 val = _mm512_loadu_ps(x_out + i);
+    __m512 w = _mm512_loadu_ps(rms_w + i);
+
+    // x_out = (x_out * scale) * weight = x_out * w * scale
+    val = _mm512_mul_ps(val, scale_vec);
+    val = _mm512_mul_ps(val, w);
+    _mm512_storeu_ps(x_out + i, val);
+  }
+
+  // Scalar remainder for pass 2
+  for (; i < n; i++) {
+    x_out[i] = x_out[i] * scale * rms_w[i];
+  }
+}
+
+/**
+ * @brief Fused Q/K/V projection in one pass (AVX-512 optimized)
+ *
+ * Computes Q = x @ W_q, K = x @ W_k, V = x @ W_v simultaneously.
+ * Reduces memory bandwidth by loading input x into registers once
+ * and computing all three projections with interleaved instructions.
+ *
+ * Note: This is a simplified version for decode (batch=1) scenarios.
+ * For larger batches, use standard GEMM calls.
+ *
+ * @param q Output Q projection [n_embd]
+ * @param k Output K projection [dim_k]
+ * @param v Output V projection [dim_v]
+ * @param x Input tensor [n_embd]
+ * @param w_q Q weight [n_embd, dim_q] (row-major)
+ * @param w_k K weight [n_embd, dim_k] (row-major)
+ * @param w_v V weight [n_embd, dim_v] (row-major)
+ * @param n_embd Input dimension
+ * @param dim_q Q output dimension (= n_head * head_dim)
+ * @param dim_k K output dimension (= n_head_kv * head_dim)
+ * @param dim_v V output dimension (= n_head_kv * head_dim)
+ */
+inline void ComputeQKV_AVX512(float *q, float *k, float *v, const float *x,
+                              const float *w_q, const float *w_k,
+                              const float *w_v, int n_embd, int dim_q,
+                              int dim_k, int dim_v) {
+  // For each output position, compute dot product with corresponding weight row
+  // Process multiple output positions for better ILP
+
+  constexpr int UNROLL = 4; // Process 4 outputs at a time for better pipelining
+
+  // Compute Q projection
+  int oq = 0;
+  for (; oq + UNROLL <= dim_q; oq += UNROLL) {
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    __m512 acc2 = _mm512_setzero_ps();
+    __m512 acc3 = _mm512_setzero_ps();
+
+    const float *w0 = w_q + oq * n_embd;
+    const float *w1 = w_q + (oq + 1) * n_embd;
+    const float *w2 = w_q + (oq + 2) * n_embd;
+    const float *w3 = w_q + (oq + 3) * n_embd;
+
+    int d = 0;
+    for (; d + 16 <= n_embd; d += 16) {
+      __m512 x_vec = _mm512_loadu_ps(x + d);
+
+      // Load weights and FMA
+      acc0 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w0 + d), acc0);
+      acc1 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w1 + d), acc1);
+      acc2 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w2 + d), acc2);
+      acc3 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w3 + d), acc3);
+    }
+
+    // Reduce and store
+    q[oq + 0] = _mm512_reduce_add_ps(acc0);
+    q[oq + 1] = _mm512_reduce_add_ps(acc1);
+    q[oq + 2] = _mm512_reduce_add_ps(acc2);
+    q[oq + 3] = _mm512_reduce_add_ps(acc3);
+
+    // Handle remainder for this output group
+    for (; d < n_embd; d++) {
+      q[oq + 0] += x[d] * w0[d];
+      q[oq + 1] += x[d] * w1[d];
+      q[oq + 2] += x[d] * w2[d];
+      q[oq + 3] += x[d] * w3[d];
+    }
+  }
+
+  // Handle remaining Q outputs
+  for (; oq < dim_q; oq++) {
+    __m512 acc = _mm512_setzero_ps();
+    const float *w = w_q + oq * n_embd;
+    int d = 0;
+    for (; d + 16 <= n_embd; d += 16) {
+      __m512 x_vec = _mm512_loadu_ps(x + d);
+      acc = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w + d), acc);
+    }
+    float sum = _mm512_reduce_add_ps(acc);
+    for (; d < n_embd; d++) {
+      sum += x[d] * w[d];
+    }
+    q[oq] = sum;
+  }
+
+  // Compute K projection (same pattern)
+  int ok = 0;
+  for (; ok + UNROLL <= dim_k; ok += UNROLL) {
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    __m512 acc2 = _mm512_setzero_ps();
+    __m512 acc3 = _mm512_setzero_ps();
+
+    const float *w0 = w_k + ok * n_embd;
+    const float *w1 = w_k + (ok + 1) * n_embd;
+    const float *w2 = w_k + (ok + 2) * n_embd;
+    const float *w3 = w_k + (ok + 3) * n_embd;
+
+    int d = 0;
+    for (; d + 16 <= n_embd; d += 16) {
+      __m512 x_vec = _mm512_loadu_ps(x + d);
+      acc0 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w0 + d), acc0);
+      acc1 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w1 + d), acc1);
+      acc2 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w2 + d), acc2);
+      acc3 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w3 + d), acc3);
+    }
+
+    k[ok + 0] = _mm512_reduce_add_ps(acc0);
+    k[ok + 1] = _mm512_reduce_add_ps(acc1);
+    k[ok + 2] = _mm512_reduce_add_ps(acc2);
+    k[ok + 3] = _mm512_reduce_add_ps(acc3);
+
+    for (; d < n_embd; d++) {
+      k[ok + 0] += x[d] * w0[d];
+      k[ok + 1] += x[d] * w1[d];
+      k[ok + 2] += x[d] * w2[d];
+      k[ok + 3] += x[d] * w3[d];
+    }
+  }
+
+  for (; ok < dim_k; ok++) {
+    __m512 acc = _mm512_setzero_ps();
+    const float *w = w_k + ok * n_embd;
+    int d = 0;
+    for (; d + 16 <= n_embd; d += 16) {
+      __m512 x_vec = _mm512_loadu_ps(x + d);
+      acc = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w + d), acc);
+    }
+    float sum = _mm512_reduce_add_ps(acc);
+    for (; d < n_embd; d++) {
+      sum += x[d] * w[d];
+    }
+    k[ok] = sum;
+  }
+
+  // Compute V projection (same pattern)
+  int ov = 0;
+  for (; ov + UNROLL <= dim_v; ov += UNROLL) {
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    __m512 acc2 = _mm512_setzero_ps();
+    __m512 acc3 = _mm512_setzero_ps();
+
+    const float *w0 = w_v + ov * n_embd;
+    const float *w1 = w_v + (ov + 1) * n_embd;
+    const float *w2 = w_v + (ov + 2) * n_embd;
+    const float *w3 = w_v + (ov + 3) * n_embd;
+
+    int d = 0;
+    for (; d + 16 <= n_embd; d += 16) {
+      __m512 x_vec = _mm512_loadu_ps(x + d);
+      acc0 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w0 + d), acc0);
+      acc1 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w1 + d), acc1);
+      acc2 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w2 + d), acc2);
+      acc3 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w3 + d), acc3);
+    }
+
+    v[ov + 0] = _mm512_reduce_add_ps(acc0);
+    v[ov + 1] = _mm512_reduce_add_ps(acc1);
+    v[ov + 2] = _mm512_reduce_add_ps(acc2);
+    v[ov + 3] = _mm512_reduce_add_ps(acc3);
+
+    for (; d < n_embd; d++) {
+      v[ov + 0] += x[d] * w0[d];
+      v[ov + 1] += x[d] * w1[d];
+      v[ov + 2] += x[d] * w2[d];
+      v[ov + 3] += x[d] * w3[d];
+    }
+  }
+
+  for (; ov < dim_v; ov++) {
+    __m512 acc = _mm512_setzero_ps();
+    const float *w = w_v + ov * n_embd;
+    int d = 0;
+    for (; d + 16 <= n_embd; d += 16) {
+      __m512 x_vec = _mm512_loadu_ps(x + d);
+      acc = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w + d), acc);
+    }
+    float sum = _mm512_reduce_add_ps(acc);
+    for (; d < n_embd; d++) {
+      sum += x[d] * w[d];
+    }
+    v[ov] = sum;
+  }
+}
+
+#else // Scalar fallback for non-AVX512
+
+// Forward declare scalar implementations
+inline void AddRMSNorm_Scalar(float *x_out, const float *x,
+                              const float *residual, const float *rms_w,
+                              size_t n, float eps = 1e-5f);
+
+inline void ComputeQKV_Scalar(float *q, float *k, float *v, const float *x,
+                              const float *w_q, const float *w_k,
+                              const float *w_v, int n_embd, int dim_q,
+                              int dim_k, int dim_v);
+
+/**
+ * @brief Scalar fallback for fused Add + RMSNorm
+ */
+inline void AddRMSNorm_AVX512(float *x_out, const float *x,
+                              const float *residual, const float *rms_w,
+                              size_t n, float eps = 1e-5f) {
+  AddRMSNorm_Scalar(x_out, x, residual, rms_w, n, eps);
+}
+
+/**
+ * @brief Scalar fallback for fused Q/K/V projection
+ */
+inline void ComputeQKV_AVX512(float *q, float *k, float *v, const float *x,
+                              const float *w_q, const float *w_k,
+                              const float *w_v, int n_embd, int dim_q,
+                              int dim_k, int dim_v) {
+  ComputeQKV_Scalar(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v);
+}
+
+#endif // __AVX512F__
+
+// =============================================================================
+// AVX2 Fused Kernels
+// =============================================================================
+
+#if defined(__AVX2__)
+
+/**
+ * @brief Fused Add + RMSNorm in one pass (AVX2 optimized)
+ */
+inline void AddRMSNorm_AVX2(float *x_out, const float *x, const float *residual,
+                            const float *rms_w, size_t n, float eps = 1e-5f) {
+  __m256 sos_vec = _mm256_setzero_ps();
+  size_t i = 0;
+
+  // Pass 1: Fused Add + Sum of Squares
+  for (; i + 8 <= n; i += 8) {
+    __m256 x_vec = _mm256_loadu_ps(x + i);
+    __m256 res_vec = _mm256_loadu_ps(residual + i);
+
+    // x_out = x + residual
+    __m256 sum = _mm256_add_ps(x_vec, res_vec);
+    _mm256_storeu_ps(x_out + i, sum);
+
+    // Accumulate sum of squares
+    sos_vec = _mm256_fmadd_ps(sum, sum, sos_vec);
+  }
+
+  // Horizontal reduction for AVX2
+  // 1. Extract high 128 bits and add to low 128 bits
+  __m128 hi = _mm256_extractf128_ps(sos_vec, 1);
+  __m128 lo = _mm256_castps256_ps128(sos_vec);
+  __m128 sum128 = _mm_add_ps(lo, hi);
+
+  // 2. Reduce 128 vectors using movehl and shuffle (faster than hadd)
+  // [a, b, c, d] -> [a+c, b+d, c, d]
+  __m128 movehl = _mm_movehl_ps(sum128, sum128);
+  sum128 = _mm_add_ps(sum128, movehl);
+  // [a+c, b+d, ...] -> [a+c+b+d, ...]
+  __m128 shuffle = _mm_shuffle_ps(sum128, sum128, 1);
+  sum128 = _mm_add_ss(sum128, shuffle);
+
+  float sos_scalar = _mm_cvtss_f32(sum128);
+
+  // Handle remainder for Pass 1
+  for (; i < n; i++) {
+    float val = x[i] + residual[i];
+    x_out[i] = val;
+    sos_scalar += val * val;
+  }
+
+  // Compute scale
+  float rms = sqrtf(sos_scalar / static_cast<float>(n) + eps);
+  float scale = 1.0f / rms;
+  __m256 scale_vec = _mm256_set1_ps(scale);
+
+  // Pass 2: Apply normalization and weight
+  i = 0;
+  for (; i + 8 <= n; i += 8) {
+    __m256 val = _mm256_loadu_ps(x_out + i);
+    __m256 w = _mm256_loadu_ps(rms_w + i);
+
+    val = _mm256_mul_ps(val, scale_vec); // normalize
+    val = _mm256_mul_ps(val, w);         // weight
+    _mm256_storeu_ps(x_out + i, val);
+  }
+
+  // Handle remainder for Pass 2
+  for (; i < n; i++) {
+    x_out[i] = x_out[i] * scale * rms_w[i];
+  }
+}
+
+/**
+ * @brief Fused Q/K/V projection (AVX2 optimized)
+ */
+inline void ComputeQKV_AVX2(float *q, float *k, float *v, const float *x,
+                            const float *w_q, const float *w_k,
+                            const float *w_v, int n_embd, int dim_q, int dim_k,
+                            int dim_v) {
+  // Unrolling factor: 2 outputs at a time to hide latency
+  constexpr int UNROLL = 2;
+
+  // Q Projection
+  int oq = 0;
+  for (; oq + UNROLL <= dim_q; oq += UNROLL) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+
+    const float *w0 = w_q + oq * n_embd;
+    const float *w1 = w_q + (oq + 1) * n_embd;
+
+    int d = 0;
+    for (; d + 8 <= n_embd; d += 8) {
+      __m256 x_vec = _mm256_loadu_ps(x + d);
+      acc0 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w0 + d), acc0);
+      acc1 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w1 + d), acc1);
+    }
+
+    // Helper lambda for reduction
+    auto hsum256 = [](__m256 v) -> float {
+      __m128 hi = _mm256_extractf128_ps(v, 1);
+      __m128 lo = _mm256_castps256_ps128(v);
+      __m128 s = _mm_add_ps(lo, hi);
+      s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+      s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+      return _mm_cvtss_f32(s);
+    };
+
+    q[oq + 0] = hsum256(acc0);
+    q[oq + 1] = hsum256(acc1);
+
+    // Remainder
+    for (; d < n_embd; d++) {
+      q[oq + 0] += x[d] * w0[d];
+      q[oq + 1] += x[d] * w1[d];
+    }
+  }
+
+  // Remaining Q outputs
+  for (; oq < dim_q; oq++) {
+    __m256 acc = _mm256_setzero_ps();
+    const float *w = w_q + oq * n_embd;
+    int d = 0;
+    for (; d + 8 <= n_embd; d += 8) {
+      acc =
+          _mm256_fmadd_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(w + d), acc);
+    }
+    // Reduction
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    float sum = _mm_cvtss_f32(s);
+
+    for (; d < n_embd; d++) {
+      sum += x[d] * w[d];
+    }
+    q[oq] = sum;
+  }
+
+  // K Projection
+  int ok = 0;
+  for (; ok + UNROLL <= dim_k; ok += UNROLL) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+
+    const float *w0 = w_k + ok * n_embd;
+    const float *w1 = w_k + (ok + 1) * n_embd;
+
+    int d = 0;
+    for (; d + 8 <= n_embd; d += 8) {
+      __m256 x_vec = _mm256_loadu_ps(x + d);
+      acc0 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w0 + d), acc0);
+      acc1 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w1 + d), acc1);
+    }
+
+    auto hsum256 = [](__m256 v) -> float {
+      __m128 hi = _mm256_extractf128_ps(v, 1);
+      __m128 lo = _mm256_castps256_ps128(v);
+      __m128 s = _mm_add_ps(lo, hi);
+      s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+      s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+      return _mm_cvtss_f32(s);
+    };
+
+    k[ok + 0] = hsum256(acc0);
+    k[ok + 1] = hsum256(acc1);
+
+    for (; d < n_embd; d++) {
+      k[ok + 0] += x[d] * w0[d];
+      k[ok + 1] += x[d] * w1[d];
+    }
+  }
+
+  for (; ok < dim_k; ok++) {
+    __m256 acc = _mm256_setzero_ps();
+    const float *w = w_k + ok * n_embd;
+    int d = 0;
+    for (; d + 8 <= n_embd; d += 8) {
+      acc =
+          _mm256_fmadd_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(w + d), acc);
+    }
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    float sum = _mm_cvtss_f32(s);
+
+    for (; d < n_embd; d++) {
+      sum += x[d] * w[d];
+    }
+    k[ok] = sum;
+  }
+
+  // V Projection
+  int ov = 0;
+  for (; ov + UNROLL <= dim_v; ov += UNROLL) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+
+    const float *w0 = w_v + ov * n_embd;
+    const float *w1 = w_v + (ov + 1) * n_embd;
+
+    int d = 0;
+    for (; d + 8 <= n_embd; d += 8) {
+      __m256 x_vec = _mm256_loadu_ps(x + d);
+      acc0 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w0 + d), acc0);
+      acc1 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w1 + d), acc1);
+    }
+
+    auto hsum256 = [](__m256 v) -> float {
+      __m128 hi = _mm256_extractf128_ps(v, 1);
+      __m128 lo = _mm256_castps256_ps128(v);
+      __m128 s = _mm_add_ps(lo, hi);
+      s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+      s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+      return _mm_cvtss_f32(s);
+    };
+
+    v[ov + 0] = hsum256(acc0);
+    v[ov + 1] = hsum256(acc1);
+
+    for (; d < n_embd; d++) {
+      v[ov + 0] += x[d] * w0[d];
+      v[ov + 1] += x[d] * w1[d];
+    }
+  }
+
+  for (; ov < dim_v; ov++) {
+    __m256 acc = _mm256_setzero_ps();
+    const float *w = w_v + ov * n_embd;
+    int d = 0;
+    for (; d + 8 <= n_embd; d += 8) {
+      acc =
+          _mm256_fmadd_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(w + d), acc);
+    }
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    float sum = _mm_cvtss_f32(s);
+
+    for (; d < n_embd; d++) {
+      sum += x[d] * w[d];
+    }
+    v[ov] = sum;
+  }
+}
+
+#else
+
+// Forward declare to allow wrapper usage
+inline void AddRMSNorm_Scalar(float *x_out, const float *x,
+                              const float *residual, const float *rms_w,
+                              size_t n, float eps = 1e-5f);
+inline void ComputeQKV_Scalar(float *q, float *k, float *v, const float *x,
+                              const float *w_q, const float *w_k,
+                              const float *w_v, int n_embd, int dim_q,
+                              int dim_k, int dim_v);
+
+inline void AddRMSNorm_AVX2(float *x_out, const float *x, const float *residual,
+                            const float *rms_w, size_t n, float eps = 1e-5f) {
+  AddRMSNorm_Scalar(x_out, x, residual, rms_w, n, eps);
+}
+
+inline void ComputeQKV_AVX2(float *q, float *k, float *v, const float *x,
+                            const float *w_q, const float *w_k,
+                            const float *w_v, int n_embd, int dim_q, int dim_k,
+                            int dim_v) {
+  ComputeQKV_Scalar(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v);
+}
+
+#endif // __AVX2__
+
+// =============================================================================
+// Scalar Implementation (Always Available)
+// =============================================================================
+
+inline void AddRMSNorm_Scalar(float *x_out, const float *x,
+                              const float *residual, const float *rms_w,
+                              size_t n, float eps) {
+  // Pass 1: Add and compute sum of squares
+  float sos = 0.0f;
+  for (size_t i = 0; i < n; i++) {
+    float val = x[i] + residual[i];
+    x_out[i] = val;
+    sos += val * val;
+  }
+
+  // Compute scale
+  float rms = sqrtf(sos / static_cast<float>(n) + eps);
+  float scale = 1.0f / rms;
+
+  // Pass 2: Apply normalization
+  for (size_t i = 0; i < n; i++) {
+    x_out[i] = x_out[i] * scale * rms_w[i];
+  }
+}
+
+inline void ComputeQKV_Scalar(float *q, float *k, float *v, const float *x,
+                              const float *w_q, const float *w_k,
+                              const float *w_v, int n_embd, int dim_q,
+                              int dim_k, int dim_v) {
+  // Q projection
+  for (int o = 0; o < dim_q; o++) {
+    float sum = 0.0f;
+    const float *w = w_q + o * n_embd;
+    for (int d = 0; d < n_embd; d++) {
+      sum += x[d] * w[d];
+    }
+    q[o] = sum;
+  }
+
+  // K projection
+  for (int o = 0; o < dim_k; o++) {
+    float sum = 0.0f;
+    const float *w = w_k + o * n_embd;
+    for (int d = 0; d < n_embd; d++) {
+      sum += x[d] * w[d];
+    }
+    k[o] = sum;
+  }
+
+  // V projection
+  for (int o = 0; o < dim_v; o++) {
+    float sum = 0.0f;
+    const float *w = w_v + o * n_embd;
+    for (int d = 0; d < n_embd; d++) {
+      sum += x[d] * w[d];
+    }
+    v[o] = sum;
+  }
+}
+
+// =============================================================================
+// Unified Dispatch Wrappers
+// =============================================================================
+
+/**
+ * @brief Unified AddRMSNorm dispatcher (runtime SIMD selection)
+ */
+inline void AddRMSNorm(float *x_out, const float *x, const float *residual,
+                       const float *rms_w, size_t n, float eps = 1e-5f) {
+  static const SimdLevel level = DetectSimdLevel();
+  if (level >= SimdLevel::AVX512) {
+    AddRMSNorm_AVX512(x_out, x, residual, rms_w, n, eps);
+  } else if (level >= SimdLevel::AVX2) {
+    AddRMSNorm_AVX2(x_out, x, residual, rms_w, n, eps);
+  } else {
+    AddRMSNorm_Scalar(x_out, x, residual, rms_w, n, eps);
+  }
+}
+
+/**
+ * @brief Unified ComputeQKV dispatcher (runtime SIMD selection)
+ */
+inline void ComputeQKV(float *q, float *k, float *v, const float *x,
+                       const float *w_q, const float *w_k, const float *w_v,
+                       int n_embd, int dim_q, int dim_k, int dim_v) {
+  static const SimdLevel level = DetectSimdLevel();
+  if (level >= SimdLevel::AVX512) {
+    ComputeQKV_AVX512(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v);
+  } else if (level >= SimdLevel::AVX2) {
+    ComputeQKV_AVX2(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v);
+  } else {
+    ComputeQKV_Scalar(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v);
+  }
+}
+
 } // namespace simd
 } // namespace densecore
 

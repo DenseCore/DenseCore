@@ -2,18 +2,16 @@
 
 # 🚀 DenseCore
 
-### **Run LLMs 10x Faster on CPU. No GPU Required.**
+### **High-Performance CPU Inference Engine for LLMs**
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/densecore?color=blue)](https://pypi.org/project/densecore/)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](python/)
-[![Go 1.24+](https://img.shields.io/badge/go-1.24+-00ADD8.svg)](server/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](Dockerfile)
-[![CI](https://github.com/Jake-Network/DenseCore/actions/workflows/ci.yml/badge.svg)](https://github.com/Jake-Network/DenseCore/actions)
 
-**The high-performance open-source inference engine that makes Small Language Models production-ready on CPUs.**
+**Make Small Language Models production-ready on CPUs with AVX-512 optimization.**
 
-[Quick Start](#-quick-start) • [Why DenseCore](#-why-densecore) • [Benchmarks](#-benchmarks) • [Roadmap](#-roadmap) • [Docs](docs/)
+[Quick Start](#-quick-start) • [Why DenseCore](#-why-densecore) • [LangChain](#-langchain-integration) • [Benchmarks](#-benchmarks)
 
 </div>
 
@@ -21,92 +19,67 @@
 
 ## ⚡ Quick Start
 
-> [!NOTE]
-> **Linux Only (Recommended)**: DenseCore is optimized for **Linux (Ubuntu 22.04+)**.
-
-### 1. Python SDK
-
-Designed for developers who want a "just works" experience.
+### Installation
 
 ```bash
+# Install from source (requires C++ compiler)
+pip install .
+
+# Or install from PyPI
 pip install densecore
 ```
 
+### Python SDK
+
 ```python
-import densecore
+from densecore import AutoModel
 
-# 🚀 One line to load from HuggingFace (No manual conversion needed!)
-model = densecore.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+# Auto-download and load model
+model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct-GGUF")
 
-# ✨ Generate with industry-leading speed
-print(model.generate("Explain quantum computing in one sentence."))
+# Generate text
+print(model.generate("Hello world!"))
 ```
 
-### 2. Docker Server (OpenAI-Compatible)
+### 🦜🔗 LangChain Integration
 
-Deploy a production-ready API server in seconds.
+Build agents in 5 lines of code:
 
-```bash
-docker run -p 8080:8080 \
-  -v ./models:/models \
-  -e MAIN_MODEL_PATH=/models/qwen.gguf \
-  densecore/densecore:latest
-```
+```python
+from densecore.langchain import DenseCoreChatModel
+from langchain_core.messages import HumanMessage
 
-Test it with `curl`:
+chat = DenseCoreChatModel(hf_repo_id="Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+chat_with_tools = chat.bind_tools([calculator_tool])
 
-```bash
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "Hello!"}]}'
+response = chat_with_tools.invoke([HumanMessage(content="What is 25 * 4?")])
+print(response.content)
 ```
 
 ---
 
 ## 🎯 Why DenseCore?
 
-We built DenseCore because **GPUs are scarce and expensive**, but CPUs are everywhere.
+We built DenseCore because **GPUs are scarce**, but CPUs are everywhere.
 
 <table>
 <tr>
 <td width="50%">
 
-### 🔥 Blazing Fast
-C++ core with **AVX-512 & AVX2** hand-tuned kernels. 
-- **Runtime SIMD Dispatch**: Detects CPU at runtime (CPUID) and uses best available (AVX-512 → AVX2 → Scalar).
-- **INT4 Quantization**: 7× compression, 5-6× faster inference.
-- **Continuous Batching**: Maximizes throughput.
-- **Graph Caching**: Reduces overhead by 40%.
-- **OpenMP Threading**: Full CPU core utilization (16 threads on i7-10870H).
-
+### 🔥 High-Performance Core
+- **AVX-512 & AMX Optimized**: Hand-tuned Assembly kernels.
+- **PagedAttention on CPU**: Zero-copy KV cache management.
+- **Runtime SIMD Dispatch**: Auto-selects AVX-512/AVX2/Scalar.
+- **Continuous Batching**: High throughput for server workloads.
 
 </td>
 <td width="50%">
 
-### 💰 Cost Efficiency
-Slash your cloud bills by **90%**.
-- Run production workloads on commodity VMs (`c7i.large`).
-- Cost as low as **$0.01/hr**.
-- No specialized hardware required.
-
-</td>
-</tr>
-<tr>
-<td width="50%">
-
-### 🐍 Developer First
-- **Native Python SDK**: No complex compilation.
-- **HuggingFace Integration**: Direct downloads.
-- **OpenAI API**: Drop-in replacement for existing apps.
-
-</td>
-<td width="50%">
-
-### 🛡️ Production Ready
-- **Kubernetes Native**: Helm charts & manifests included.
-- **Observability**: Prometheus metrics & OpenTelemetry tracing.
-- **Security**: Enterprise-grade API key management.
-- **NUMA-Aware**: Optimized for multi-socket servers.
+### 🛠️ Developer Ready
+- **OpenAI API Compatible**: Drop-in replacement server.
+- **LangChain/LangGraph Ready**: Native tool calling support.
+- **HuggingFace Integration**: Seamless model downloading.
+- **Easy Installation**: `pip install .` works out of the box.
 
 </td>
 </tr>
@@ -116,16 +89,15 @@ Slash your cloud bills by **90%**.
 
 ## 📊 Benchmarks
 
-**Environment:** 4-core vCPU, 8GB RAM (AWS c7i.large equivalent) — **No GPU**.
+**Environment:** 4-core vCPU, 8GB RAM (AWS c7i.large) — **No GPU**.
 
-| Model | DenseCore | Transformers | Speedup |
-|-------|-----------|--------------|---------| 
+| Model | DenseCore (AVX-512) | Transformers (Standard) | Speedup |
+|-------|---------------------|--------------------------|---------| 
 | **Qwen2.5-0.5B** | **28.5 tok/s** | ~3-4 tok/s | **🚀 8x** |
 | **TinyLlama-1.1B** | **22.1 tok/s** | ~2 tok/s | **🔥 11x** |
 | **Qwen3-4B** | **6.6 tok/s** | ~1.5 tok/s | **4x** |
-| **Qwen3-8B** | **4.0 tok/s** | ~0.5 tok/s | **8x** |
 
-> See [full benchmarks](docs/BENCHMARKS.md) for methodology.
+> Run the benchmark script to test your machine: `python benchmarks/benchmark_throughput.py --model model.gguf`
 
 ---
 
@@ -134,16 +106,13 @@ Slash your cloud bills by **90%**.
 Includes built-in tools to compress models (Quantization & Pruning) for edge deployment.
 
 ```python
-from densecore.quantize import quantize_model, Q4_K_M_CFG, INT4_PAPER_CFG
+from densecore.quantize import quantize_model, INT4_PAPER_CFG
 
-# Standard GGML quantization
-quantize_model("model.gguf", "model-q4.gguf", config=Q4_K_M_CFG)
-
-# 🚀 NEW: Custom INT4 with AVX512-optimized kernels (5-6× faster inference!)
+# Custom INT4 with AVX512-optimized kernels (5-6× faster inference!)
 quantize_model("model.gguf", "model-int4.gguf", config=INT4_PAPER_CFG(block_size=128))
 ```
 
-📖 **[Optimization Guide →](docs/MODEL_OPTIMIZATION.md)** | **[INT4 Quantization →](docs/INT4_QUANTIZATION.md)**
+📖 **[Optimization Guide →](docs/MODEL_OPTIMIZATION.md)**
 
 ---
 
