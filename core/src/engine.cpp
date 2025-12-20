@@ -1,3 +1,4 @@
+#include "backend_registry.h" // Backend abstraction layer
 #include "densecore.h"
 #include "embedding.h"
 #include "engine_internal.h"
@@ -126,6 +127,14 @@ DENSECORE_API DenseCoreHandle InitEngine(const char *model_path,
     if (!densecore::OpsRegistry::IsInitialized()) {
       densecore::OpsRegistry::Init();
     }
+
+    // =========================================================================
+    // BACKEND REGISTRY INITIALIZATION
+    // =========================================================================
+    // Register the CPU backend (AVX2/AVX-512 kernels wrapped in ComputeBackend
+    // interface). Future ASIC backends can be registered similarly.
+    // =========================================================================
+    densecore::BackendRegistry::Instance().RegisterCpuBackend();
 
     // Update global inference config for Flash Attention and other parallel ops
     InferenceConfig::Instance().num_threads = threads;

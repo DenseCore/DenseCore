@@ -15,7 +15,6 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <iostream> // For std::cerr debug logging
 
 // User data for KV cache operations
 struct KVCacheUserData {
@@ -82,9 +81,6 @@ inline RoPEUserData *GetRoPEUserData() {
  */
 void cb_rope_avx512(struct ggml_tensor *dst, const struct ggml_tensor *src,
                     int ith, int nth, void *userdata) {
-  // [DEBUG] Trace RoPE kernel entry
-  std::cerr << "[DEBUG] Enter RoPE ith=" << ith << " nth=" << nth << std::endl;
-
   auto *ud = (RoPEUserData *)userdata;
   if (!ud || !ud->cos_sin_table || !ud->positions)
     return;
@@ -319,9 +315,6 @@ inline QKVUserData *GetQKVUserData() {
  */
 void cb_compute_qkv(struct ggml_tensor *dst, const struct ggml_tensor *src,
                     int ith, int nth, void *userdata) {
-  // [DEBUG] Trace QKV kernel entry/exit
-  std::cerr << "[DEBUG] Enter QKV ith=" << ith << " nth=" << nth << std::endl;
-
   // ===========================================================================
   // BARRIER SAFETY CONTRACT:
   // ===========================================================================
@@ -333,10 +326,8 @@ void cb_compute_qkv(struct ggml_tensor *dst, const struct ggml_tensor *src,
   // - In DECODE case, all threads iterate all tokens (no early return)
   // ===========================================================================
   auto *ud = static_cast<QKVUserData *>(userdata);
-  if (!ud || !ud->x || !ud->w_q || !ud->w_k || !ud->w_v) {
-    std::cerr << "[DEBUG] Exit QKV (early, bad userdata)" << std::endl;
+  if (!ud || !ud->x || !ud->w_q || !ud->w_k || !ud->w_v)
     return;
-  }
 
   const int n_tokens = ud->n_tokens;
 
@@ -394,7 +385,6 @@ void cb_compute_qkv(struct ggml_tensor *dst, const struct ggml_tensor *src,
           1 // Disable tensor parallelism (single-threaded kernel call)
       );
     }
-    std::cerr << "[DEBUG] Exit QKV" << std::endl;
   }
 }
 
@@ -545,16 +535,11 @@ struct INT4GemmUserData {
  */
 void cb_int4_gemm(struct ggml_tensor *dst, const struct ggml_tensor *src,
                   int ith, int nth, void *userdata) {
-  // [DEBUG] Trace GEMM kernel entry
-  std::cerr << "[DEBUG] Enter GEMM ith=" << ith << " nth=" << nth << std::endl;
-
   // =========================================================================
-  // [DEBUG] Thread pinning DISABLED to diagnose potential deadlock.
+  // Thread pinning DISABLED to prevent deadlock on consumer hardware.
   // Aggressive CPU pinning was causing hangs on first token inference.
-  // Uncomment to re-enable after debugging.
+  // See: https://github.com/DenseCore/issues/xyz (Thread Affinity Deadlock)
   // =========================================================================
-  // Pin this GGML worker thread on first invocation (thread-local, O(1) after
-  // first call)
   // densecore::HardwareTopology::GetInstance().PinComputeThread(ith);
 
   auto *ud = (INT4GemmUserData *)userdata;

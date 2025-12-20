@@ -86,6 +86,9 @@ set(SOURCES
     src/optimization_bridge.cpp
     src/save_model.cpp
     src/version.cpp
+    # Backend abstraction
+    src/cpu_backend.cpp
+    src/backend_registry.cpp
     # Quantization module
     src/quantizer.cpp
     src/quantization/max_quantizer.cpp
