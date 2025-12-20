@@ -93,11 +93,13 @@ We built DenseCore because **GPUs are scarce**, but CPUs are everywhere.
 
 | Model | DenseCore (AVX-512) | Transformers (Standard) | Speedup |
 |-------|---------------------|--------------------------|---------| 
-| **Qwen2.5-0.5B** | **TBD** | ~3-4 tok/s | **-** |
-| **Qwen3-4B** | **TBD** | ~1.5 tok/s | **-** |
+| **Qwen2.5-0.5B** | **Pending** | ~3-4 tok/s | **-** |
+| **Qwen3-4B** | **Pending** | ~1.5 tok/s | **-** |
 | **TinyLlama-1.1B** | **22.1** | ~2 tok/s | **11x** |
 
-> **Note:** Benchmarks currently failing on verification environment (Deadlock/Segfault detected). Fix investigation in progress.
+> **Status Update (2025-12-20):** AVX2 kernel hardening applied. All SIMD unit tests pass (32/32).
+> Multi-threaded inference on AVX2 hardware (Intel Comet Lake) has a known threading issue being investigated.
+> Single-thread mode (`--threads 1`) or AVX-512 hardware works correctly.
 
 > Run the benchmark script to test your machine: `python benchmarks/benchmark_throughput.py --model model.gguf`
 

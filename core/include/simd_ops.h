@@ -2469,165 +2469,207 @@ inline void AddRMSNorm_AVX512(float *x_out, const float *x,
 inline void ComputeQKV_AVX512(float *q, float *k, float *v, const float *x,
                               const float *w_q, const float *w_k,
                               const float *w_v, int n_embd, int dim_q,
-                              int dim_k, int dim_v) {
+                              int dim_k, int dim_v, int ith = 0, int nth = 1) {
+  // ==========================================================================
+  // TENSOR-LEVEL PARALLELISM: Work Partitioning
+  // ==========================================================================
+  // Virtual column space: [0, dim_q) = Q, [dim_q, dim_q+dim_k) = K,
+  //                       [dim_q+dim_k, total) = V
+  // Each thread computes a slice [start_col, end_col) of this virtual space.
+  // ==========================================================================
+  const int total_cols = dim_q + dim_k + dim_v;
+  const int cols_per_thread = (total_cols + nth - 1) / nth; // Ceiling division
+  const int start_col = ith * cols_per_thread;
+  const int end_col = std::min(start_col + cols_per_thread, total_cols);
+
+  // Early exit if this thread has no work
+  if (start_col >= total_cols)
+    return;
+
   // For each output position, compute dot product with corresponding weight row
   // Process multiple output positions for better ILP
 
   constexpr int UNROLL = 4; // Process 4 outputs at a time for better pipelining
 
-  // Compute Q projection
-  int oq = 0;
-  for (; oq + UNROLL <= dim_q; oq += UNROLL) {
-    __m512 acc0 = _mm512_setzero_ps();
-    __m512 acc1 = _mm512_setzero_ps();
-    __m512 acc2 = _mm512_setzero_ps();
-    __m512 acc3 = _mm512_setzero_ps();
+  // ==========================================================================
+  // Q Projection: virtual columns [0, dim_q)
+  // ==========================================================================
+  // Compute intersection with this thread's range
+  const int q_start = std::max(0, start_col);
+  const int q_end = std::min(dim_q, end_col);
 
-    const float *w0 = w_q + oq * n_embd;
-    const float *w1 = w_q + (oq + 1) * n_embd;
-    const float *w2 = w_q + (oq + 2) * n_embd;
-    const float *w3 = w_q + (oq + 3) * n_embd;
+  if (q_start < q_end) {
+    int oq = q_start;
+    for (; oq + UNROLL <= q_end; oq += UNROLL) {
+      __m512 acc0 = _mm512_setzero_ps();
+      __m512 acc1 = _mm512_setzero_ps();
+      __m512 acc2 = _mm512_setzero_ps();
+      __m512 acc3 = _mm512_setzero_ps();
 
-    int d = 0;
-    for (; d + 16 <= n_embd; d += 16) {
-      __m512 x_vec = _mm512_loadu_ps(x + d);
+      const float *w0 = w_q + oq * n_embd;
+      const float *w1 = w_q + (oq + 1) * n_embd;
+      const float *w2 = w_q + (oq + 2) * n_embd;
+      const float *w3 = w_q + (oq + 3) * n_embd;
 
-      // Load weights and FMA
-      acc0 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w0 + d), acc0);
-      acc1 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w1 + d), acc1);
-      acc2 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w2 + d), acc2);
-      acc3 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w3 + d), acc3);
+      int d = 0;
+      for (; d + 16 <= n_embd; d += 16) {
+        __m512 x_vec = _mm512_loadu_ps(x + d);
+
+        // Load weights and FMA
+        acc0 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w0 + d), acc0);
+        acc1 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w1 + d), acc1);
+        acc2 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w2 + d), acc2);
+        acc3 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w3 + d), acc3);
+      }
+
+      // Reduce and store
+      q[oq + 0] = _mm512_reduce_add_ps(acc0);
+      q[oq + 1] = _mm512_reduce_add_ps(acc1);
+      q[oq + 2] = _mm512_reduce_add_ps(acc2);
+      q[oq + 3] = _mm512_reduce_add_ps(acc3);
+
+      // Handle remainder for this output group
+      for (; d < n_embd; d++) {
+        q[oq + 0] += x[d] * w0[d];
+        q[oq + 1] += x[d] * w1[d];
+        q[oq + 2] += x[d] * w2[d];
+        q[oq + 3] += x[d] * w3[d];
+      }
     }
 
-    // Reduce and store
-    q[oq + 0] = _mm512_reduce_add_ps(acc0);
-    q[oq + 1] = _mm512_reduce_add_ps(acc1);
-    q[oq + 2] = _mm512_reduce_add_ps(acc2);
-    q[oq + 3] = _mm512_reduce_add_ps(acc3);
-
-    // Handle remainder for this output group
-    for (; d < n_embd; d++) {
-      q[oq + 0] += x[d] * w0[d];
-      q[oq + 1] += x[d] * w1[d];
-      q[oq + 2] += x[d] * w2[d];
-      q[oq + 3] += x[d] * w3[d];
-    }
-  }
-
-  // Handle remaining Q outputs
-  for (; oq < dim_q; oq++) {
-    __m512 acc = _mm512_setzero_ps();
-    const float *w = w_q + oq * n_embd;
-    int d = 0;
-    for (; d + 16 <= n_embd; d += 16) {
-      __m512 x_vec = _mm512_loadu_ps(x + d);
-      acc = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w + d), acc);
-    }
-    float sum = _mm512_reduce_add_ps(acc);
-    for (; d < n_embd; d++) {
-      sum += x[d] * w[d];
-    }
-    q[oq] = sum;
-  }
-
-  // Compute K projection (same pattern)
-  int ok = 0;
-  for (; ok + UNROLL <= dim_k; ok += UNROLL) {
-    __m512 acc0 = _mm512_setzero_ps();
-    __m512 acc1 = _mm512_setzero_ps();
-    __m512 acc2 = _mm512_setzero_ps();
-    __m512 acc3 = _mm512_setzero_ps();
-
-    const float *w0 = w_k + ok * n_embd;
-    const float *w1 = w_k + (ok + 1) * n_embd;
-    const float *w2 = w_k + (ok + 2) * n_embd;
-    const float *w3 = w_k + (ok + 3) * n_embd;
-
-    int d = 0;
-    for (; d + 16 <= n_embd; d += 16) {
-      __m512 x_vec = _mm512_loadu_ps(x + d);
-      acc0 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w0 + d), acc0);
-      acc1 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w1 + d), acc1);
-      acc2 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w2 + d), acc2);
-      acc3 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w3 + d), acc3);
-    }
-
-    k[ok + 0] = _mm512_reduce_add_ps(acc0);
-    k[ok + 1] = _mm512_reduce_add_ps(acc1);
-    k[ok + 2] = _mm512_reduce_add_ps(acc2);
-    k[ok + 3] = _mm512_reduce_add_ps(acc3);
-
-    for (; d < n_embd; d++) {
-      k[ok + 0] += x[d] * w0[d];
-      k[ok + 1] += x[d] * w1[d];
-      k[ok + 2] += x[d] * w2[d];
-      k[ok + 3] += x[d] * w3[d];
+    // Handle remaining Q outputs in this thread's range
+    for (; oq < q_end; oq++) {
+      __m512 acc = _mm512_setzero_ps();
+      const float *w = w_q + oq * n_embd;
+      int d = 0;
+      for (; d + 16 <= n_embd; d += 16) {
+        __m512 x_vec = _mm512_loadu_ps(x + d);
+        acc = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w + d), acc);
+      }
+      float sum = _mm512_reduce_add_ps(acc);
+      for (; d < n_embd; d++) {
+        sum += x[d] * w[d];
+      }
+      q[oq] = sum;
     }
   }
 
-  for (; ok < dim_k; ok++) {
-    __m512 acc = _mm512_setzero_ps();
-    const float *w = w_k + ok * n_embd;
-    int d = 0;
-    for (; d + 16 <= n_embd; d += 16) {
-      __m512 x_vec = _mm512_loadu_ps(x + d);
-      acc = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w + d), acc);
+  // ==========================================================================
+  // K Projection: virtual columns [dim_q, dim_q + dim_k)
+  // ==========================================================================
+  // Map virtual start/end to K-local indices
+  const int k_virt_start = dim_q;
+  const int k_virt_end = dim_q + dim_k;
+  const int k_start = std::max(0, start_col - k_virt_start);
+  const int k_end = std::min(dim_k, end_col - k_virt_start);
+
+  if (k_start < k_end) {
+    int ok = k_start;
+    for (; ok + UNROLL <= k_end; ok += UNROLL) {
+      __m512 acc0 = _mm512_setzero_ps();
+      __m512 acc1 = _mm512_setzero_ps();
+      __m512 acc2 = _mm512_setzero_ps();
+      __m512 acc3 = _mm512_setzero_ps();
+
+      const float *w0 = w_k + ok * n_embd;
+      const float *w1 = w_k + (ok + 1) * n_embd;
+      const float *w2 = w_k + (ok + 2) * n_embd;
+      const float *w3 = w_k + (ok + 3) * n_embd;
+
+      int d = 0;
+      for (; d + 16 <= n_embd; d += 16) {
+        __m512 x_vec = _mm512_loadu_ps(x + d);
+        acc0 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w0 + d), acc0);
+        acc1 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w1 + d), acc1);
+        acc2 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w2 + d), acc2);
+        acc3 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w3 + d), acc3);
+      }
+
+      k[ok + 0] = _mm512_reduce_add_ps(acc0);
+      k[ok + 1] = _mm512_reduce_add_ps(acc1);
+      k[ok + 2] = _mm512_reduce_add_ps(acc2);
+      k[ok + 3] = _mm512_reduce_add_ps(acc3);
+
+      for (; d < n_embd; d++) {
+        k[ok + 0] += x[d] * w0[d];
+        k[ok + 1] += x[d] * w1[d];
+        k[ok + 2] += x[d] * w2[d];
+        k[ok + 3] += x[d] * w3[d];
+      }
     }
-    float sum = _mm512_reduce_add_ps(acc);
-    for (; d < n_embd; d++) {
-      sum += x[d] * w[d];
+
+    for (; ok < k_end; ok++) {
+      __m512 acc = _mm512_setzero_ps();
+      const float *w = w_k + ok * n_embd;
+      int d = 0;
+      for (; d + 16 <= n_embd; d += 16) {
+        __m512 x_vec = _mm512_loadu_ps(x + d);
+        acc = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w + d), acc);
+      }
+      float sum = _mm512_reduce_add_ps(acc);
+      for (; d < n_embd; d++) {
+        sum += x[d] * w[d];
+      }
+      k[ok] = sum;
     }
-    k[ok] = sum;
   }
 
-  // Compute V projection (same pattern)
-  int ov = 0;
-  for (; ov + UNROLL <= dim_v; ov += UNROLL) {
-    __m512 acc0 = _mm512_setzero_ps();
-    __m512 acc1 = _mm512_setzero_ps();
-    __m512 acc2 = _mm512_setzero_ps();
-    __m512 acc3 = _mm512_setzero_ps();
+  // ==========================================================================
+  // V Projection: virtual columns [dim_q + dim_k, total_cols)
+  // ==========================================================================
+  const int v_virt_start = dim_q + dim_k;
+  const int v_start = std::max(0, start_col - v_virt_start);
+  const int v_end = std::min(dim_v, end_col - v_virt_start);
 
-    const float *w0 = w_v + ov * n_embd;
-    const float *w1 = w_v + (ov + 1) * n_embd;
-    const float *w2 = w_v + (ov + 2) * n_embd;
-    const float *w3 = w_v + (ov + 3) * n_embd;
+  if (v_start < v_end) {
+    int ov = v_start;
+    for (; ov + UNROLL <= v_end; ov += UNROLL) {
+      __m512 acc0 = _mm512_setzero_ps();
+      __m512 acc1 = _mm512_setzero_ps();
+      __m512 acc2 = _mm512_setzero_ps();
+      __m512 acc3 = _mm512_setzero_ps();
 
-    int d = 0;
-    for (; d + 16 <= n_embd; d += 16) {
-      __m512 x_vec = _mm512_loadu_ps(x + d);
-      acc0 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w0 + d), acc0);
-      acc1 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w1 + d), acc1);
-      acc2 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w2 + d), acc2);
-      acc3 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w3 + d), acc3);
+      const float *w0 = w_v + ov * n_embd;
+      const float *w1 = w_v + (ov + 1) * n_embd;
+      const float *w2 = w_v + (ov + 2) * n_embd;
+      const float *w3 = w_v + (ov + 3) * n_embd;
+
+      int d = 0;
+      for (; d + 16 <= n_embd; d += 16) {
+        __m512 x_vec = _mm512_loadu_ps(x + d);
+        acc0 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w0 + d), acc0);
+        acc1 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w1 + d), acc1);
+        acc2 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w2 + d), acc2);
+        acc3 = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w3 + d), acc3);
+      }
+
+      v[ov + 0] = _mm512_reduce_add_ps(acc0);
+      v[ov + 1] = _mm512_reduce_add_ps(acc1);
+      v[ov + 2] = _mm512_reduce_add_ps(acc2);
+      v[ov + 3] = _mm512_reduce_add_ps(acc3);
+
+      for (; d < n_embd; d++) {
+        v[ov + 0] += x[d] * w0[d];
+        v[ov + 1] += x[d] * w1[d];
+        v[ov + 2] += x[d] * w2[d];
+        v[ov + 3] += x[d] * w3[d];
+      }
     }
 
-    v[ov + 0] = _mm512_reduce_add_ps(acc0);
-    v[ov + 1] = _mm512_reduce_add_ps(acc1);
-    v[ov + 2] = _mm512_reduce_add_ps(acc2);
-    v[ov + 3] = _mm512_reduce_add_ps(acc3);
-
-    for (; d < n_embd; d++) {
-      v[ov + 0] += x[d] * w0[d];
-      v[ov + 1] += x[d] * w1[d];
-      v[ov + 2] += x[d] * w2[d];
-      v[ov + 3] += x[d] * w3[d];
+    for (; ov < v_end; ov++) {
+      __m512 acc = _mm512_setzero_ps();
+      const float *w = w_v + ov * n_embd;
+      int d = 0;
+      for (; d + 16 <= n_embd; d += 16) {
+        __m512 x_vec = _mm512_loadu_ps(x + d);
+        acc = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w + d), acc);
+      }
+      float sum = _mm512_reduce_add_ps(acc);
+      for (; d < n_embd; d++) {
+        sum += x[d] * w[d];
+      }
+      v[ov] = sum;
     }
-  }
-
-  for (; ov < dim_v; ov++) {
-    __m512 acc = _mm512_setzero_ps();
-    const float *w = w_v + ov * n_embd;
-    int d = 0;
-    for (; d + 16 <= n_embd; d += 16) {
-      __m512 x_vec = _mm512_loadu_ps(x + d);
-      acc = _mm512_fmadd_ps(x_vec, _mm512_loadu_ps(w + d), acc);
-    }
-    float sum = _mm512_reduce_add_ps(acc);
-    for (; d < n_embd; d++) {
-      sum += x[d] * w[d];
-    }
-    v[ov] = sum;
   }
 }
 
@@ -2641,7 +2683,7 @@ inline void AddRMSNorm_Scalar(float *x_out, const float *x,
 inline void ComputeQKV_Scalar(float *q, float *k, float *v, const float *x,
                               const float *w_q, const float *w_k,
                               const float *w_v, int n_embd, int dim_q,
-                              int dim_k, int dim_v);
+                              int dim_k, int dim_v, int ith, int nth);
 
 /**
  * @brief Scalar fallback for fused Add + RMSNorm
@@ -2658,8 +2700,9 @@ inline void AddRMSNorm_AVX512(float *x_out, const float *x,
 inline void ComputeQKV_AVX512(float *q, float *k, float *v, const float *x,
                               const float *w_q, const float *w_k,
                               const float *w_v, int n_embd, int dim_q,
-                              int dim_k, int dim_v) {
-  ComputeQKV_Scalar(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v);
+                              int dim_k, int dim_v, int ith = 0, int nth = 1) {
+  ComputeQKV_Scalar(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v, ith,
+                    nth);
 }
 
 #endif // __AVX512F__
@@ -2764,184 +2807,175 @@ inline void AddRMSNorm_AVX2(float *x_out, const float *x, const float *residual,
 inline void ComputeQKV_AVX2(float *q, float *k, float *v, const float *x,
                             const float *w_q, const float *w_k,
                             const float *w_v, int n_embd, int dim_q, int dim_k,
-                            int dim_v) {
-  // Unrolling factor: 2 outputs at a time to hide latency
+                            int dim_v, int ith = 0, int nth = 1) {
+  // ==========================================================================
+  // TENSOR-LEVEL PARALLELISM: Work Partitioning
+  // ==========================================================================
+  const int total_cols = dim_q + dim_k + dim_v;
+  const int cols_per_thread = (total_cols + nth - 1) / nth;
+  const int start_col = ith * cols_per_thread;
+  const int end_col = std::min(start_col + cols_per_thread, total_cols);
+
+  // BARRIER SAFETY: Explicit early exit for zero-work threads.
+  // This is critical for multi-threaded correctness - threads with no work
+  // must still return cleanly to reach barrier sync without executing any
+  // loops.
+  if (start_col >= end_col)
+    return;
+
   constexpr int UNROLL = 2;
 
-  // Q Projection
-  int oq = 0;
-  for (; oq + UNROLL <= dim_q; oq += UNROLL) {
-    __m256 acc0 = _mm256_setzero_ps();
-    __m256 acc1 = _mm256_setzero_ps();
-
-    const float *w0 = w_q + oq * n_embd;
-    const float *w1 = w_q + (oq + 1) * n_embd;
-
-    int d = 0;
-    for (; d + 8 <= n_embd; d += 8) {
-      __m256 x_vec = _mm256_loadu_ps(x + d);
-      acc0 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w0 + d), acc0);
-      acc1 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w1 + d), acc1);
-    }
-
-    // Helper lambda for reduction
-    auto hsum256 = [](__m256 v) -> float {
-      __m128 hi = _mm256_extractf128_ps(v, 1);
-      __m128 lo = _mm256_castps256_ps128(v);
-      __m128 s = _mm_add_ps(lo, hi);
-      s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-      s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-      return _mm_cvtss_f32(s);
-    };
-
-    q[oq + 0] = hsum256(acc0);
-    q[oq + 1] = hsum256(acc1);
-
-    // Remainder
-    for (; d < n_embd; d++) {
-      q[oq + 0] += x[d] * w0[d];
-      q[oq + 1] += x[d] * w1[d];
-    }
-  }
-
-  // Remaining Q outputs
-  for (; oq < dim_q; oq++) {
-    __m256 acc = _mm256_setzero_ps();
-    const float *w = w_q + oq * n_embd;
-    int d = 0;
-    for (; d + 8 <= n_embd; d += 8) {
-      acc =
-          _mm256_fmadd_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(w + d), acc);
-    }
-    // Reduction
-    __m128 hi = _mm256_extractf128_ps(acc, 1);
-    __m128 lo = _mm256_castps256_ps128(acc);
+  // Helper lambda for horizontal sum
+  auto hsum256 = [](__m256 v) -> float {
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 lo = _mm256_castps256_ps128(v);
     __m128 s = _mm_add_ps(lo, hi);
     s = _mm_add_ps(s, _mm_movehl_ps(s, s));
     s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-    float sum = _mm_cvtss_f32(s);
+    return _mm_cvtss_f32(s);
+  };
 
-    for (; d < n_embd; d++) {
-      sum += x[d] * w[d];
-    }
-    q[oq] = sum;
-  }
+  // ==========================================================================
+  // Q Projection: virtual columns [0, dim_q)
+  // ==========================================================================
+  const int q_start = std::max(0, start_col);
+  const int q_end = std::min(dim_q, end_col);
 
-  // K Projection
-  int ok = 0;
-  for (; ok + UNROLL <= dim_k; ok += UNROLL) {
-    __m256 acc0 = _mm256_setzero_ps();
-    __m256 acc1 = _mm256_setzero_ps();
+  if (q_start < q_end) {
+    int oq = q_start;
+    for (; oq + UNROLL <= q_end; oq += UNROLL) {
+      __m256 acc0 = _mm256_setzero_ps();
+      __m256 acc1 = _mm256_setzero_ps();
 
-    const float *w0 = w_k + ok * n_embd;
-    const float *w1 = w_k + (ok + 1) * n_embd;
+      const float *w0 = w_q + oq * n_embd;
+      const float *w1 = w_q + (oq + 1) * n_embd;
 
-    int d = 0;
-    for (; d + 8 <= n_embd; d += 8) {
-      __m256 x_vec = _mm256_loadu_ps(x + d);
-      acc0 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w0 + d), acc0);
-      acc1 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w1 + d), acc1);
-    }
+      int d = 0;
+      for (; d + 8 <= n_embd; d += 8) {
+        __m256 x_vec = _mm256_loadu_ps(x + d);
+        acc0 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w0 + d), acc0);
+        acc1 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w1 + d), acc1);
+      }
 
-    // Helper lambda for reduction
-    auto hsum256 = [](__m256 v) -> float {
-      __m128 hi = _mm256_extractf128_ps(v, 1);
-      __m128 lo = _mm256_castps256_ps128(v);
-      __m128 s = _mm_add_ps(lo, hi);
-      s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-      s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-      return _mm_cvtss_f32(s);
-    };
+      q[oq + 0] = hsum256(acc0);
+      q[oq + 1] = hsum256(acc1);
 
-    k[ok + 0] = hsum256(acc0);
-    k[ok + 1] = hsum256(acc1);
-
-    for (; d < n_embd; d++) {
-      k[ok + 0] += x[d] * w0[d];
-      k[ok + 1] += x[d] * w1[d];
-    }
-  }
-
-  // Remaining K outputs (handles dim_k % UNROLL != 0)
-  for (; ok < dim_k; ok++) {
-    __m256 acc = _mm256_setzero_ps();
-    const float *w = w_k + ok * n_embd;
-    int d = 0;
-    // Vectorized dot product
-    for (; d + 8 <= n_embd; d += 8) {
-      acc =
-          _mm256_fmadd_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(w + d), acc);
-    }
-    // Horizontal reduction
-    __m128 hi = _mm256_extractf128_ps(acc, 1);
-    __m128 lo = _mm256_castps256_ps128(acc);
-    __m128 s = _mm_add_ps(lo, hi);
-    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-    float sum = _mm_cvtss_f32(s);
-    // Scalar remainder for n_embd % 8 != 0
-    for (; d < n_embd; d++) {
-      sum += x[d] * w[d];
-    }
-    k[ok] = sum;
-  }
-
-  // V Projection
-  int ov = 0;
-  for (; ov + UNROLL <= dim_v; ov += UNROLL) {
-    __m256 acc0 = _mm256_setzero_ps();
-    __m256 acc1 = _mm256_setzero_ps();
-
-    const float *w0 = w_v + ov * n_embd;
-    const float *w1 = w_v + (ov + 1) * n_embd;
-
-    int d = 0;
-    for (; d + 8 <= n_embd; d += 8) {
-      __m256 x_vec = _mm256_loadu_ps(x + d);
-      acc0 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w0 + d), acc0);
-      acc1 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w1 + d), acc1);
+      for (; d < n_embd; d++) {
+        q[oq + 0] += x[d] * w0[d];
+        q[oq + 1] += x[d] * w1[d];
+      }
     }
 
-    auto hsum256 = [](__m256 v) -> float {
-      __m128 hi = _mm256_extractf128_ps(v, 1);
-      __m128 lo = _mm256_castps256_ps128(v);
-      __m128 s = _mm_add_ps(lo, hi);
-      s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-      s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-      return _mm_cvtss_f32(s);
-    };
-
-    v[ov + 0] = hsum256(acc0);
-    v[ov + 1] = hsum256(acc1);
-
-    for (; d < n_embd; d++) {
-      v[ov + 0] += x[d] * w0[d];
-      v[ov + 1] += x[d] * w1[d];
+    for (; oq < q_end; oq++) {
+      __m256 acc = _mm256_setzero_ps();
+      const float *w = w_q + oq * n_embd;
+      int d = 0;
+      for (; d + 8 <= n_embd; d += 8) {
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(w + d),
+                              acc);
+      }
+      float sum = hsum256(acc);
+      for (; d < n_embd; d++) {
+        sum += x[d] * w[d];
+      }
+      q[oq] = sum;
     }
   }
 
-  // Remaining V outputs (handles dim_v % UNROLL != 0)
-  for (; ov < dim_v; ov++) {
-    __m256 acc = _mm256_setzero_ps();
-    const float *w = w_v + ov * n_embd;
-    int d = 0;
-    // Vectorized dot product
-    for (; d + 8 <= n_embd; d += 8) {
-      acc =
-          _mm256_fmadd_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(w + d), acc);
+  // ==========================================================================
+  // K Projection: virtual columns [dim_q, dim_q + dim_k)
+  // ==========================================================================
+  const int k_virt_start = dim_q;
+  const int k_start = std::max(0, start_col - k_virt_start);
+  const int k_end = std::min(dim_k, end_col - k_virt_start);
+
+  if (k_start < k_end) {
+    int ok = k_start;
+    for (; ok + UNROLL <= k_end; ok += UNROLL) {
+      __m256 acc0 = _mm256_setzero_ps();
+      __m256 acc1 = _mm256_setzero_ps();
+
+      const float *w0 = w_k + ok * n_embd;
+      const float *w1 = w_k + (ok + 1) * n_embd;
+
+      int d = 0;
+      for (; d + 8 <= n_embd; d += 8) {
+        __m256 x_vec = _mm256_loadu_ps(x + d);
+        acc0 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w0 + d), acc0);
+        acc1 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w1 + d), acc1);
+      }
+
+      k[ok + 0] = hsum256(acc0);
+      k[ok + 1] = hsum256(acc1);
+
+      for (; d < n_embd; d++) {
+        k[ok + 0] += x[d] * w0[d];
+        k[ok + 1] += x[d] * w1[d];
+      }
     }
-    // Horizontal reduction
-    __m128 hi = _mm256_extractf128_ps(acc, 1);
-    __m128 lo = _mm256_castps256_ps128(acc);
-    __m128 s = _mm_add_ps(lo, hi);
-    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-    float sum = _mm_cvtss_f32(s);
-    // Scalar remainder for n_embd % 8 != 0
-    for (; d < n_embd; d++) {
-      sum += x[d] * w[d];
+
+    for (; ok < k_end; ok++) {
+      __m256 acc = _mm256_setzero_ps();
+      const float *w = w_k + ok * n_embd;
+      int d = 0;
+      for (; d + 8 <= n_embd; d += 8) {
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(w + d),
+                              acc);
+      }
+      float sum = hsum256(acc);
+      for (; d < n_embd; d++) {
+        sum += x[d] * w[d];
+      }
+      k[ok] = sum;
     }
-    v[ov] = sum;
+  }
+
+  // ==========================================================================
+  // V Projection: virtual columns [dim_q + dim_k, total_cols)
+  // ==========================================================================
+  const int v_virt_start = dim_q + dim_k;
+  const int v_start = std::max(0, start_col - v_virt_start);
+  const int v_end = std::min(dim_v, end_col - v_virt_start);
+
+  if (v_start < v_end) {
+    int ov = v_start;
+    for (; ov + UNROLL <= v_end; ov += UNROLL) {
+      __m256 acc0 = _mm256_setzero_ps();
+      __m256 acc1 = _mm256_setzero_ps();
+
+      const float *w0 = w_v + ov * n_embd;
+      const float *w1 = w_v + (ov + 1) * n_embd;
+
+      int d = 0;
+      for (; d + 8 <= n_embd; d += 8) {
+        __m256 x_vec = _mm256_loadu_ps(x + d);
+        acc0 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w0 + d), acc0);
+        acc1 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w1 + d), acc1);
+      }
+
+      v[ov + 0] = hsum256(acc0);
+      v[ov + 1] = hsum256(acc1);
+
+      for (; d < n_embd; d++) {
+        v[ov + 0] += x[d] * w0[d];
+        v[ov + 1] += x[d] * w1[d];
+      }
+    }
+
+    for (; ov < v_end; ov++) {
+      __m256 acc = _mm256_setzero_ps();
+      const float *w = w_v + ov * n_embd;
+      int d = 0;
+      for (; d + 8 <= n_embd; d += 8) {
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(w + d),
+                              acc);
+      }
+      float sum = hsum256(acc);
+      for (; d < n_embd; d++) {
+        sum += x[d] * w[d];
+      }
+      v[ov] = sum;
+    }
   }
 }
 
@@ -2954,7 +2988,7 @@ inline void AddRMSNorm_Scalar(float *x_out, const float *x,
 inline void ComputeQKV_Scalar(float *q, float *k, float *v, const float *x,
                               const float *w_q, const float *w_k,
                               const float *w_v, int n_embd, int dim_q,
-                              int dim_k, int dim_v);
+                              int dim_k, int dim_v, int ith, int nth);
 
 inline void AddRMSNorm_AVX2(float *x_out, const float *x, const float *residual,
                             const float *rms_w, size_t n, float eps = 1e-5f) {
@@ -2964,8 +2998,9 @@ inline void AddRMSNorm_AVX2(float *x_out, const float *x, const float *residual,
 inline void ComputeQKV_AVX2(float *q, float *k, float *v, const float *x,
                             const float *w_q, const float *w_k,
                             const float *w_v, int n_embd, int dim_q, int dim_k,
-                            int dim_v) {
-  ComputeQKV_Scalar(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v);
+                            int dim_v, int ith = 0, int nth = 1) {
+  ComputeQKV_Scalar(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v, ith,
+                    nth);
 }
 
 #endif // __AVX2__
@@ -2998,9 +3033,26 @@ inline void AddRMSNorm_Scalar(float *x_out, const float *x,
 inline void ComputeQKV_Scalar(float *q, float *k, float *v, const float *x,
                               const float *w_q, const float *w_k,
                               const float *w_v, int n_embd, int dim_q,
-                              int dim_k, int dim_v) {
-  // Q projection
-  for (int o = 0; o < dim_q; o++) {
+                              int dim_k, int dim_v, int ith = 0, int nth = 1) {
+  // ==========================================================================
+  // TENSOR-LEVEL PARALLELISM: Work Partitioning
+  // ==========================================================================
+  const int total_cols = dim_q + dim_k + dim_v;
+  const int cols_per_thread = (total_cols + nth - 1) / nth;
+  const int start_col = ith * cols_per_thread;
+  const int end_col = std::min(start_col + cols_per_thread, total_cols);
+
+  // BARRIER SAFETY: Explicit early exit for zero-work threads.
+  // This is critical for multi-threaded correctness - threads with no work
+  // must still return cleanly to reach barrier sync without executing any
+  // loops.
+  if (start_col >= end_col)
+    return;
+
+  // Q projection: virtual columns [0, dim_q)
+  const int q_start = std::max(0, start_col);
+  const int q_end = std::min(dim_q, end_col);
+  for (int o = q_start; o < q_end; o++) {
     float sum = 0.0f;
     const float *w = w_q + o * n_embd;
     for (int d = 0; d < n_embd; d++) {
@@ -3009,8 +3061,11 @@ inline void ComputeQKV_Scalar(float *q, float *k, float *v, const float *x,
     q[o] = sum;
   }
 
-  // K projection
-  for (int o = 0; o < dim_k; o++) {
+  // K projection: virtual columns [dim_q, dim_q + dim_k)
+  const int k_virt_start = dim_q;
+  const int k_start = std::max(0, start_col - k_virt_start);
+  const int k_end = std::min(dim_k, end_col - k_virt_start);
+  for (int o = k_start; o < k_end; o++) {
     float sum = 0.0f;
     const float *w = w_k + o * n_embd;
     for (int d = 0; d < n_embd; d++) {
@@ -3019,8 +3074,11 @@ inline void ComputeQKV_Scalar(float *q, float *k, float *v, const float *x,
     k[o] = sum;
   }
 
-  // V projection
-  for (int o = 0; o < dim_v; o++) {
+  // V projection: virtual columns [dim_q + dim_k, total_cols)
+  const int v_virt_start = dim_q + dim_k;
+  const int v_start = std::max(0, start_col - v_virt_start);
+  const int v_end = std::min(dim_v, end_col - v_virt_start);
+  for (int o = v_start; o < v_end; o++) {
     float sum = 0.0f;
     const float *w = w_v + o * n_embd;
     for (int d = 0; d < n_embd; d++) {
@@ -3051,17 +3109,24 @@ inline void AddRMSNorm(float *x_out, const float *x, const float *residual,
 
 /**
  * @brief Unified ComputeQKV dispatcher (runtime SIMD selection)
+ *
+ * @param ith Thread index (0-based)
+ * @param nth Total number of threads
  */
 inline void ComputeQKV(float *q, float *k, float *v, const float *x,
                        const float *w_q, const float *w_k, const float *w_v,
-                       int n_embd, int dim_q, int dim_k, int dim_v) {
+                       int n_embd, int dim_q, int dim_k, int dim_v, int ith = 0,
+                       int nth = 1) {
   static const SimdLevel level = DetectSimdLevel();
   if (level >= SimdLevel::AVX512) {
-    ComputeQKV_AVX512(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v);
+    ComputeQKV_AVX512(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v,
+                      ith, nth);
   } else if (level >= SimdLevel::AVX2) {
-    ComputeQKV_AVX2(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v);
+    ComputeQKV_AVX2(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v, ith,
+                    nth);
   } else {
-    ComputeQKV_Scalar(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v);
+    ComputeQKV_Scalar(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v,
+                      ith, nth);
   }
 }
 

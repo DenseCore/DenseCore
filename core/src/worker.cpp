@@ -109,11 +109,17 @@ void EngineLoop(EngineState *state) {
       int target_node = (state->numa_node_id >= 0) ? state->numa_node_id : 0;
       // Use configured thread count from engine initialization
       if (n_threads > 0) {
+        // =========================================================================
+        // [DEBUG] Thread pinning DISABLED to diagnose potential deadlock.
+        // Aggressive CPU pinning was causing hangs on first token inference.
+        // Uncomment to re-enable after debugging.
+        // =========================================================================
         // Use configured pinning policy (0=SCATTER, 1=COMPACT)
-        densecore::PinningPolicy policy =
-            (state->pinning_policy == 1) ? densecore::PinningPolicy::COMPACT
-                                         : densecore::PinningPolicy::SCATTER;
-        topo.SetupComputeThreadAffinity(target_node, n_threads, policy);
+        // densecore::PinningPolicy policy =
+        //     (state->pinning_policy == 1) ? densecore::PinningPolicy::COMPACT
+        //                                  : densecore::PinningPolicy::SCATTER;
+        // topo.SetupComputeThreadAffinity(target_node, n_threads, policy);
+        std::cerr << "[DEBUG] Thread pinning DISABLED" << std::endl;
       }
     }
 

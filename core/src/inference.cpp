@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <iostream> // For std::cerr debug logging
 
 // User data for KV cache operations
 struct KVCacheUserData {
@@ -81,6 +82,9 @@ inline RoPEUserData *GetRoPEUserData() {
  */
 void cb_rope_avx512(struct ggml_tensor *dst, const struct ggml_tensor *src,
                     int ith, int nth, void *userdata) {
+  // [DEBUG] Trace RoPE kernel entry
+  std::cerr << "[DEBUG] Enter RoPE ith=" << ith << " nth=" << nth << std::endl;
+
   auto *ud = (RoPEUserData *)userdata;
   if (!ud || !ud->cos_sin_table || !ud->positions)
     return;
@@ -257,6 +261,144 @@ void cb_residual_rmsnorm_fused(struct ggml_tensor *dst,
 }
 
 // ============================================================================
+// Fused QKV Projection Callback (Tensor-Level Parallelism)
+// ============================================================================
+// Computes Q, K, V projections in a single pass with intra-operator parallelism
+// across the output dimension (dim_q + dim_k + dim_v). This enables
+// multi-thread utilization during decode when batch_size=1.
+// ============================================================================
+
+/**
+ * User data for fused Q/K/V projection operation
+ */
+struct QKVUserData {
+  const float *x;   ///< Input tensor [n_tokens, n_embd]
+  const float *w_q; ///< Q weight [dim_q, n_embd] (row-major)
+  const float *w_k; ///< K weight [dim_k, n_embd] (row-major)
+  const float *w_v; ///< V weight [dim_v, n_embd] (row-major)
+  float *q_out;     ///< Q output [n_tokens, dim_q]
+  float *k_out;     ///< K output [n_tokens, dim_k]
+  float *v_out;     ///< V output [n_tokens, dim_v]
+  int n_embd;       ///< Input embedding dimension
+  int dim_q;        ///< Q output dimension (n_head * head_dim)
+  int dim_k;        ///< K output dimension (n_head_kv * head_dim)
+  int dim_v;        ///< V output dimension (n_head_kv * head_dim)
+  int n_tokens;     ///< Number of tokens in batch
+};
+
+// Thread-local pool for QKV userdata
+static constexpr int kMaxQKVUserDataSlots = 256;
+static thread_local QKVUserData g_qkv_userdata_pool[kMaxQKVUserDataSlots];
+static thread_local int g_qkv_userdata_index = 0;
+
+inline QKVUserData *GetQKVUserData() {
+  int idx = g_qkv_userdata_index++;
+  if (idx >= kMaxQKVUserDataSlots) {
+    g_qkv_userdata_index = 0;
+    idx = 0;
+  }
+  return &g_qkv_userdata_pool[idx];
+}
+
+/**
+ * Custom callback for fused Q/K/V projection with HYBRID parallelism
+ *
+ * Implements a smart dispatch strategy based on batch size:
+ *
+ * CASE A - DECODE (Small Batch: n_tokens < nth):
+ *   - All threads iterate through ALL tokens
+ *   - Pass real ith/nth to ComputeQKV for TENSOR PARALLELISM
+ *   - Multiple threads collaborate on each token's output dimensions
+ *   - Fixes single-threaded bottleneck when batch_size=1
+ *
+ * CASE B - PREFILL (Large Batch: n_tokens >= nth):
+ *   - Partition tokens across threads (TOKEN PARALLELISM)
+ *   - Each thread computes FULL dimensions for its token subset
+ *   - Pass ith=0, nth=1 to ComputeQKV to disable dimension splitting
+ *   - More cache-friendly since each thread works on contiguous data
+ */
+void cb_compute_qkv(struct ggml_tensor *dst, const struct ggml_tensor *src,
+                    int ith, int nth, void *userdata) {
+  // [DEBUG] Trace QKV kernel entry/exit
+  std::cerr << "[DEBUG] Enter QKV ith=" << ith << " nth=" << nth << std::endl;
+
+  // ===========================================================================
+  // BARRIER SAFETY CONTRACT:
+  // ===========================================================================
+  // This callback is invoked by GGML's thread pool. ALL threads must reach the
+  // end of this function cleanly, even if they have no work to do.
+  //
+  // - ComputeQKV handles `start >= end` by doing nothing and returning early
+  // - Early returns here are safe ONLY in PREFILL case (token partitioning)
+  // - In DECODE case, all threads iterate all tokens (no early return)
+  // ===========================================================================
+  auto *ud = static_cast<QKVUserData *>(userdata);
+  if (!ud || !ud->x || !ud->w_q || !ud->w_k || !ud->w_v) {
+    std::cerr << "[DEBUG] Exit QKV (early, bad userdata)" << std::endl;
+    return;
+  }
+
+  const int n_tokens = ud->n_tokens;
+
+  // ==========================================================================
+  // HYBRID DISPATCH: Choose parallelism strategy based on batch size
+  // ==========================================================================
+
+  if (n_tokens < nth) {
+    // ========================================================================
+    // CASE A: DECODE (Tensor Parallelism)
+    // ========================================================================
+    // Few tokens (typically 1 during generation), many threads
+    // All threads collaborate on ALL tokens, each computing a SLICE of dims
+    // ========================================================================
+    for (int t = 0; t < n_tokens; t++) {
+      const float *x_t = ud->x + t * ud->n_embd;
+      float *q_t = ud->q_out + t * ud->dim_q;
+      float *k_t = ud->k_out + t * ud->dim_k;
+      float *v_t = ud->v_out + t * ud->dim_v;
+
+      // Each thread computes slice [start_col, end_col) of output dimensions
+      // ComputeQKV internally partitions: total_cols = dim_q + dim_k + dim_v
+      densecore::simd::ComputeQKV(q_t, k_t, v_t, x_t, ud->w_q, ud->w_k, ud->w_v,
+                                  ud->n_embd, ud->dim_q, ud->dim_k, ud->dim_v,
+                                  ith, nth // Enable tensor parallelism
+      );
+    }
+  } else {
+    // ========================================================================
+    // CASE B: PREFILL (Token Parallelism)
+    // ========================================================================
+    // Many tokens (prompt processing), partition tokens across threads
+    // Each thread computes FULL dimensions for its subset of tokens
+    // More cache-friendly: each thread touches contiguous weight rows
+    // ========================================================================
+    const int tokens_per_thread = (n_tokens + nth - 1) / nth; // Ceiling div
+    const int t_start = ith * tokens_per_thread;
+    const int t_end = std::min(t_start + tokens_per_thread, n_tokens);
+
+    // Early exit if this thread has no tokens to process
+    if (t_start >= n_tokens)
+      return;
+
+    for (int t = t_start; t < t_end; t++) {
+      const float *x_t = ud->x + t * ud->n_embd;
+      float *q_t = ud->q_out + t * ud->dim_q;
+      float *k_t = ud->k_out + t * ud->dim_k;
+      float *v_t = ud->v_out + t * ud->dim_v;
+
+      // Compute FULL dimensions for this token (no dimension splitting)
+      // Pass ith=0, nth=1 to disable tensor parallelism within ComputeQKV
+      densecore::simd::ComputeQKV(
+          q_t, k_t, v_t, x_t, ud->w_q, ud->w_k, ud->w_v, ud->n_embd, ud->dim_q,
+          ud->dim_k, ud->dim_v, 0,
+          1 // Disable tensor parallelism (single-threaded kernel call)
+      );
+    }
+    std::cerr << "[DEBUG] Exit QKV" << std::endl;
+  }
+}
+
+// ============================================================================
 // RoPE Table Initialization
 // ============================================================================
 
@@ -403,9 +545,17 @@ struct INT4GemmUserData {
  */
 void cb_int4_gemm(struct ggml_tensor *dst, const struct ggml_tensor *src,
                   int ith, int nth, void *userdata) {
+  // [DEBUG] Trace GEMM kernel entry
+  std::cerr << "[DEBUG] Enter GEMM ith=" << ith << " nth=" << nth << std::endl;
+
+  // =========================================================================
+  // [DEBUG] Thread pinning DISABLED to diagnose potential deadlock.
+  // Aggressive CPU pinning was causing hangs on first token inference.
+  // Uncomment to re-enable after debugging.
+  // =========================================================================
   // Pin this GGML worker thread on first invocation (thread-local, O(1) after
   // first call)
-  densecore::HardwareTopology::GetInstance().PinComputeThread(ith);
+  // densecore::HardwareTopology::GetInstance().PinComputeThread(ith);
 
   auto *ud = (INT4GemmUserData *)userdata;
   if (!ud || !ud->int4_weight)

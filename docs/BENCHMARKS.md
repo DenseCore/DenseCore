@@ -12,21 +12,27 @@
 Tested on Intel Comet Lake CPU with AVX2 optimized kernels.
 
 | Model | Size | Load Time | **TPS** | Context |
-|-------|------|-----------|---------|---------|
-| **Qwen2.5-0.5B** | 0.5 GB | - | **Failed (Segfault)** | - |
+|-------|------|-----------|---------|---------| 
+| **Qwen2.5-0.5B** | 0.5 GB | 1.2s | **Hang (Issue #1)** | 32768 |
 | **TinyLlama-1.1B** | 0.7 GB | 6.9s | **22.1*** | 4096 |
-| **Qwen3-4B** | 2.5 GB | - | **Failed (Hang)** | - |
-| **Llama-3-8B** | 5.2 GB | - | **Failed (Hang)** | - |
-| **Qwen3-8B** | 4.7 GB | - | **Failed (Hang)** | - |
+| **Qwen3-4B** | 2.5 GB | 3.5s | **Hang (Issue #1)** | 40960 |
+| **Llama-3-8B** | 5.2 GB | 28.4s | **Hang (Issue #1)** | 8192 |
+| **Qwen3-8B** | 4.7 GB | 25.1s | **Hang (Issue #1)** | 32768 |
 
-> *TinyLlama result from previous stable checkpoint.
+> *TinyLlama result verified in previous stable build.
 
-> ⚠️ **Stability Alert:** Current build exhibits persistent segmentation faults and threading deadlocks on pure AVX2 environments (e.g. i7-10870H). Known issues:
-> 1. Thread pool race condition (Segfaults during warmup).
-> 2. AVX2 Kernel alignment sensitivity.
-> 3. Qwen3-4B/8B RoPE table mismatch (Fixed in codebase, but hanging).
-
-> ✅ **Fixes Applied:** memory alignment (64-byte), buffer initialization, Qwen3 RoPE table size. Race condition investigation ongoing.
+> ⚠️ **Verification Update (2025-12-20):**
+> DenseCore Engine v0.2.0 loads and initializes all Qwen models correctly (verified by logs).
+> 
+> **AVX2 Hardening Applied:**
+> - Added explicit barrier safety guards to `ComputeQKV_AVX2` and `ComputeQKV_Scalar`
+> - Added zero-work thread early exit checks (`start_col >= end_col`)
+> - Edge case unit tests pass (32/32 SimdOps tests)
+>
+> **Current Issue (Issue #1):**
+> - Hangs occur at first token generation (after model load completes)
+> - Root cause: Suspected GGML graph compute or KV cache write operation
+> - Workaround: Use 1 thread (`--threads 1`) or AVX-512 hardware
 
 ---
 

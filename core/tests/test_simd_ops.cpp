@@ -487,3 +487,133 @@ TEST(SimdOps, ComputeQKV_Correctness) {
     EXPECT_NEAR(v[i], row_sum, 1e-4f);
   }
 }
+
+// =============================================================================
+// Edge Case Tests (Barrier Safety / Tail Handling)
+// =============================================================================
+
+TEST(SimdOps, ComputeQKV_ZeroWork) {
+  // Test with nth >> total_cols - some threads will get zero work
+  // This verifies barrier safety: threads must return cleanly without crash
+  constexpr int n_embd = 32;
+  constexpr int dim_q = 8;
+  constexpr int dim_k = 4;
+  constexpr int dim_v = 4;
+  constexpr int total_cols = dim_q + dim_k + dim_v; // 16
+
+  std::vector<float> x(n_embd, 1.0f);
+  std::vector<float> w_q(n_embd * dim_q, 1.0f);
+  std::vector<float> w_k(n_embd * dim_k, 1.0f);
+  std::vector<float> w_v(n_embd * dim_v, 1.0f);
+  std::vector<float> q(dim_q, 0.0f);
+  std::vector<float> k(dim_k, 0.0f);
+  std::vector<float> v(dim_v, 0.0f);
+
+  // Simulate 64 threads, only first 16 should have work
+  constexpr int nth = 64;
+  for (int ith = 0; ith < nth; ith++) {
+    // This should NOT crash even when ith * cols_per_thread >= total_cols
+    ComputeQKV(q.data(), k.data(), v.data(), x.data(), w_q.data(), w_k.data(),
+               w_v.data(), n_embd, dim_q, dim_k, dim_v, ith, nth);
+  }
+
+  // Verify outputs are correct after all threads processed
+  // (Only threads with work should have modified the arrays)
+  for (int i = 0; i < dim_q; i++) {
+    EXPECT_NEAR(q[i], (float)n_embd, 1e-4f);
+  }
+  for (int i = 0; i < dim_k; i++) {
+    EXPECT_NEAR(k[i], (float)n_embd, 1e-4f);
+  }
+  for (int i = 0; i < dim_v; i++) {
+    EXPECT_NEAR(v[i], (float)n_embd, 1e-4f);
+  }
+}
+
+TEST(SimdOps, AddRMSNorm_EmptyInput) {
+  // Test with n = 0 - should return immediately without crash
+  std::vector<float> x_out;
+  std::vector<float> x;
+  std::vector<float> residual;
+  std::vector<float> rms_w;
+
+  // Should not crash with empty input
+  AddRMSNorm(x_out.data(), x.data(), residual.data(), rms_w.data(), 0, 1e-5f);
+
+  // Verify - nothing to verify, just ensuring no crash
+  EXPECT_TRUE(true);
+}
+
+TEST(SimdOps, ComputeQKV_NonDivisibleDimensions) {
+  // Test with dimensions NOT divisible by 8 (AVX2 register width)
+  // This verifies proper tail handling in SIMD loops
+  constexpr int n_embd = 67; // Not divisible by 8
+  constexpr int dim_q = 23;  // Not divisible by 8
+  constexpr int dim_k = 11;  // Not divisible by 8
+  constexpr int dim_v = 13;  // Not divisible by 8
+
+  std::vector<float> x(n_embd, 1.0f);
+  std::vector<float> w_q(n_embd * dim_q, 1.0f);
+  std::vector<float> w_k(n_embd * dim_k, 0.5f);
+  std::vector<float> w_v(n_embd * dim_v, 2.0f);
+  std::vector<float> q(dim_q, 0.0f);
+  std::vector<float> k(dim_k, 0.0f);
+  std::vector<float> v(dim_v, 0.0f);
+
+  // Single-threaded call
+  ComputeQKV(q.data(), k.data(), v.data(), x.data(), w_q.data(), w_k.data(),
+             w_v.data(), n_embd, dim_q, dim_k, dim_v);
+
+  // Verify Q: each output = sum of 67 ones = 67
+  for (int i = 0; i < dim_q; i++) {
+    EXPECT_NEAR(q[i], (float)n_embd, 1e-4f) << "Q mismatch at index " << i;
+  }
+
+  // Verify K: each output = sum of 67 * 0.5 = 33.5
+  for (int i = 0; i < dim_k; i++) {
+    EXPECT_NEAR(k[i], (float)n_embd * 0.5f, 1e-4f)
+        << "K mismatch at index " << i;
+  }
+
+  // Verify V: each output = sum of 67 * 2.0 = 134
+  for (int i = 0; i < dim_v; i++) {
+    EXPECT_NEAR(v[i], (float)n_embd * 2.0f, 1e-4f)
+        << "V mismatch at index " << i;
+  }
+}
+
+TEST(SimdOps, AddRMSNorm_NonDivisibleDimension) {
+  // Test with n NOT divisible by 8 (AVX2 register width)
+  constexpr size_t N = 67; // Not divisible by 8
+  std::vector<float> x(N);
+  std::vector<float> residual(N);
+  std::vector<float> rms_w(N, 1.0f);
+  std::vector<float> out_test(N);
+  std::vector<float> out_ref(N);
+
+  for (size_t i = 0; i < N; i++) {
+    x[i] = 0.5f * (i % 7);
+    residual[i] = 0.3f * (i % 5);
+  }
+
+  // Compute reference (scalar)
+  float eps = 1e-5f;
+  float sos = 0.0f;
+  for (size_t i = 0; i < N; i++) {
+    float val = x[i] + residual[i];
+    out_ref[i] = val;
+    sos += val * val;
+  }
+  float rms = std::sqrt(sos / N + eps);
+  float scale = 1.0f / rms;
+  for (size_t i = 0; i < N; i++) {
+    out_ref[i] *= scale;
+  }
+
+  // Test unified dispatcher
+  AddRMSNorm(out_test.data(), x.data(), residual.data(), rms_w.data(), N, eps);
+
+  for (size_t i = 0; i < N; i++) {
+    EXPECT_NEAR(out_test[i], out_ref[i], 1e-4f) << "Mismatch at index " << i;
+  }
+}
