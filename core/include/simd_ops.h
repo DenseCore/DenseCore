@@ -54,7 +54,7 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) ||             \
     defined(_M_IX86)
 #define DENSECORE_X86
-#include <immintrin.h>
+#include "simd_platform.h"
 #elif defined(__aarch64__) || defined(_M_ARM64)
 #define DENSECORE_ARM
 #include <arm_neon.h>

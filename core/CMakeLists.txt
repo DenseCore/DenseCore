@@ -74,6 +74,18 @@ set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 # Add ggml as subdirectory
 add_subdirectory(${GGML_DIR})
 
+# ==========================================================================
+# SIMDe Integration (for ARM64/non-x86 support)
+# ==========================================================================
+include(FetchContent)
+FetchContent_Declare(
+    simde
+    GIT_REPOSITORY https://github.com/simd-everywhere/simde.git
+    GIT_TAG v0.8.2
+)
+FetchContent_MakeAvailable(simde)
+
+
 # Source files (DenseCore specific only)
 set(SOURCES
     src/engine.cpp
@@ -89,6 +101,9 @@ set(SOURCES
     # Backend abstraction
     src/cpu_backend.cpp
     src/backend_registry.cpp
+    src/kernel_context.cpp
+    src/async_cpu_backend.cpp
+    src/cpu_backend_opt.cpp
     # Quantization module
     src/quantizer.cpp
     src/quantization/max_quantizer.cpp
@@ -115,10 +130,12 @@ target_include_directories(densecore PUBLIC
     ${GGML_DIR}/include
     ${GGML_DIR}/src
     ${GGML_DIR}/src/ggml-cpu
+    ${simde_SOURCE_DIR} # Add SIMDe include path
 )
 
 # Link against ggml
 target_link_libraries(densecore PRIVATE ggml)
+
 
 # Define DENSECORE_BUILD_SHARED for symbol export (Windows dllexport)
 target_compile_definitions(densecore PRIVATE DENSECORE_BUILD_SHARED)
@@ -329,6 +346,7 @@ target_include_directories(quantize PUBLIC
     ${GGML_DIR}/include
     ${GGML_DIR}/src
     ${GGML_DIR}/src/ggml-cpu
+    ${simde_SOURCE_DIR} # Add SIMDe include path
 )
 
 target_compile_definitions(quantize PRIVATE
@@ -393,6 +411,10 @@ if(DENSECORE_BUILD_TESTS)
         tests/test_simd_ops.cpp
         tests/test_memory_pool.cpp
         tests/test_kv_cache.cpp
+        tests/test_aligned_allocator.cpp
+        tests/test_tensor_view.cpp
+        tests/test_kernel_context.cpp
+        tests/test_async_backend.cpp
     )
 
     # Create test executable
