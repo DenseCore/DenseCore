@@ -3,12 +3,6 @@ import time
 import sys
 import platform
 import os
-import time
-import sys
-import platform
-import os
-import subprocess
-
 try:
     import psutil
 except ImportError:

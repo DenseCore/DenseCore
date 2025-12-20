@@ -3,6 +3,7 @@
 #include "hardware_topology.h"
 #include "optimization_bridge.h" // Runtime SIMD dispatch
 #include "simd_ops.h"
+#include <atomic>
 #include <cstring>
 #include <ggml-cpu.h>
 #include <iostream>
@@ -110,16 +111,15 @@ void EngineLoop(EngineState *state) {
       // Use configured thread count from engine initialization
       if (n_threads > 0) {
         // =========================================================================
-        // [DEBUG] Thread pinning DISABLED to diagnose potential deadlock.
+        // Thread affinity DISABLED to prevent deadlock on consumer hardware.
         // Aggressive CPU pinning was causing hangs on first token inference.
-        // Uncomment to re-enable after debugging.
+        // The orchestration thread and GGML's Thread 0 would contend for Core
+        // 0.
         // =========================================================================
-        // Use configured pinning policy (0=SCATTER, 1=COMPACT)
         // densecore::PinningPolicy policy =
         //     (state->pinning_policy == 1) ? densecore::PinningPolicy::COMPACT
         //                                  : densecore::PinningPolicy::SCATTER;
         // topo.SetupComputeThreadAffinity(target_node, n_threads, policy);
-        std::cerr << "[DEBUG] Thread pinning DISABLED" << std::endl;
       }
     }
 
@@ -476,9 +476,30 @@ void EngineLoop(EngineState *state) {
              batch.tokens.size() * sizeof(int));
       memcpy(pos->data, batch.pos.data(), batch.pos.size() * sizeof(int));
 
-      // Mitigation for potential thread pool race condition on high-core CPUs
-      // A tiny delay ensures memory consistency and thread readiness
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
+      // =======================================================================
+      // MEMORY FENCE: Ensures visibility of input data to GGML worker threads.
+      // =======================================================================
+      // The memcpy operations above write input data to buffers that will be
+      // read by GGML's internal thread pool workers. On modern CPUs with
+      // out-of-order execution and store buffers, these writes may not be
+      // immediately visible to other CPU cores.
+      //
+      // We use a release fence as the publishing side of the synchronization:
+      // - std::memory_order_release guarantees that all preceding writes
+      //   (the memcpy calls) are visible before any subsequent synchronization
+      //   operation that has acquire semantics.
+      //
+      // GGML's thread pool internally uses proper synchronization (typically
+      // condition variables or atomics) with acquire semantics when worker
+      // threads start execution, completing the acquire-release synchronization
+      // pair and ensuring they observe the input data correctly.
+      //
+      // This replaces the previous fragile sleep_for(100us) workaround which:
+      // - Was not guaranteed to work (timing-based, system-dependent)
+      // - Added unnecessary latency to every inference call
+      // - Could fail under heavy load or on different CPU architectures
+      // =======================================================================
+      std::atomic_thread_fence(std::memory_order_release);
 
       ggml_backend_graph_compute(current_model->backend, gf);
 
