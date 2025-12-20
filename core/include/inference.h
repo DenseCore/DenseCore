@@ -27,7 +27,7 @@ struct InferenceConfig {
   int prefetch_lookahead = 1;  // Layers to prefetch ahead
 
   // Performance options
-  int num_threads = 1; // Thread count for parallel ops
+  int num_threads = 0; // Thread count (0 = auto-detect physical cores)
 
   // Singleton instance
   static InferenceConfig &Instance() {
@@ -41,6 +41,9 @@ struct ggml_tensor *BuildTransformerGraph(
     const BatchSpec &batch, bool embedding_mode = false,
     struct ggml_cgraph *gf = nullptr, struct ggml_tensor **out_embd = nullptr,
     struct ggml_tensor **out_pos = nullptr);
+
+// Initialize pre-computed RoPE cos/sin table for optimized inference
+void InitRoPETable(TransformerModel *model);
 
 // Grammar constraint for structured output (e.g., JSON mode)
 enum class JSONState {

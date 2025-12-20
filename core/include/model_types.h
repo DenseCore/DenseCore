@@ -9,6 +9,13 @@
 #include <string>
 #include <vector>
 
+// Forward declaration for RoPE table (defined in simd_ops.h)
+namespace densecore {
+namespace simd {
+struct RoPETable;
+} // namespace simd
+} // namespace densecore
+
 // Transformer hyperparameters
 struct TransformerHParams {
   uint32_t n_vocab = 32000;
@@ -100,6 +107,21 @@ struct TransformerModel {
   std::map<std::string, int> token_to_id;
   int32_t bos_token_id = 1;
   int32_t eos_token_id = 2;
+
+  // Pre-computed RoPE cos/sin table (interleaved: [cos, sin, cos, sin, ...])
+  // Layout: [max_seq_len, head_dim] where each pair is (cos, sin)
+  // Initialized during model loading based on hparams
+  std::vector<float> rope_cos_sin;
+  int rope_head_dim = 0; // Head dim used for RoPE table
+
+  // =========================================================================
+  // NUMA-Aware Memory Tracking
+  // =========================================================================
+  // Stores (ptr, size) pairs for tensor data that was rebind to NUMA nodes.
+  // These buffers are NOT owned by ggml_context and MUST be freed manually
+  // in the destructor. Failing to do so will cause memory leaks.
+  // =========================================================================
+  std::vector<std::pair<void *, size_t>> numa_buffers;
 
   ~TransformerModel();
 };

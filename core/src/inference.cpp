@@ -1,7 +1,8 @@
 #include "inference.h"
 #include "flash_attention.h"
-#include "ggml.h"              // Required for ggml_tensor definition
-#include "hardware_topology.h" // For compute thread affinity
+#include "ggml.h"                // Required for ggml_tensor definition
+#include "hardware_topology.h"   // For compute thread affinity
+#include "optimization_bridge.h" // Runtime SIMD dispatch
 
 #ifndef GGML_KQ_MASK_PAD
 #define GGML_KQ_MASK_PAD 32
@@ -38,6 +39,386 @@ inline KVCacheUserData *GetKVCacheUserData(int layer, bool is_k) {
     idx = idx % kMaxKVCacheUserDataSlots; // Wrap for safety
   }
   return &g_kv_userdata_pool[idx];
+}
+
+// ============================================================================
+// Custom RoPE Callback (AVX-512 Optimized)
+// ============================================================================
+
+/**
+ * User data for custom RoPE operation
+ */
+struct RoPEUserData {
+  const float *cos_sin_table; ///< Pre-computed [max_seq, head_dim] table
+  const int *positions;       ///< Token positions [n_tokens]
+  int n_tokens;               ///< Number of tokens
+  int n_heads;                ///< Number of heads (Q or KV)
+  int head_dim;               ///< Dimension per head
+  int rope_dim;               ///< Number of dimensions to rotate
+};
+
+// Thread-local pool for RoPE user data (avoids allocation per layer)
+static constexpr int kMaxRoPEUserDataSlots = 512;
+static thread_local RoPEUserData g_rope_userdata_pool[kMaxRoPEUserDataSlots];
+static thread_local int g_rope_userdata_index = 0;
+
+inline RoPEUserData *GetRoPEUserData() {
+  int idx = g_rope_userdata_index++;
+  if (idx >= kMaxRoPEUserDataSlots) {
+    g_rope_userdata_index = 0;
+    idx = 0;
+  }
+  return &g_rope_userdata_pool[idx];
+}
+
+/**
+ * Custom RoPE callback using AVX-512 kernel
+ *
+ * Input tensor shape: [head_dim, n_heads, n_tokens] (GGML standard for Q/K)
+ * Applies RoPE rotation in-place using pre-computed cos/sin tables.
+ *
+ * Threading: Work is partitioned across n_heads dimension.
+ */
+void cb_rope_avx512(struct ggml_tensor *dst, const struct ggml_tensor *src,
+                    int ith, int nth, void *userdata) {
+  auto *ud = (RoPEUserData *)userdata;
+  if (!ud || !ud->cos_sin_table || !ud->positions)
+    return;
+
+  // Tensor layout: [head_dim, n_heads, n_tokens]
+  const int head_dim = ud->head_dim;
+  const int n_heads = ud->n_heads;
+  const int n_tokens = ud->n_tokens;
+  const int rope_dim = ud->rope_dim;
+
+  // Partition work across heads
+  const int heads_per_thread = (n_heads + nth - 1) / nth;
+  const int h_start = ith * heads_per_thread;
+  const int h_end = std::min(h_start + heads_per_thread, n_heads);
+
+  if (h_start >= n_heads)
+    return;
+
+  // Process assigned heads
+  for (int h = h_start; h < h_end; h++) {
+    for (int t = 0; t < n_tokens; t++) {
+      const int pos = ud->positions[t];
+      const float *cs_ptr = ud->cos_sin_table + pos * head_dim;
+
+      // Input/output pointers for this head and token
+      // Layout: [head_dim, n_heads, n_tokens] -> offset = head_dim * (h +
+      // n_heads * t)
+      const float *in_ptr =
+          (const float *)src->data + head_dim * (h + n_heads * t);
+      float *out_ptr = (float *)dst->data + head_dim * (h + n_heads * t);
+
+#if defined(__AVX512F__)
+      // AVX-512 path: process 16 floats (8 pairs) at a time
+      int d = 0;
+      for (; d + 16 <= rope_dim; d += 16) {
+        // Load input: [x0, x1, x2, x3, ..., x14, x15]
+        __m512 x = _mm512_loadu_ps(in_ptr + d);
+
+        // Load cos/sin: [c0, s0, c1, s1, c2, s2, ...]
+        __m512 cs = _mm512_loadu_ps(cs_ptr + d);
+
+        // Deinterleave cos and sin using permute
+        // cos = [c0, c0, c1, c1, ...]  sin = [s0, s0, s1, s1, ...]
+        const __m512i idx_cos = _mm512_setr_epi32(0, 0, 2, 2, 4, 4, 6, 6, 8, 8,
+                                                  10, 10, 12, 12, 14, 14);
+        const __m512i idx_sin = _mm512_setr_epi32(1, 1, 3, 3, 5, 5, 7, 7, 9, 9,
+                                                  11, 11, 13, 13, 15, 15);
+
+        __m512 cos_vec = _mm512_permutexvar_ps(idx_cos, cs);
+        __m512 sin_vec = _mm512_permutexvar_ps(idx_sin, cs);
+
+        // Create swapped x: [x1, x0, x3, x2, x5, x4, ...]
+        const __m512i idx_swap = _mm512_setr_epi32(1, 0, 3, 2, 5, 4, 7, 6, 9, 8,
+                                                   11, 10, 13, 12, 15, 14);
+        __m512 x_swap = _mm512_permutexvar_ps(idx_swap, x);
+
+        // RoPE formula:
+        //   x'_{2d}   = x_{2d} * cos - x_{2d+1} * sin  (even positions)
+        //   x'_{2d+1} = x_{2d} * sin + x_{2d+1} * cos  (odd positions)
+        // Alternating sign: [-1, +1, -1, +1, ...]
+        const __m512 sign_mask =
+            _mm512_set_ps(1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
+                          1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f);
+
+        // out = x * cos + x_swap * sign * sin
+        __m512 result = _mm512_mul_ps(x, cos_vec);
+        __m512 term2 = _mm512_mul_ps(x_swap, sin_vec);
+        term2 = _mm512_mul_ps(term2, sign_mask);
+        result = _mm512_add_ps(result, term2);
+
+        _mm512_storeu_ps(out_ptr + d, result);
+      }
+
+      // Handle remainder (less than 16 floats)
+      for (; d < rope_dim; d += 2) {
+        float x0 = in_ptr[d];
+        float x1 = in_ptr[d + 1];
+        float cos_val = cs_ptr[d];
+        float sin_val = cs_ptr[d + 1];
+
+        out_ptr[d] = x0 * cos_val - x1 * sin_val;
+        out_ptr[d + 1] = x0 * sin_val + x1 * cos_val;
+      }
+#else
+      // Scalar fallback for non-AVX512 builds
+      for (int d = 0; d < rope_dim; d += 2) {
+        float x0 = in_ptr[d];
+        float x1 = in_ptr[d + 1];
+        float cos_val = cs_ptr[d];
+        float sin_val = cs_ptr[d + 1];
+
+        out_ptr[d] = x0 * cos_val - x1 * sin_val;
+        out_ptr[d + 1] = x0 * sin_val + x1 * cos_val;
+      }
+#endif
+
+      // Copy dimensions beyond rope_dim unchanged
+      for (int dd = rope_dim; dd < head_dim; dd++) {
+        out_ptr[dd] = in_ptr[dd];
+      }
+    }
+  }
+}
+
+// ============================================================================
+// Fused Add + RMSNorm Callback (AVX-512 Optimized)
+// ============================================================================
+// Combines residual connection (x += residual) and RMSNorm in a single pass
+// to reduce memory bandwidth by loading/storing data once instead of twice.
+// ============================================================================
+
+/**
+ * User data for fused Add+RMSNorm operation
+ */
+struct AddRMSNormUserData {
+  const float *residual;   ///< Residual tensor data [n_embd, N]
+  const float *rms_weight; ///< RMSNorm weight [n_embd]
+  int n_embd;              ///< Embedding dimension
+  int n_tokens;            ///< Number of tokens
+  float eps;               ///< RMSNorm epsilon
+};
+
+// Thread-local pool for AddRMSNorm user data
+static constexpr int kMaxAddRMSNormSlots = 256;
+static thread_local AddRMSNormUserData g_add_rmsnorm_pool[kMaxAddRMSNormSlots];
+static thread_local int g_add_rmsnorm_index = 0;
+
+inline AddRMSNormUserData *GetAddRMSNormUserData() {
+  int idx = g_add_rmsnorm_index++;
+  if (idx >= kMaxAddRMSNormSlots) {
+    g_add_rmsnorm_index = 0;
+    idx = 0;
+  }
+  return &g_add_rmsnorm_pool[idx];
+}
+
+/**
+ * Custom callback for fused Add + RMSNorm
+ *
+ * Input tensor (src): Current tensor to add residual to and normalize
+ * Output tensor (dst): Result of (src + residual) normalized with RMSNorm
+ *
+ * Uses AVX-512 fused kernel for optimal memory bandwidth utilization.
+ */
+void cb_residual_rmsnorm_fused(struct ggml_tensor *dst,
+                               const struct ggml_tensor *src, int ith, int nth,
+                               void *userdata) {
+  auto *ud = (AddRMSNormUserData *)userdata;
+  if (!ud || !ud->residual || !ud->rms_weight)
+    return;
+
+  const int n_embd = ud->n_embd;
+  const int n_tokens = ud->n_tokens;
+  const float eps = ud->eps;
+
+  // Partition work across tokens
+  const int tokens_per_thread = (n_tokens + nth - 1) / nth;
+  const int t_start = ith * tokens_per_thread;
+  const int t_end = std::min(t_start + tokens_per_thread, n_tokens);
+
+  if (t_start >= n_tokens)
+    return;
+
+  // Process assigned tokens
+  for (int t = t_start; t < t_end; t++) {
+    const float *x_ptr = (const float *)src->data + t * n_embd;
+    const float *res_ptr = ud->residual + t * n_embd;
+    float *out_ptr = (float *)dst->data + t * n_embd;
+
+    // Use unified AddRMSNorm dispatcher (Runtime AVX512/AVX2/Scalar)
+    densecore::simd::AddRMSNorm(out_ptr, x_ptr, res_ptr, ud->rms_weight,
+                                static_cast<size_t>(n_embd), eps);
+  }
+}
+
+// ============================================================================
+// Fused QKV Projection Callback (Tensor-Level Parallelism)
+// ============================================================================
+// Computes Q, K, V projections in a single pass with intra-operator parallelism
+// across the output dimension (dim_q + dim_k + dim_v). This enables
+// multi-thread utilization during decode when batch_size=1.
+// ============================================================================
+
+/**
+ * User data for fused Q/K/V projection operation
+ */
+struct QKVUserData {
+  const float *x;   ///< Input tensor [n_tokens, n_embd]
+  const float *w_q; ///< Q weight [dim_q, n_embd] (row-major)
+  const float *w_k; ///< K weight [dim_k, n_embd] (row-major)
+  const float *w_v; ///< V weight [dim_v, n_embd] (row-major)
+  float *q_out;     ///< Q output [n_tokens, dim_q]
+  float *k_out;     ///< K output [n_tokens, dim_k]
+  float *v_out;     ///< V output [n_tokens, dim_v]
+  int n_embd;       ///< Input embedding dimension
+  int dim_q;        ///< Q output dimension (n_head * head_dim)
+  int dim_k;        ///< K output dimension (n_head_kv * head_dim)
+  int dim_v;        ///< V output dimension (n_head_kv * head_dim)
+  int n_tokens;     ///< Number of tokens in batch
+};
+
+// Thread-local pool for QKV userdata
+static constexpr int kMaxQKVUserDataSlots = 256;
+static thread_local QKVUserData g_qkv_userdata_pool[kMaxQKVUserDataSlots];
+static thread_local int g_qkv_userdata_index = 0;
+
+inline QKVUserData *GetQKVUserData() {
+  int idx = g_qkv_userdata_index++;
+  if (idx >= kMaxQKVUserDataSlots) {
+    g_qkv_userdata_index = 0;
+    idx = 0;
+  }
+  return &g_qkv_userdata_pool[idx];
+}
+
+/**
+ * Custom callback for fused Q/K/V projection with HYBRID parallelism
+ *
+ * Implements a smart dispatch strategy based on batch size:
+ *
+ * CASE A - DECODE (Small Batch: n_tokens < nth):
+ *   - All threads iterate through ALL tokens
+ *   - Pass real ith/nth to ComputeQKV for TENSOR PARALLELISM
+ *   - Multiple threads collaborate on each token's output dimensions
+ *   - Fixes single-threaded bottleneck when batch_size=1
+ *
+ * CASE B - PREFILL (Large Batch: n_tokens >= nth):
+ *   - Partition tokens across threads (TOKEN PARALLELISM)
+ *   - Each thread computes FULL dimensions for its token subset
+ *   - Pass ith=0, nth=1 to ComputeQKV to disable dimension splitting
+ *   - More cache-friendly since each thread works on contiguous data
+ */
+void cb_compute_qkv(struct ggml_tensor *dst, const struct ggml_tensor *src,
+                    int ith, int nth, void *userdata) {
+  // ===========================================================================
+  // BARRIER SAFETY CONTRACT:
+  // ===========================================================================
+  // This callback is invoked by GGML's thread pool. ALL threads must reach the
+  // end of this function cleanly, even if they have no work to do.
+  //
+  // - ComputeQKV handles `start >= end` by doing nothing and returning early
+  // - Early returns here are safe ONLY in PREFILL case (token partitioning)
+  // - In DECODE case, all threads iterate all tokens (no early return)
+  // ===========================================================================
+  auto *ud = static_cast<QKVUserData *>(userdata);
+  if (!ud || !ud->x || !ud->w_q || !ud->w_k || !ud->w_v)
+    return;
+
+  const int n_tokens = ud->n_tokens;
+
+  // ==========================================================================
+  // HYBRID DISPATCH: Choose parallelism strategy based on batch size
+  // ==========================================================================
+
+  if (n_tokens < nth) {
+    // ========================================================================
+    // CASE A: DECODE (Tensor Parallelism)
+    // ========================================================================
+    // Few tokens (typically 1 during generation), many threads
+    // All threads collaborate on ALL tokens, each computing a SLICE of dims
+    // ========================================================================
+    for (int t = 0; t < n_tokens; t++) {
+      const float *x_t = ud->x + t * ud->n_embd;
+      float *q_t = ud->q_out + t * ud->dim_q;
+      float *k_t = ud->k_out + t * ud->dim_k;
+      float *v_t = ud->v_out + t * ud->dim_v;
+
+      // Each thread computes slice [start_col, end_col) of output dimensions
+      // ComputeQKV internally partitions: total_cols = dim_q + dim_k + dim_v
+      densecore::simd::ComputeQKV(q_t, k_t, v_t, x_t, ud->w_q, ud->w_k, ud->w_v,
+                                  ud->n_embd, ud->dim_q, ud->dim_k, ud->dim_v,
+                                  ith, nth // Enable tensor parallelism
+      );
+    }
+  } else {
+    // ========================================================================
+    // CASE B: PREFILL (Token Parallelism)
+    // ========================================================================
+    // Many tokens (prompt processing), partition tokens across threads
+    // Each thread computes FULL dimensions for its subset of tokens
+    // More cache-friendly: each thread touches contiguous weight rows
+    // ========================================================================
+    const int tokens_per_thread = (n_tokens + nth - 1) / nth; // Ceiling div
+    const int t_start = ith * tokens_per_thread;
+    const int t_end = std::min(t_start + tokens_per_thread, n_tokens);
+
+    // Early exit if this thread has no tokens to process
+    if (t_start >= n_tokens)
+      return;
+
+    for (int t = t_start; t < t_end; t++) {
+      const float *x_t = ud->x + t * ud->n_embd;
+      float *q_t = ud->q_out + t * ud->dim_q;
+      float *k_t = ud->k_out + t * ud->dim_k;
+      float *v_t = ud->v_out + t * ud->dim_v;
+
+      // Compute FULL dimensions for this token (no dimension splitting)
+      // Pass ith=0, nth=1 to disable tensor parallelism within ComputeQKV
+      densecore::simd::ComputeQKV(
+          q_t, k_t, v_t, x_t, ud->w_q, ud->w_k, ud->w_v, ud->n_embd, ud->dim_q,
+          ud->dim_k, ud->dim_v, 0,
+          1 // Disable tensor parallelism (single-threaded kernel call)
+      );
+    }
+  }
+}
+
+// ============================================================================
+// RoPE Table Initialization
+// ============================================================================
+
+/**
+ * @brief Initialize pre-computed RoPE cos/sin table for the model
+ *
+ * Populates model->rope_cos_sin with values for all positions and dimensions.
+ * Layout: [pos * head_dim + d] = cos/sin pair for position 'pos', dimension 'd'
+ * Interleaved format: [cos0, sin0, cos1, sin1, ...]
+ *
+ * @param model Model to initialize RoPE table for
+ */
+void InitRoPETable(TransformerModel *model) {
+  if (!model)
+    return;
+
+  const int n_ctx = model->hparams.n_ctx;
+  int head_dim = model->hparams.n_embd / model->hparams.n_head;
+  if (model->hparams.n_embd_head_k > 0) {
+    head_dim = model->hparams.n_embd_head_k;
+  }
+  const float freq_base = model->hparams.rope_freq_base;
+
+  // Reuse RoPETable from simd_ops.h to avoid code duplication
+  densecore::simd::RoPETable table;
+  table.Init(n_ctx, head_dim, freq_base);
+
+  // Move the computed data to the model
+  model->rope_cos_sin = std::move(table.cos_sin);
+  model->rope_head_dim = head_dim;
 }
 
 // Custom callback to load K/V history from cache and append current K/V
@@ -154,9 +535,12 @@ struct INT4GemmUserData {
  */
 void cb_int4_gemm(struct ggml_tensor *dst, const struct ggml_tensor *src,
                   int ith, int nth, void *userdata) {
-  // Pin this GGML worker thread on first invocation (thread-local, O(1) after
-  // first call)
-  densecore::HardwareTopology::GetInstance().PinComputeThread(ith);
+  // =========================================================================
+  // Thread pinning DISABLED to prevent deadlock on consumer hardware.
+  // Aggressive CPU pinning was causing hangs on first token inference.
+  // See: https://github.com/DenseCore/issues/xyz (Thread Affinity Deadlock)
+  // =========================================================================
+  // densecore::HardwareTopology::GetInstance().PinComputeThread(ith);
 
   auto *ud = (INT4GemmUserData *)userdata;
   if (!ud || !ud->int4_weight)
@@ -213,7 +597,8 @@ void cb_int4_gemm(struct ggml_tensor *dst, const struct ggml_tensor *src,
   }
 
   // Call the INT4 GEMM kernel for this thread's partition
-  densecore::simd::GemmInt4Fp32_AVX512(
+  // Uses OpsRegistry for runtime dispatch (AVX512 vs Scalar)
+  densecore::OpsRegistry::Instance().GemmInt4(
       C_local,       // Temporary output [M × n_local]
       A,             // Full activations [M × K]
       W_int4_local,  // Subset of weights [n_local × K]
@@ -306,9 +691,9 @@ inline struct ggml_tensor *smart_mul_mat(struct ggml_context *ctx,
                                          struct ggml_tensor *weight,
                                          struct ggml_tensor *input) {
 
-  // Check if INT4 quantization is available and should be used
-  static const bool use_int4_kernel = (densecore::simd::DetectSimdLevel() >=
-                                       densecore::simd::SimdLevel::AVX512);
+  // Check if INT4 quantization is available (OpsRegistry provides fallback)
+  // Always enabled - OpsRegistry::Init() selects best available kernel
+  static const bool use_int4_kernel = densecore::OpsRegistry::IsInitialized();
 
   if (use_int4_kernel && IsINT4Quantized(weight)) {
     // Use custom INT4 GEMM kernel
@@ -331,6 +716,10 @@ struct ggml_tensor *BuildTransformerGraph(
     TransformerModel *model, PagedKVCache *cache, struct ggml_context *ctx_c,
     const BatchSpec &batch, bool embedding_mode, struct ggml_cgraph *gf,
     struct ggml_tensor **out_embd, struct ggml_tensor **out_pos) {
+
+  // ENSURE: ctx_c must be initialized with sufficient memory (e.g. 128MB+)
+  // to hold the compute graph nodes, especially for deep models like Qwen.
+  // This initialization happens in worker.cpp (InitGraphCache or temp context).
 
   const int N = batch.tokens.size();
   const int n_embd = model->hparams.n_embd;
@@ -422,14 +811,39 @@ struct ggml_tensor *BuildTransformerGraph(
     if (rope_dim > head_dim_q)
       rope_dim = head_dim_q;
 
-    Qcur =
-        ggml_rope_ext(ctx_c, Qcur, pos, nullptr, rope_dim, 0, n_ctx,
-                      model->hparams.rope_freq_base,
-                      model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
-    Kcur =
-        ggml_rope_ext(ctx_c, Kcur, pos, nullptr, rope_dim, 0, n_ctx,
-                      model->hparams.rope_freq_base,
-                      model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+    // Use custom RoPE if pre-computed table is available
+    if (!model->rope_cos_sin.empty()) {
+      // Apply custom RoPE using pre-computed table
+      // Q: [head_dim_q, n_head, N]
+      RoPEUserData *q_ud = GetRoPEUserData();
+      *q_ud = {model->rope_cos_sin.data(),
+               batch.pos.data(),
+               N,
+               n_head,
+               head_dim_q,
+               rope_dim};
+      Qcur = ggml_map_custom1(ctx_c, Qcur, cb_rope_avx512, 1, q_ud);
+
+      // K: [head_dim_kv, n_head_kv, N]
+      RoPEUserData *k_ud = GetRoPEUserData();
+      *k_ud = {model->rope_cos_sin.data(),
+               batch.pos.data(),
+               N,
+               n_head_kv,
+               head_dim_kv,
+               rope_dim};
+      Kcur = ggml_map_custom1(ctx_c, Kcur, cb_rope_avx512, 1, k_ud);
+    } else {
+      // Fallback to standard GGML RoPE
+      Qcur =
+          ggml_rope_ext(ctx_c, Qcur, pos, nullptr, rope_dim, 0, n_ctx,
+                        model->hparams.rope_freq_base,
+                        model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+      Kcur =
+          ggml_rope_ext(ctx_c, Kcur, pos, nullptr, rope_dim, 0, n_ctx,
+                        model->hparams.rope_freq_base,
+                        model->hparams.rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+    }
 
     // =========================================================================
     // KV CACHE INTEGRATION (Universal Paged Attention)
@@ -548,7 +962,10 @@ struct ggml_tensor *BuildTransformerGraph(
     // - AVX-512+: Use Flash Attention (ggml_flash_attn_ext) for efficiency
     // - Other: Use standard Q*K^T -> softmax -> V for compatibility
     // =========================================================================
+    // Note: Flash Attention still requires AVX-512 for correctness
+    // (uses GGML's ggml_flash_attn_ext which has AVX-512 requirement)
     static const bool use_flash_attention =
+        densecore::OpsRegistry::IsInitialized() &&
         (densecore::simd::DetectSimdLevel() >=
          densecore::simd::SimdLevel::AVX512);
 

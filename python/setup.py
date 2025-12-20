@@ -180,17 +180,17 @@ setup(
     ],
     python_requires='>=3.9',
     install_requires=[
-        'huggingface-hub>=0.20.0',
-        'numpy>=2.0.2',
-        'torch>=2.5.1',
-        'transformers>=4.46.3',
+        # Minimal dependencies for lightweight mode (pure C++ binding)
+        'numpy>=1.20.0',
         'typing-extensions>=4.0.0;python_version<"3.10"',
     ],
     extras_require={
         'full': [
+            # Heavy ML dependencies for HuggingFace integration
+            'torch>=2.0.0',
             'transformers>=4.35.0',
+            'huggingface-hub>=0.20.0',
             'tokenizers>=0.15.0',
-            'numpy>=1.20.0',
         ],
         'langchain': [
             'langchain-core>=0.1.0',

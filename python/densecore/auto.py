@@ -253,8 +253,9 @@ class AutoTokenizer:
             from transformers import AutoTokenizer as HFAutoTokenizer
         except ImportError:
             raise ImportError(
-                "transformers library is required for AutoTokenizer. "
-                "Install with: pip install transformers"
+                "Transformers is not installed. "
+                "Please install it via `pip install densecore[full]` to use AutoTokenizer, "
+                "or use the native `densecore.LlamaTokenizer` if available."
             ) from None
 
         return HFAutoTokenizer.from_pretrained(

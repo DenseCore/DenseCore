@@ -12,7 +12,7 @@ import platform
 import queue
 import threading
 import warnings
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +36,62 @@ except ImportError:
 
 from .config import GenerationConfig, ModelConfig
 from .lora import LoRAManager, is_lora_adapter_repo, download_lora_adapter
+
+
+# ==============================================================================
+# GIL Release Architecture
+# ==============================================================================
+#
+# DenseCore achieves true non-blocking AsyncIO through the following design:
+#
+# 1. THREAD POOL OFFLOADING:
+#    - SubmitRequest is offloaded to a ThreadPoolExecutor via run_in_executor
+#    - This frees the Python event loop to handle other async tasks
+#
+# 2. GIL RELEASE DURING C++ EXECUTION:
+#    - ctypes.CDLL (not ctypes.pythonapi) is used for bindings
+#    - The GIL is released during C function calls by default
+#    - C++ inference runs on native threads without holding the GIL
+#
+# 3. THREAD-SAFE CALLBACK BRIDGING:
+#    - Token callbacks use loop.call_soon_threadsafe() to safely
+#      communicate from C++ worker threads back to the event loop
+#
+# This enables 100+ concurrent async requests without event loop starvation.
+# ==============================================================================
+
+# Dedicated thread pool for C++ inference submissions
+# Lazily initialized to avoid overhead if only sync methods are used
+_INFERENCE_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def _get_inference_executor() -> ThreadPoolExecutor:
+    """
+    Get or create the inference thread pool executor (Singleton).
+
+    The executor is sized to handle high concurrency while avoiding
+    thread explosion. Workers are named for easy debugging.
+    """
+    global _INFERENCE_EXECUTOR
+    if _INFERENCE_EXECUTOR is None:
+        max_workers = min(32, (os.cpu_count() or 4) * 4)
+        _INFERENCE_EXECUTOR = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="densecore-submit",
+        )
+    return _INFERENCE_EXECUTOR
+
+
+def shutdown_executor() -> None:
+    """
+    Shut down the inference executor gracefully.
+
+    Call this during application shutdown to ensure clean termination.
+    """
+    global _INFERENCE_EXECUTOR
+    if _INFERENCE_EXECUTOR is not None:
+        _INFERENCE_EXECUTOR.shutdown(wait=True)
+        _INFERENCE_EXECUTOR = None
 
 
 # ==============================================================================
@@ -191,6 +247,7 @@ def _find_library() -> str:
         Path(__file__).parent / "lib",
         Path(__file__).parent.parent,
         Path(__file__).parent.parent.parent / "build",
+        Path(__file__).parent.parent.parent / "core" / "build",  # Added: correctly locate core build artifacts
         Path("/usr/local/lib"),
         Path("/usr/lib"),
     ]
@@ -276,6 +333,7 @@ class DenseCore:
         self._handle = None
         self._closed = True
         self._requests: dict[int, Any] = {}
+        self._active_ctypes_refs: dict[int, list] = {}  # Prevent GC of ctypes objects
         self._req_id_counter = 0
         self._lock = threading.Lock()
         self._verbose = verbose
@@ -498,20 +556,8 @@ class DenseCore:
         # Decode token string
         token_str = token.decode("utf-8") if token else ""
 
-        # Check if this is a TokenResult struct format (token_id is passed)
-        # The C++ engine now passes format: "[TID:token_id]" or just the struct
-        # For backwards compatibility, check for TID format but prefer struct
-        if token_str.startswith("[TID:") and self.tokenizer:
-            # Extract token ID from legacy format (fallback)
-            try:
-                token_id = int(token_str[5 : token_str.index("]")])
-                token_str = self.tokenizer.decode([token_id])
-            except (ValueError, IndexError):
-                # Clean BPE artifacts as fallback
-                token_str = self._clean_bpe_token(token_str)
-        else:
-            # Clean BPE artifacts from standard format
-            token_str = self._clean_bpe_token(token_str)
+        # Since C++ now sends decoded tokens, just clean BPE artifacts
+        token_str = self._clean_bpe_token(token_str)
 
         finished = bool(is_finished)
 
@@ -523,6 +569,7 @@ class DenseCore:
         if finished:
             with self._lock:
                 self._requests.pop(req_id, None)
+                self._active_ctypes_refs.pop(req_id, None)  # Release ctypes refs
 
     def _register_request(self, handler: Callable[[str, bool], None]) -> int:
         """Register a request handler and return request ID."""
@@ -552,7 +599,10 @@ class DenseCore:
 
         tokens = self.tokenizer.encode(prompt, add_special_tokens=True)
         tokens_array = (ctypes.c_int * len(tokens))(*tokens)
-        return self._lib.SubmitRequestIds(
+        # CRITICAL: Keep ctypes array reference alive until C++ is done!
+        with self._lock:
+            self._active_ctypes_refs[req_id] = [tokens_array]
+        res = self._lib.SubmitRequestIds(
             self._handle,
             tokens_array,
             len(tokens),
@@ -560,6 +610,7 @@ class DenseCore:
             ctypes.cast(self._c_callback, ctypes.c_void_p),
             ctypes.c_void_p(req_id),
         )
+        return res
 
     # =========================================================================
     # Public API - Generation Methods
@@ -741,6 +792,9 @@ class DenseCore:
         if prompt_tokens is not None:
             # Use tokenized input
             tokens_array = (ctypes.c_int * len(prompt_tokens))(*prompt_tokens)
+            # CRITICAL: Keep ctypes array reference alive until C++ is done!
+            with self._lock:
+                self._active_ctypes_refs[req_id] = [tokens_array]
             ret = self._lib.SubmitRequestIds(
                 self._handle,
                 tokens_array,
@@ -756,6 +810,7 @@ class DenseCore:
         if ret < 0:
             with self._lock:
                 self._requests.pop(req_id, None)
+                self._active_ctypes_refs.pop(req_id, None)
             raise _error_code_to_exception(ret, context="in generate()")
 
         # Collect generated tokens
@@ -947,18 +1002,23 @@ class DenseCore:
 
         req_id = self._register_request(handler)
 
-        ret = self._lib.SubmitRequest(
-            self._handle,
-            prompt.encode("utf-8"),
-            max_tokens,
-            ctypes.cast(self._c_callback, ctypes.c_void_p),
-            ctypes.c_void_p(req_id),
-        )
+        # Offload submission to thread pool to avoid blocking the event loop
+        def blocking_submit() -> int:
+            """Execute SubmitRequest in executor - main loop stays free."""
+            return self._lib.SubmitRequest(
+                self._handle,
+                prompt.encode("utf-8"),
+                max_tokens,
+                ctypes.cast(self._c_callback, ctypes.c_void_p),
+                ctypes.c_void_p(req_id),
+            )
+
+        ret = await loop.run_in_executor(_get_inference_executor(), blocking_submit)
 
         if ret < 0:
             with self._lock:
                 self._requests.pop(req_id, None)
-            raise RuntimeError(f"Failed to submit request: error code {ret}")
+            raise _error_code_to_exception(ret, context="in generate_async()")
 
         return await future
 
@@ -995,18 +1055,24 @@ class DenseCore:
 
         req_id = self._register_request(handler)
 
-        ret = self._lib.SubmitRequest(
-            self._handle,
-            prompt.encode("utf-8"),
-            max_tokens,
-            ctypes.cast(self._c_callback, ctypes.c_void_p),
-            ctypes.c_void_p(req_id),
-        )
+        # Offload submission to thread pool to avoid blocking the event loop
+        def blocking_submit() -> int:
+            """Execute SubmitRequest in executor - main loop stays free."""
+            return self._lib.SubmitRequest(
+                self._handle,
+                prompt.encode("utf-8"),
+                max_tokens,
+                ctypes.cast(self._c_callback, ctypes.c_void_p),
+                ctypes.c_void_p(req_id),
+            )
+
+        ret = await loop.run_in_executor(_get_inference_executor(), blocking_submit)
 
         if ret < 0:
             with self._lock:
                 self._requests.pop(req_id, None)
-            raise RuntimeError(f"Failed to submit request: error code {ret}")
+                self._active_ctypes_refs.pop(req_id, None)
+            raise _error_code_to_exception(ret, context="in stream_async()")
 
         while True:
             token, finished = await async_queue.get()

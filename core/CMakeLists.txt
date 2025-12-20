@@ -86,6 +86,9 @@ set(SOURCES
     src/optimization_bridge.cpp
     src/save_model.cpp
     src/version.cpp
+    # Backend abstraction
+    src/cpu_backend.cpp
+    src/backend_registry.cpp
     # Quantization module
     src/quantizer.cpp
     src/quantization/max_quantizer.cpp
@@ -261,6 +264,20 @@ find_package(Threads REQUIRED)
 target_link_libraries(densecore PRIVATE Threads::Threads)
 
 # ==========================================================================
+# Threading Model: GGML Thread Pool + std::thread (NO OpenMP)
+# ==========================================================================
+# DenseCore uses a unified threading model:
+# - Request-level parallelism: std::thread workers in worker.cpp
+# - Compute-level parallelism: GGML's internal thread pool
+#
+# OpenMP is NOT used to avoid thread oversubscription (nested parallelism).
+# All SIMD kernels in simd_ops.h are single-threaded and rely on the caller
+# (GGML callbacks or worker.cpp) to manage parallel execution.
+# ==========================================================================
+message(STATUS "Threading: GGML thread pool + std::thread (OpenMP disabled)")
+
+
+# ==========================================================================
 # NUMA / hwloc Support (Optional)
 # ==========================================================================
 # Enables NUMA-aware memory allocation and thread affinity for multi-socket
@@ -386,6 +403,7 @@ if(DENSECORE_BUILD_TESTS)
 
     target_include_directories(densecore_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_BINARY_DIR}/include  # Generated headers (densecore_version.h)
         ${GGML_DIR}/include
         ${GGML_DIR}/src
         ${GGML_DIR}/src/ggml-cpu

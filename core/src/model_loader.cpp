@@ -1,7 +1,12 @@
 #include "model_loader.h"
+#include "hardware_topology.h"
+#include "inference.h" // For InitRoPETable
+#include "numa_allocator.h"
+#include <cstring>
 #include <ggml-cpu.h>
 #include <iostream>
 #include <string>
+#include <thread>
 
 // ============================================================================
 // Mock Model (Test Build Only)
@@ -409,6 +414,13 @@ TransformerModel *LoadGGUFModel(const char *path) {
             << model->hparams.n_embd_head_k
             << ", n_embd_head_v=" << model->hparams.n_embd_head_v << std::endl;
 
+  // Initialize pre-computed RoPE table for optimized inference
+  std::cout << "[DenseCore] Initializing RoPE table..." << std::endl;
+  InitRoPETable(model);
+  std::cout << "[DenseCore] RoPE table initialized: "
+            << model->rope_cos_sin.size() << " values (" << model->hparams.n_ctx
+            << " positions × " << model->rope_head_dim << " dims)" << std::endl;
+
   std::cout << "[DenseCore] Model loaded successfully" << std::endl;
   return model;
 }
@@ -474,4 +486,167 @@ int SaveModel(const TransformerModel *model, const char *path) {
 
   std::cout << "[DenseCore] Model saved (metadata-only mode)" << std::endl;
   return 0;
+}
+
+// ============================================================================
+// NUMA-Aware Model Loading
+// ============================================================================
+
+/**
+ * Rebind a single tensor's data to specified NUMA node.
+ * Uses a dedicated thread pinned to the target NUMA node for copying,
+ * which enforces first-touch memory policy allocation.
+ *
+ * @param tensor Tensor to rebind (must have valid data pointer)
+ * @param numa_node Target NUMA node for allocation
+ * @param model Model to track allocation for cleanup
+ * @param min_size_bytes Minimum tensor size threshold (skip smaller tensors)
+ * @return True if tensor was successfully rebound
+ */
+static bool RebindTensorNuma(struct ggml_tensor *tensor, int numa_node,
+                             TransformerModel *model,
+                             size_t min_size_bytes = 1024 * 1024) {
+  if (!tensor || !tensor->data) {
+    return false;
+  }
+
+  const size_t tensor_size = ggml_nbytes(tensor);
+  if (tensor_size < min_size_bytes) {
+    return false; // Skip small tensors - overhead not worth it
+  }
+
+  // Allocate NUMA-aware buffer
+  auto result =
+      densecore::NumaAllocator::AllocatePreferred(tensor_size, 64, numa_node);
+
+  if (!result.ptr) {
+    std::cerr << "[NUMA] Failed to allocate " << (tensor_size / 1024 / 1024)
+              << " MB on node " << numa_node << std::endl;
+    return false;
+  }
+
+  // =========================================================================
+  // CRITICAL: Copy data using thread pinned to target NUMA node
+  // =========================================================================
+  // This enforces first-touch policy: the physical memory pages are allocated
+  // on the NUMA node where the first write occurs. By pinning our copy thread
+  // to the target node, we ensure pages are allocated there.
+  // =========================================================================
+  const void *src_data = tensor->data;
+  void *dst_data = result.ptr;
+
+  std::thread copy_thread([dst_data, src_data, tensor_size, numa_node]() {
+    // Pin this thread to the target NUMA node
+    densecore::HardwareTopology::GetInstance().PinCurrentThreadToNumaNode(
+        numa_node, densecore::PinningPolicy::SCATTER);
+
+    // Perform the copy - this triggers first-touch allocation
+    std::memcpy(dst_data, src_data, tensor_size);
+  });
+
+  // MUST join to ensure copy completes before we use the tensor
+  copy_thread.join();
+
+  // Replace tensor data pointer
+  // NOTE: Original mmap data will be freed when ctx_gguf is freed
+  tensor->data = result.ptr;
+
+  // Track allocation for cleanup in model destructor
+  model->numa_buffers.emplace_back(result.ptr, result.size);
+
+  return true;
+}
+
+/**
+ * Load GGUF model with NUMA-aware memory placement.
+ *
+ * After initial mmap load, identifies large tensors (>1MB) and rebinds
+ * their data to the specified NUMA node for optimized memory bandwidth.
+ *
+ * @param path Path to GGUF file
+ * @param numa_node Target NUMA node (-1 for local/auto)
+ * @param use_huge_pages Whether to request huge pages (TBD)
+ * @return Loaded model with NUMA-optimized memory layout
+ */
+TransformerModel *LoadGGUFModelNuma(const char *path, int numa_node,
+                                    bool use_huge_pages) {
+  // Step 1: Load model normally (mmap-based)
+  TransformerModel *model = LoadGGUFModel(path);
+  if (!model) {
+    return nullptr;
+  }
+
+  // Step 2: Check if NUMA rebinding is needed
+  if (numa_node < 0 && !densecore::NumaAllocator::IsNumaAvailable()) {
+    std::cout << "[DenseCore] NUMA not available, using standard memory layout"
+              << std::endl;
+    return model;
+  }
+
+  // If numa_node is -1 (auto), default to node 0
+  // (for more sophisticated scheduling, the caller should specify explicitly)
+  if (numa_node < 0) {
+    numa_node = 0;
+    std::cout << "[DenseCore] Auto-selected NUMA node " << numa_node
+              << " for tensor rebinding" << std::endl;
+  }
+
+  (void)use_huge_pages; // TODO: implement huge page allocation path
+
+  std::cout << "[DenseCore] Starting NUMA rebinding to node " << numa_node
+            << "..." << std::endl;
+
+  // Step 3: Rebind large tensors to target NUMA node
+  size_t rebound_bytes = 0;
+  int rebound_count = 0;
+
+  // Helper lambda to rebind and track
+  auto rebind = [&](struct ggml_tensor *t, const char *name) {
+    if (RebindTensorNuma(t, numa_node, model)) {
+      rebound_bytes += ggml_nbytes(t);
+      rebound_count++;
+      std::cout << "  [NUMA] Rebound " << name << " ("
+                << (ggml_nbytes(t) / 1024 / 1024) << " MB)" << std::endl;
+    }
+  };
+
+  // Rebind critical weight tensors
+  rebind(model->tok_embeddings, "tok_embeddings");
+  rebind(model->output, "output");
+  rebind(model->output_norm, "output_norm");
+
+  // Rebind layer weights (these are the bulk of model memory)
+  for (size_t i = 0; i < model->layers.size(); ++i) {
+    auto &layer = model->layers[i];
+    std::string prefix = "blk." + std::to_string(i) + ".";
+
+    // Attention weights (largest tensors per layer)
+    rebind(layer.wq, (prefix + "wq").c_str());
+    rebind(layer.wk, (prefix + "wk").c_str());
+    rebind(layer.wv, (prefix + "wv").c_str());
+    rebind(layer.wo, (prefix + "wo").c_str());
+
+    // FFN weights (also large)
+    rebind(layer.w1, (prefix + "w1").c_str());
+    rebind(layer.w2, (prefix + "w2").c_str());
+    rebind(layer.w3, (prefix + "w3").c_str());
+
+    // Norms (small, typically skipped by size threshold)
+    rebind(layer.attention_norm, (prefix + "attn_norm").c_str());
+    rebind(layer.ffn_norm, (prefix + "ffn_norm").c_str());
+  }
+
+  // Step 4: Print summary
+  std::cout << "[DenseCore] NUMA rebinding complete: " << rebound_count
+            << " tensors (" << (rebound_bytes / 1024 / 1024) << " MB) to Node "
+            << numa_node << std::endl;
+
+  // Optional: Verify placement using MemoryDiagnostics
+  if (model->tok_embeddings && rebound_count > 0) {
+    densecore::MemoryDiagnostics::PrintSystemTopologyReport(
+        model->tok_embeddings->data, ggml_nbytes(model->tok_embeddings),
+        numa_node, "tok_embeddings (sample)");
+  }
+
+  return model;
 }

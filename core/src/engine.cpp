@@ -1,3 +1,4 @@
+#include "backend_registry.h" // Backend abstraction layer
 #include "densecore.h"
 #include "embedding.h"
 #include "engine_internal.h"
@@ -5,6 +6,7 @@
 #include "kv_cache.h"
 #include "model_loader.h"
 #include "model_types.h"
+#include "optimization_bridge.h" // Runtime SIMD dispatch
 #include "simd_ops.h"
 #include "tokenizer.h"
 #include <algorithm>
@@ -57,13 +59,15 @@ int SubmitEmbeddingRequestEx(DenseCoreHandle handle, const char *prompt,
 
   // Record arrival time
   req->arrival_time = std::chrono::steady_clock::now();
-  req->priority = 50; // High priority for embeddings
+  req->priority = 50;    // High priority for embeddings
+  req->tier = "premium"; // Embeddings get premium tier
 
+  // Lock-free enqueue: no mutex needed
+  state->pending_requests.Push(req, req->tier);
   {
-    std::lock_guard<std::mutex> lock(state->queue_mu);
-    state->pending_requests.push(req);
+    std::lock_guard<std::mutex> lock(state->cv_mu);
+    state->queue_cv.notify_one();
   }
-  state->queue_cv.notify_one();
 
   return req->id;
 }
@@ -99,23 +103,51 @@ int GetEmbeddingDimension(DenseCoreHandle handle) {
   return -1;
 }
 
-DenseCoreHandle InitEngine(const char *model_path, const char * /*reserved*/,
-                           int threads, int numa_node_id, int pinning_policy) {
+DENSECORE_API DenseCoreHandle InitEngine(const char *model_path,
+                                         const char * /*reserved*/,
+                                         int threads) {
   try {
-    (void)threads; // Reserved for future use
-#ifdef _OPENMP
-    if (threads > 0) {
-      // omp_set_num_threads(threads);
+    // =========================================================================
+    // THREAD CONFIGURATION (Pure std::thread + GGML thread pool)
+    // =========================================================================
+    // Auto-detect optimal thread count if not specified
+    if (threads <= 0) {
+      threads = densecore::simd::GetNumCores();
     }
-#endif
+    std::cout << "[DenseCore] Threading configured: " << threads << " threads"
+              << " (GGML thread pool + std::thread, no OpenMP)" << std::endl;
+
+    // =========================================================================
+    // SIMD DISPATCH TABLE INITIALIZATION (Must happen before any inference!)
+    // =========================================================================
+    // OpsRegistry selects optimal kernel implementations based on CPU caps.
+    // Initializing here ensures the dispatch table is ready before generate()
+    // is called, even if the worker thread hasn't started yet.
+    // =========================================================================
+    if (!densecore::OpsRegistry::IsInitialized()) {
+      densecore::OpsRegistry::Init();
+    }
+
+    // =========================================================================
+    // BACKEND REGISTRY INITIALIZATION
+    // =========================================================================
+    // Register the CPU backend (AVX2/AVX-512 kernels wrapped in ComputeBackend
+    // interface). Future ASIC backends can be registered similarly.
+    // =========================================================================
+    densecore::BackendRegistry::Instance().RegisterCpuBackend();
+
+    // Update global inference config for Flash Attention and other parallel ops
+    InferenceConfig::Instance().num_threads = threads;
 
     TransformerModel *model = LoadGGUFModel(model_path);
     if (!model)
       return nullptr;
 
     EngineState *state = new EngineState();
-    state->numa_node_id = numa_node_id;     // Store NUMA configuration
-    state->pinning_policy = pinning_policy; // Store pinning policy
+    // Default values
+    state->numa_node_id = -1;
+    state->pinning_policy = 0;
+    state->n_threads = threads; // Store for worker thread
 
     // Calculate optimal KV cache size based on model dimensions
     const int head_dim = model->hparams.n_embd / model->hparams.n_head;
@@ -156,14 +188,14 @@ DenseCoreHandle InitEngine(const char *model_path, const char * /*reserved*/,
     }
 
     // Log NUMA configuration
-    if (numa_node_id >= 0) {
-      std::cout << "[DenseCore] NUMA binding: node " << numa_node_id
+    if (state->numa_node_id >= 0) {
+      std::cout << "[DenseCore] NUMA binding: node " << state->numa_node_id
                 << std::endl;
     }
 
     // Initialize Paged KV Cache with NUMA-aware allocation
-    PagedKVCache *cache = InitPagedKVCache(model, 1, optimal_seq_len,
-                                           GGML_TYPE_F16, numa_node_id);
+    PagedKVCache *cache =
+        InitPagedKVCache(model, 1, optimal_seq_len, GGML_TYPE_F16, -1);
     if (!cache) {
       delete model;
       delete state;
@@ -181,6 +213,25 @@ DenseCoreHandle InitEngine(const char *model_path, const char * /*reserved*/,
 
     state->models["default"] = std::move(entry);
     state->default_model_id = "default";
+
+    // Initialize Scheduler with the default model's block manager
+    // Note: The scheduler takes a raw pointer to BlockManager, ownership
+    // remains with PagedKVCache
+    if (state->models["default"]->kv_cache &&
+        state->models["default"]->kv_cache->block_manager) {
+      state->scheduler = std::make_unique<densecore::Scheduler>(
+          state->models["default"]->kv_cache->block_manager);
+      std::cout << "[DenseCore] Scheduler initialized." << std::endl;
+    } else {
+      std::cerr << "[DenseCore] FATAL: Failed to initialize Scheduler. "
+                   "BlockManager is missing."
+                << std::endl;
+      delete state;
+      return nullptr;
+    }
+
+    // Initialize compute buffer (Persistent, Aligned)
+    state->InitComputeBuffer();
 
     // Start background thread
     state->status = EngineStatus::RUNNING;
@@ -220,35 +271,41 @@ int SubmitRequest(DenseCoreHandle handle, const char *prompt, int max_tokens,
   req->user_data = user_data;
 
   // Tokenize immediately (outside hot path)
+  std::cout << "[DEBUG] Tokenizing prompt..." << std::endl;
   req->tokens = Tokenizer::Tokenize(model_entry->model.get(), prompt, true);
+  std::cout << "[DEBUG] Tokenized: " << req->tokens.size() << " tokens"
+            << std::endl;
 
   // Record arrival time for metrics
   req->arrival_time = std::chrono::steady_clock::now();
 
   // Priority based on actual token count (shorter = higher priority)
   int n_tokens = req->tokens.size();
+  // Set tier based on length (SJF-style prioritization)
   if (n_tokens < 100) {
-    req->priority = 50; // High priority for short requests
+    req->tier = "premium"; // Short requests get highest priority
   } else if (n_tokens < 500) {
-    req->priority = 100; // Normal priority
+    req->tier = "standard";
   } else {
-    req->priority = 150; // Lower priority for long requests
+    req->tier = "batch"; // Long requests get lowest priority
   }
 
-  // Enqueue with priority
+  // Lock-free enqueue: no mutex needed
+  state->pending_requests.Push(req, req->tier);
+  std::cout << "[DEBUG] Enqueued request " << req->id << std::endl;
   {
-    std::lock_guard<std::mutex> lock(state->queue_mu);
-    state->pending_requests.push(req);
+    std::lock_guard<std::mutex> lock(state->cv_mu);
+    state->queue_cv.notify_one();
   }
-  state->queue_cv.notify_one();
 
   return req->id;
 }
 
 int SubmitRequestIds(DenseCoreHandle handle, const int *tokens, int n_tokens,
                      int max_tokens, TokenCallback callback, void *user_data) {
-  if (!handle || !tokens || n_tokens <= 0)
+  if (!handle || !tokens || n_tokens <= 0) {
     return -1;
+  }
   EngineState *state = (EngineState *)handle;
 
   Request *req = state->request_pool.Acquire();
@@ -265,20 +322,21 @@ int SubmitRequestIds(DenseCoreHandle handle, const int *tokens, int n_tokens,
   // Record arrival time
   req->arrival_time = std::chrono::steady_clock::now();
 
-  // Priority based on length
+  // Set tier based on length
   if (n_tokens < 100) {
-    req->priority = 50;
+    req->tier = "premium";
   } else if (n_tokens < 500) {
-    req->priority = 100;
+    req->tier = "standard";
   } else {
-    req->priority = 150;
+    req->tier = "batch";
   }
 
+  // Lock-free enqueue
+  state->pending_requests.Push(req, req->tier);
   {
-    std::lock_guard<std::mutex> lock(state->queue_mu);
-    state->pending_requests.push(req);
+    std::lock_guard<std::mutex> lock(state->cv_mu);
+    state->queue_cv.notify_one();
   }
-  state->queue_cv.notify_one();
 
   return req->id;
 }
@@ -322,23 +380,22 @@ int SubmitRequestWithFormat(DenseCoreHandle handle, const char *prompt,
 
   // Record arrival time for metrics
   req->arrival_time = std::chrono::steady_clock::now();
-
-  // Priority based on actual token count
+  // Set tier based on length
   int n_tokens = req->tokens.size();
   if (n_tokens < 100) {
-    req->priority = 50;
+    req->tier = "premium";
   } else if (n_tokens < 500) {
-    req->priority = 100;
+    req->tier = "standard";
   } else {
-    req->priority = 150;
+    req->tier = "batch";
   }
 
-  // Enqueue with priority
+  // Lock-free enqueue
+  state->pending_requests.Push(req, req->tier);
   {
-    std::lock_guard<std::mutex> lock(state->queue_mu);
-    state->pending_requests.push(req);
+    std::lock_guard<std::mutex> lock(state->cv_mu);
+    state->queue_cv.notify_one();
   }
-  state->queue_cv.notify_one();
 
   return req->id;
 }
@@ -348,9 +405,14 @@ int CancelRequest(DenseCoreHandle handle, int request_id) {
     return -1;
   EngineState *state = (EngineState *)handle;
 
-  std::lock_guard<std::mutex> lock(state->queue_mu);
+  // ==========================================================================
+  // LOCK-FREE QUEUE LIMITATION: Cannot iterate/remove from pending queue
+  // ==========================================================================
+  // With lock-free queues, we can only cancel active requests.
+  // Pending requests will be checked for cancellation when dequeued.
+  // ==========================================================================
+  std::lock_guard<std::mutex> lock(state->active_mu);
 
-  // 1. Check active requests first
   for (Request *req : state->active_requests) {
     if (req->id == request_id) {
       req->cancelled = true;
@@ -359,33 +421,11 @@ int CancelRequest(DenseCoreHandle handle, int request_id) {
     }
   }
 
-  // 2. Check pending queue (need to rebuild to remove)
-  std::priority_queue<Request *, std::vector<Request *>,
-                      RequestPriorityComparator>
-      temp_queue;
-  bool found = false;
-
-  while (!state->pending_requests.empty()) {
-    Request *req = state->pending_requests.top();
-    state->pending_requests.pop();
-
-    if (req->id == request_id) {
-      found = true;
-      LOG_INFO("Removing cancelled request ", request_id,
-               " from pending queue.");
-      if (req->callback) {
-        req->callback("Error: Request cancelled", 1, req->user_data);
-      }
-      state->request_pool.Release(req);
-    } else {
-      temp_queue.push(req);
-    }
-  }
-
-  // Restore the queue
-  state->pending_requests = std::move(temp_queue);
-
-  return found ? 0 : -2; // -2 = not found
+  // Request not found in active list - it might be pending
+  // Mark cancellation will happen lazily when request is dequeued
+  LOG_INFO("Request ", request_id,
+           " not active - cancellation may be delayed.");
+  return -2; // Not found in active
 }
 
 DenseCoreMetrics GetMetrics(DenseCoreHandle handle) {
@@ -412,10 +452,10 @@ DetailedMetrics GetDetailedMetrics(DenseCoreHandle handle) {
   m.completed_requests = state->metrics.completed_requests;
   m.failed_requests = state->metrics.failed_requests;
 
-  // Count pending requests
+  // Count pending requests (lock-free approximate count)
+  m.pending_requests = state->pending_requests.Size();
   {
-    std::lock_guard<std::mutex> lock(state->queue_mu);
-    m.pending_requests = state->pending_requests.size();
+    std::lock_guard<std::mutex> lock(state->active_mu);
     m.current_batch_size = state->active_requests.size();
   }
 

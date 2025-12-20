@@ -37,17 +37,22 @@ struct FlashAttentionConfig {
 };
 
 /**
- * Scratch buffer for Flash Attention computation
- * Pre-allocate to avoid repeated allocations
+ * Scratch buffer for Flash Attention computation.
+ * Pre-allocate to avoid repeated allocations.
+ *
+ * IMPORTANT: All buffers use 64-byte aligned memory (simd::AlignedVector)
+ * to ensure compatibility with AVX-512 aligned load/store instructions.
  */
 struct FlashAttentionScratch {
-  std::vector<float> qk_block; // [block_m, block_n]
-  std::vector<float> pv_block; // [block_m, head_dim]
-  std::vector<float> row_max;  // [block_m]
-  std::vector<float> row_sum;  // [block_m]
-  std::vector<float> new_max;  // [block_m]
-  std::vector<float> exp_diff; // [block_m]
-  std::vector<float> o_block;  // [block_m, head_dim]
+  simd::AlignedVector<float> qk_block;  // [block_m, block_n] (64-byte aligned)
+  simd::AlignedVector<float> pv_block;  // [block_m, head_dim] (64-byte aligned)
+  simd::AlignedVector<float> row_max;   // [block_m] (64-byte aligned)
+  simd::AlignedVector<float> row_sum;   // [block_m] (64-byte aligned)
+  simd::AlignedVector<float> new_max;   // [block_m] (64-byte aligned)
+  simd::AlignedVector<float> exp_diff;  // [block_m] (64-byte aligned)
+  simd::AlignedVector<float> o_block;   // [block_m, head_dim] (64-byte aligned)
+  simd::AlignedVector<float> alpha_buf; // [block_m] (64-byte aligned)
+  simd::AlignedVector<float> beta_buf;  // [block_m] (64-byte aligned)
 
   void Resize(int block_m, int block_n, int head_dim) {
     qk_block.resize(block_m * block_n);
@@ -57,6 +62,8 @@ struct FlashAttentionScratch {
     new_max.resize(block_m);
     exp_diff.resize(block_m);
     o_block.resize(block_m * head_dim);
+    alpha_buf.resize(block_m);
+    beta_buf.resize(block_m);
   }
 };
 
@@ -94,7 +101,7 @@ inline void FlashAttentionForward(const float *Q, const float *K,
   std::vector<float> L(seq_len_q, 0.0f);   // Cumulative sum of exp
   std::vector<float> M(seq_len_q, -1e10f); // Max value seen so far
 
-  // Process in tiles
+  // Process in tiles (outer KV loop for better cache locality)
   for (int j = 0; j < seq_len_kv; j += Bc) {
     const int kv_end = std::min(j + Bc, seq_len_kv);
     const int kv_len = kv_end - j;
@@ -109,71 +116,68 @@ inline void FlashAttentionForward(const float *Q, const float *K,
         continue;
       }
 
-      // Compute Q @ K^T for this tile
-      // S_ij = Q[i:i+Br] @ K[j:j+Bc]^T / sqrt(d)
-      for (int qi = 0; qi < q_len; qi++) {
-        for (int ki = 0; ki < kv_len; ki++) {
-          // Causal mask: skip future positions
-          if (config.causal && (j + ki) > (i + qi)) {
-            scratch.qk_block[qi * Bc + ki] = -1e10f;
-          } else {
-            float dot = simd::DotF32(Q + (i + qi) * head_dim,
-                                     K + (j + ki) * head_dim, head_dim);
-            scratch.qk_block[qi * Bc + ki] = dot * scale;
-          }
-        }
+      // Step 1: Compute Q @ K^T for this tile
+      // S_ij = Q[i:i+Br] @ K[j:j+Bc]^T * scale
+      simd::ComputeQK_AVX512(Q + i * head_dim, K + j * head_dim,
+                             scratch.qk_block.data(), q_len, kv_len, head_dim,
+                             scale);
+
+      // Step 2: Apply causal mask (vectorized)
+      if (config.causal) {
+        simd::ApplyMask_AVX512(scratch.qk_block.data(), i, j, q_len, kv_len);
       }
 
-      // Online softmax update
+      // Step 3: Online softmax update (vectorized)
+      bool first_kv_block = (j == 0);
+
+      // Reuse scratch buffers for block_max/block_sum (no heap allocation)
+      float *block_max = scratch.row_max.data();
+      float *block_sum = scratch.row_sum.data();
+
+      // Copy relevant portion of global stats
+      for (int qi = 0; qi < q_len; qi++) {
+        block_max[qi] = M[i + qi];
+        block_sum[qi] = L[i + qi];
+      }
+
+      simd::SoftmaxBlock_AVX512(scratch.qk_block.data(), block_max, block_sum,
+                                q_len, kv_len, first_kv_block);
+
+      // Step 4: Compute P @ V for this tile
+      // pv[qi] = sum_ki(softmax[qi, ki] * V[j + ki])
+      memset(scratch.pv_block.data(), 0, q_len * head_dim * sizeof(float));
+      simd::ComputePV_AVX512(scratch.qk_block.data(), V + j * head_dim,
+                             scratch.pv_block.data(), q_len, kv_len, head_dim);
+
+      // Step 5: Update output with rescaling
+      // O = (alpha * L * O + pv) / L_new
+      float *alpha_ptr = scratch.alpha_buf.data();
+      float *beta_ptr = scratch.beta_buf.data();
+
       for (int qi = 0; qi < q_len; qi++) {
         const int global_qi = i + qi;
-        float *qk_row = scratch.qk_block.data() + qi * Bc;
 
-        // Find local max
-        float local_max = simd::MaxF32(qk_row, kv_len);
-
-        // New global max
-        float m_new = std::max(M[global_qi], local_max);
-
-        // Compute exp(qk - new_max) and local sum
-        float local_sum = 0.0f;
-        for (int ki = 0; ki < kv_len; ki++) {
-          qk_row[ki] = expf(qk_row[ki] - m_new);
-          local_sum += qk_row[ki];
-        }
+        float m_old = M[global_qi];
+        float m_new = block_max[qi];
+        float L_old = L[global_qi];
+        float L_new = block_sum[qi];
 
         // Rescale factor for previous accumulator
-        float alpha = expf(M[global_qi] - m_new);
+        float alpha_val =
+            (L_old > 0) ? (expf(m_old - m_new) * L_old / L_new) : 0.0f;
+        float beta_val = 1.0f / L_new;
 
-        // Update running sum: L = alpha * L + local_sum
-        float L_new = alpha * L[global_qi] + local_sum;
-
-        // Compute P @ V for this tile
-        // pv[qi] = sum_ki(softmax[qi, ki] * V[j + ki])
-        float *pv_row = scratch.pv_block.data() + qi * head_dim;
-        memset(pv_row, 0, head_dim * sizeof(float));
-        for (int ki = 0; ki < kv_len; ki++) {
-          float p = qk_row[ki];
-          const float *v_row = V + (j + ki) * head_dim;
-          for (int d = 0; d < head_dim; d++) {
-            pv_row[d] += p * v_row[d];
-          }
-        }
-
-        // Update output: O = (alpha * L * O + pv) / L_new
-        float *o_row = O + global_qi * head_dim;
-        float factor =
-            (L[global_qi] > 0) ? (alpha * L[global_qi] / L_new) : 0.0f;
-        float pv_factor = 1.0f / L_new;
-
-        for (int d = 0; d < head_dim; d++) {
-          o_row[d] = factor * o_row[d] + pv_factor * pv_row[d];
-        }
+        alpha_ptr[qi] = alpha_val;
+        beta_ptr[qi] = beta_val;
 
         // Update running stats
         M[global_qi] = m_new;
         L[global_qi] = L_new;
       }
+
+      // Apply rescaling with vectorized kernel
+      simd::UpdateOutput_AVX512(O + i * head_dim, scratch.pv_block.data(),
+                                alpha_ptr, beta_ptr, q_len, head_dim);
     }
   }
 }
@@ -185,33 +189,46 @@ inline void FlashAttentionForward(const float *Q, const float *K,
  * @param K Key [batch, n_head, seq_len_kv, head_dim]
  * @param V Value [batch, n_head, seq_len_kv, head_dim]
  * @param O Output [batch, n_head, seq_len_q, head_dim]
+ * @param ith Thread index (0-based) for work partitioning
+ * @param nth Total number of threads for work partitioning
+ *
+ * Threading Model:
+ * - Work is partitioned across threads using ith/nth pattern
+ * - For GGML callbacks: ith/nth are provided by GGML's thread pool
+ * - For standalone usage: defaults ith=0, nth=1 (single-threaded)
  */
 inline void FlashAttentionBatched(const float *Q, const float *K,
                                   const float *V, float *O, int batch,
                                   int n_head, int seq_len_q, int seq_len_kv,
                                   int head_dim,
-                                  const FlashAttentionConfig &config) {
+                                  const FlashAttentionConfig &config,
+                                  int ith = 0, int nth = 1) {
   const int head_stride_q = seq_len_q * head_dim;
   const int head_stride_kv = seq_len_kv * head_dim;
   const int batch_stride_q = n_head * head_stride_q;
   const int batch_stride_kv = n_head * head_stride_kv;
 
+  // Thread-local scratch buffer
   FlashAttentionScratch scratch;
   scratch.Resize(config.block_m, config.block_n, head_dim);
 
-// Process each batch and head
-#pragma omp parallel for collapse(2) if (config.num_threads > 1)               \
-    firstprivate(scratch)
-  for (int b = 0; b < batch; b++) {
-    for (int h = 0; h < n_head; h++) {
-      const float *q_ptr = Q + b * batch_stride_q + h * head_stride_q;
-      const float *k_ptr = K + b * batch_stride_kv + h * head_stride_kv;
-      const float *v_ptr = V + b * batch_stride_kv + h * head_stride_kv;
-      float *o_ptr = O + b * batch_stride_q + h * head_stride_q;
+  // Work partitioning: flatten batch × head loop and distribute across threads
+  const int total_work = batch * n_head;
+  const int work_per_thread = (total_work + nth - 1) / nth;
+  const int work_start = ith * work_per_thread;
+  const int work_end = std::min(work_start + work_per_thread, total_work);
 
-      FlashAttentionForward(q_ptr, k_ptr, v_ptr, o_ptr, seq_len_q, seq_len_kv,
-                            head_dim, config, scratch);
-    }
+  for (int idx = work_start; idx < work_end; idx++) {
+    const int b = idx / n_head;
+    const int h = idx % n_head;
+
+    const float *q_ptr = Q + b * batch_stride_q + h * head_stride_q;
+    const float *k_ptr = K + b * batch_stride_kv + h * head_stride_kv;
+    const float *v_ptr = V + b * batch_stride_kv + h * head_stride_kv;
+    float *o_ptr = O + b * batch_stride_q + h * head_stride_q;
+
+    FlashAttentionForward(q_ptr, k_ptr, v_ptr, o_ptr, seq_len_q, seq_len_kv,
+                          head_dim, config, scratch);
   }
 }
 
@@ -221,34 +238,42 @@ inline void FlashAttentionBatched(const float *Q, const float *K,
  *
  * @param n_head_q Number of query heads
  * @param n_head_kv Number of key/value heads (must divide n_head_q)
+ * @param ith Thread index (0-based) for work partitioning
+ * @param nth Total number of threads for work partitioning
  */
 inline void FlashAttentionGQA(const float *Q, const float *K, const float *V,
                               float *O, int batch, int n_head_q, int n_head_kv,
                               int seq_len_q, int seq_len_kv, int head_dim,
-                              const FlashAttentionConfig &config) {
+                              const FlashAttentionConfig &config, int ith = 0,
+                              int nth = 1) {
   const int n_rep = n_head_q / n_head_kv; // KV head repetition factor
   const int head_stride_q = seq_len_q * head_dim;
   const int head_stride_kv = seq_len_kv * head_dim;
   const int batch_stride_q = n_head_q * head_stride_q;
   const int batch_stride_kv = n_head_kv * head_stride_kv;
 
+  // Thread-local scratch buffer
   FlashAttentionScratch scratch;
   scratch.Resize(config.block_m, config.block_n, head_dim);
 
-#pragma omp parallel for collapse(2) if (config.num_threads > 1)               \
-    firstprivate(scratch)
-  for (int b = 0; b < batch; b++) {
-    for (int h = 0; h < n_head_q; h++) {
-      const int kv_head = h / n_rep; // Which KV head to use
+  // Work partitioning: flatten batch × n_head_q loop and distribute
+  const int total_work = batch * n_head_q;
+  const int work_per_thread = (total_work + nth - 1) / nth;
+  const int work_start = ith * work_per_thread;
+  const int work_end = std::min(work_start + work_per_thread, total_work);
 
-      const float *q_ptr = Q + b * batch_stride_q + h * head_stride_q;
-      const float *k_ptr = K + b * batch_stride_kv + kv_head * head_stride_kv;
-      const float *v_ptr = V + b * batch_stride_kv + kv_head * head_stride_kv;
-      float *o_ptr = O + b * batch_stride_q + h * head_stride_q;
+  for (int idx = work_start; idx < work_end; idx++) {
+    const int b = idx / n_head_q;
+    const int h = idx % n_head_q;
+    const int kv_head = h / n_rep; // Which KV head to use
 
-      FlashAttentionForward(q_ptr, k_ptr, v_ptr, o_ptr, seq_len_q, seq_len_kv,
-                            head_dim, config, scratch);
-    }
+    const float *q_ptr = Q + b * batch_stride_q + h * head_stride_q;
+    const float *k_ptr = K + b * batch_stride_kv + kv_head * head_stride_kv;
+    const float *v_ptr = V + b * batch_stride_kv + kv_head * head_stride_kv;
+    float *o_ptr = O + b * batch_stride_q + h * head_stride_q;
+
+    FlashAttentionForward(q_ptr, k_ptr, v_ptr, o_ptr, seq_len_q, seq_len_kv,
+                          head_dim, config, scratch);
   }
 }
 

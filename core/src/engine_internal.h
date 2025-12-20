@@ -5,6 +5,7 @@
 #include "embedding.h"
 #include "inference.h"
 #include "kv_cache.h"
+#include "lockfree_queue.h" // Lock-free sharded priority queue
 #include "model_loader.h"
 #include "model_types.h"
 #include "scheduler.h"
@@ -292,6 +293,9 @@ struct EngineState {
   // NUMA binding configuration (-1 = auto, >= 0 = specific node)
   int numa_node_id = -1;
 
+  // Number of threads for compute (0 = auto-detect)
+  int n_threads = 0;
+
   // Thread pinning policy for compute threads
   // 0 = SCATTER (maximize L3/bandwidth, best for latency-sensitive single-user)
   // 1 = COMPACT (share L2, leave room for other processes, best for throughput)
@@ -300,19 +304,25 @@ struct EngineState {
   // Advanced scheduler (vLLM-style)
   std::unique_ptr<densecore::Scheduler> scheduler; // Smart pointer ownership
 
-  // Request queues
-  // Note: priority_queue stores raw pointers, actual ownership in request_pool
-  std::priority_queue<Request *, std::vector<Request *>,
-                      RequestPriorityComparator>
-      pending_requests;
+  // ===========================================================================
+  // Lock-Free Request Queue (replaces mutex-protected priority_queue)
+  // ===========================================================================
+  // Uses sharded FIFO queues per priority tier with tagged pointer ABA
+  // protection. Much lower contention than mutex under high concurrency.
+  // ===========================================================================
+  densecore::ShardedPriorityQueue<Request> pending_requests;
 
   std::vector<Request *> active_requests; // Non-owning pointers
 
   // Object Pool for requests (thread-safe)
   ObjectPool<Request> request_pool;
 
-  std::mutex queue_mu;
+  // Mutex only for active_requests (rarely contested, not on hot path)
+  std::mutex active_mu;
+  // Condition variable for blocking wait when queue is empty
   std::condition_variable queue_cv;
+  std::mutex cv_mu; // Mutex for condition variable (required by
+                    // std::condition_variable)
 
   // Worker thread
   std::thread worker_thread;
@@ -343,7 +353,13 @@ struct EngineState {
 
   void InitComputeBuffer() {
     if (!compute_buffer_initialized) {
-      compute_buffer = std::make_unique<char[]>(COMPUTE_BUFFER_SIZE);
+      // Use 64-byte alignment for AVX-512 compatibility
+      void *ptr = nullptr;
+      if (posix_memalign(&ptr, 64, COMPUTE_BUFFER_SIZE) != 0) {
+        throw std::bad_alloc();
+      }
+      // Custom deleter for unique_ptr to handle free() instead of delete[]
+      compute_buffer.reset(static_cast<char *>(ptr));
       compute_buffer_initialized = true;
     }
   }
@@ -352,11 +368,13 @@ struct EngineState {
     // Initialize persistent graph context (holds node definitions)
     // 16MB should be enough for graph topology metadata
     struct ggml_init_params params = {
-        .mem_size = 16 * 1024 * 1024,
+        .mem_size = 512 * 1024 * 1024, // 512 MB for complex graph caching
         .mem_buffer = nullptr,
         .no_alloc = false,
     };
     graph_ctx = ggml_init(params);
+    std::cerr << "[DenseCore] InitGraphCache: Context initialized with 512 MB"
+              << std::endl;
   }
 
   void FreeGraphCache() {
@@ -442,7 +460,7 @@ struct EngineState {
 
     while (true) {
       {
-        std::lock_guard<std::mutex> lock(queue_mu);
+        std::lock_guard<std::mutex> lock(active_mu);
         if (active_requests.empty()) {
           LOG_INFO("All active requests drained successfully.");
           break;
@@ -451,7 +469,7 @@ struct EngineState {
 
       auto elapsed = std::chrono::steady_clock::now() - start_time;
       if (elapsed >= kShutdownTimeout) {
-        std::lock_guard<std::mutex> lock(queue_mu);
+        std::lock_guard<std::mutex> lock(active_mu);
         LOG_WARNING("Shutdown timeout after 5 seconds. Force-killing ",
                     active_requests.size(), " active requests.");
         // Mark remaining requests as finished to allow cleanup
