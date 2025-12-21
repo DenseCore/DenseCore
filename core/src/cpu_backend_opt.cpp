@@ -69,9 +69,8 @@ static void ConfigTiles(int rows, int col_bytes, int K_bytes) {
   _tile_loadconfig(&cfg);
 }
 
-__attribute__((target("amx-tile,amx-int8,amx-bf16"))) void
-densecore::CpuBackend::MatMulAMX(const TensorView &A, const TensorView &B,
-                                 TensorView &C) {
+void densecore::CpuBackend::MatMulAMX(const TensorView &A, const TensorView &B,
+                                      TensorView &C) {
 #if defined(__AMX_TILE__) && defined(__AMX_BF16__)
   // 1. Request OS Permission (once)
   static bool amx_ready = RequestAMXPermission();
