@@ -5,6 +5,8 @@ bin/
 # Third-party dependencies (downloaded by scripts)
 core/third_party/
 
+workspace/
+
 # C++ build artifacts
 *.o
 *.so
