@@ -247,7 +247,9 @@ def _find_library() -> str:
         Path(__file__).parent / "lib",
         Path(__file__).parent.parent,
         Path(__file__).parent.parent.parent / "build",
-        Path(__file__).parent.parent.parent / "core" / "build",  # Added: correctly locate core build artifacts
+        Path(__file__).parent.parent.parent
+        / "core"
+        / "build",  # Added: correctly locate core build artifacts
         Path("/usr/local/lib"),
         Path("/usr/lib"),
     ]
@@ -368,7 +370,9 @@ class DenseCore:
             self._init_tokenizer(hf_repo_id)
 
         # Initialize native engine (allocates large memory pools)
+        print(f"[DEBUG] Calling InitEngine with model: {model_path}")
         self._handle = self._lib.InitEngine(model_path_bytes, None, threads)
+        print(f"[DEBUG] InitEngine returned handle: {self._handle}")
         if not self._handle:
             raise RuntimeError(f"Failed to initialize DenseCore engine for model: {model_path}")
 
@@ -510,6 +514,7 @@ class DenseCore:
         """Initialize tokenizer from HuggingFace repo."""
         try:
             from transformers import AutoTokenizer
+
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(hf_repo_id)
                 if self._verbose:
@@ -517,11 +522,11 @@ class DenseCore:
             except Exception as e:
                 # If verbose is not available (it's called verbose in __init__ but _verbose here? check context)
                 # Engine has self.verbose. Constructor sets self.verbose.
-                if getattr(self, 'verbose', False):
-                     print(f"[DenseCore] Warning: Failed to load tokenizer from {hf_repo_id}: {e}")
+                if getattr(self, "verbose", False):
+                    print(f"[DenseCore] Warning: Failed to load tokenizer from {hf_repo_id}: {e}")
                 self.tokenizer = None
         except ImportError as e:
-            if getattr(self, '_verbose', False):
+            if getattr(self, "_verbose", False):
                 print(f"[DenseCore] transformers load failed: {e}")
                 print("[DenseCore] tokenizer disabled")
         except Exception as e:
@@ -565,6 +570,7 @@ class DenseCore:
             handler(token_str, finished)
         except Exception as e:
             import traceback
+
             error_msg = f"Error in callback handler for req {req_id}: {e}\n{traceback.format_exc()}"
             print(f"[DenseCore] {error_msg}")
             warnings.warn(error_msg)
@@ -939,7 +945,7 @@ class DenseCore:
         Example:
             >>> for token in model.stream("Tell me a story"):
             ...     print(token, end="", flush=True)
-            
+
             >>> # With pre-tokenized input
             >>> token_ids = [1, 2, 3, 4, 5]
             >>> for token in model.stream(token_ids, max_tokens=50):
@@ -978,13 +984,11 @@ class DenseCore:
 
             ret = self._submit_request(prompt, max_tokens, req_id)
 
-
         if ret < 0:
             with self._lock:
                 self._requests.pop(req_id, None)
                 self._active_ctypes_refs.pop(req_id, None)
             raise RuntimeError(f"Failed to submit request: error code {ret}")
-
 
         while True:
             token, finished = result_queue.get()

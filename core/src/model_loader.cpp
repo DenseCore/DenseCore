@@ -148,6 +148,19 @@ TransformerModel *LoadGGUFModel(const char *path) {
 
   std::cout << "[DenseCore] Detected architecture: " << arch << std::endl;
 
+  // Set architecture enum and flags from detected string
+  if (arch == "llama") {
+    model->arch = ModelArch::LLAMA;
+  } else if (arch == "qwen2") {
+    model->arch = ModelArch::QWEN2;
+  } else if (arch == "qwen3") {
+    model->arch = ModelArch::QWEN3;
+    model->arch_flags.requires_q_norm = true;
+    model->arch_flags.requires_k_norm = true;
+  } else {
+    model->arch = ModelArch::UNKNOWN;
+  }
+
   // 2. Generic parameter loader using architecture prefix
   auto get_u32 = [&](const std::string &suffix, uint32_t &val) {
     // Try architecture-specific key first, then fallback to general
@@ -437,6 +450,39 @@ TransformerModel *LoadGGUFModel(const char *path) {
   std::cout << "[DenseCore] Head dimensions: n_embd_head_k="
             << model->hparams.n_embd_head_k
             << ", n_embd_head_v=" << model->hparams.n_embd_head_v << std::endl;
+
+  // =========================================================================
+  // QWEN3 ARCHITECTURE VALIDATION
+  // =========================================================================
+  // Qwen3 requires per-head Q/K normalization. If these tensors are missing,
+  // the model will produce incorrect outputs. Fail fast instead of silently
+  // corrupting results.
+  // =========================================================================
+  if (model->arch == ModelArch::QWEN3) {
+    bool has_qk_norms = true;
+    for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
+      if (!model->layers[i].attn_q_norm || !model->layers[i].attn_k_norm) {
+        has_qk_norms = false;
+        break;
+      }
+    }
+    if (!has_qk_norms) {
+      std::cerr << "[DenseCore] FATAL: Qwen3 model requires attn_q_norm and "
+                << "attn_k_norm tensors, but they are missing from GGUF file."
+                << std::endl;
+      std::cerr << "[DenseCore] This is a corrupted or incompatible GGUF. "
+                << "Aborting load to prevent incorrect outputs." << std::endl;
+      if (model->backend)
+        ggml_backend_free(model->backend);
+      gguf_free(ctx_gguf);
+      if (ctx_w)
+        ggml_free(ctx_w);
+      delete model;
+      return nullptr;
+    }
+    std::cout << "[DenseCore] Qwen3 architecture validated: Q/K norms present"
+              << std::endl;
+  }
 
   // Initialize pre-computed RoPE table for optimized inference
   std::cout << "[DenseCore] Initializing RoPE table..." << std::endl;

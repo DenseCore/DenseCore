@@ -149,6 +149,8 @@ void EngineLoop(EngineState *state) {
         });
       }
 
+      // std::cerr << "[DEBUG] EngineLoop: Woke up" << std::endl;
+
       // Check if draining and all work is done
       if (state->status == EngineStatus::DRAINING) {
         std::lock_guard<std::mutex> active_lock(state->active_mu);
@@ -166,6 +168,9 @@ void EngineLoop(EngineState *state) {
           Request *req = state->pending_requests.Pop();
           if (!req)
             break; // Queue empty
+
+          // std::cerr << "[DEBUG] EngineLoop: Popped request " << req->id
+          //           << std::endl;
 
           // Check if cancelled before even starting
           if (req->cancelled) {
@@ -189,8 +194,11 @@ void EngineLoop(EngineState *state) {
                       << std::endl;
             req->finished = true;
             state->metrics.failed_requests++;
-            if (req->callback)
-              req->callback("Error: Missing tokens", 1, req->user_data);
+            // Push error event to callback queue (instead of direct callback)
+            if (req->callback) {
+              PushResultEvent(state, req->id, "Error: Missing tokens", true,
+                              true, req->callback, req->user_data);
+            }
             state->request_pool.Release(req);
             continue;
           }
@@ -207,8 +215,11 @@ void EngineLoop(EngineState *state) {
                       << std::endl;
             req->finished = true;
             state->metrics.failed_requests++;
-            if (req->callback)
-              req->callback("Error: Scheduler queue full", 1, req->user_data);
+            // Push error event to callback queue (instead of direct callback)
+            if (req->callback) {
+              PushResultEvent(state, req->id, "Error: Scheduler queue full",
+                              true, true, req->callback, req->user_data);
+            }
             state->request_pool.Release(req);
             continue;
           }
@@ -221,6 +232,8 @@ void EngineLoop(EngineState *state) {
           state->active_requests.push_back(req);
           state->metrics.active_requests++;
           state->metrics.total_requests++;
+          std::cerr << "[TRACE] Request " << req->id << " moved to active"
+                    << std::endl;
         }
       }
 
@@ -246,8 +259,11 @@ void EngineLoop(EngineState *state) {
             LOG_INFO("Cancelling active request: ", req->id);
             req->finished = true;
             state->metrics.failed_requests++;
+            // Push cancellation event to callback queue (instead of direct
+            // callback)
             if (req->callback) {
-              req->callback("Error: Request cancelled", 1, req->user_data);
+              PushResultEvent(state, req->id, "Error: Request cancelled", true,
+                              true, req->callback, req->user_data);
             }
             // Remove from scheduler using stored seq_id (O(1) instead of O(n))
             if (req->seq_id >= 0) {
@@ -267,7 +283,13 @@ void EngineLoop(EngineState *state) {
       }
 
       // 3. Query Scheduler for next batch
+      // std::cerr << "[DEBUG] EngineLoop: Calling Scheduler->Schedule()"
+      //           << std::endl;
       densecore::SchedulerOutput sched_output = state->scheduler->Schedule();
+      // std::cerr << "[DEBUG] EngineLoop: Schedule returned "
+      //           << sched_output.prefill_seq_ids.size() << " prefill, "
+      //           << sched_output.decode_seq_ids.size() << " decode" <<
+      //           std::endl;
 
       // 4. Handle scheduler output: block allocations
       for (const auto &alloc : sched_output.new_block_allocations) {
@@ -362,6 +384,9 @@ void EngineLoop(EngineState *state) {
           continue;
 
         Request *req = req_it->second;
+        std::cerr << "[TRACE] Prefill loop: Found request " << req->id
+                  << " for seq " << seq_id << " (finished=" << req->finished
+                  << ")" << std::endl;
         if (req->finished)
           continue;
 
@@ -398,6 +423,9 @@ void EngineLoop(EngineState *state) {
           continue;
 
         Request *req = req_it->second;
+        std::cerr << "[TRACE] Decode loop: Found request " << req->id
+                  << " for seq " << seq_id << " (finished=" << req->finished
+                  << ")" << std::endl;
         if (req->finished)
           continue;
 
@@ -419,8 +447,10 @@ void EngineLoop(EngineState *state) {
         batch_requests.push_back(req);
       }
 
-      if (batch_requests.empty())
+      if (batch_requests.empty()) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
         continue;
+      }
 
       batch.num_seqs = batch_requests.size();
 
@@ -524,7 +554,13 @@ void EngineLoop(EngineState *state) {
       // =========================================================================
       ggml_backend_cpu_set_n_threads(current_model->backend, state->n_threads);
 
+      // std::cerr << "[DEBUG] EngineLoop: Calling ggml_backend_graph_compute"
+      //           << std::endl;
       ggml_backend_graph_compute(current_model->backend, gf);
+      std::cerr << "[TRACE] Graph compute done for batch size "
+                << batch.num_seqs << std::endl;
+      // std::cerr << "[DEBUG] EngineLoop: ggml_backend_graph_compute returned"
+      //           << std::endl;
 
       // Note: GGML's thread pool join provides acquire semantics.
       // No explicit fence needed to see results.
@@ -535,6 +571,8 @@ void EngineLoop(EngineState *state) {
 
       for (int i = 0; i < batch.num_seqs; ++i) {
         Request *req = batch_requests[i];
+        std::cerr << "[DEBUG] EngineLoop: Processing output for request "
+                  << req->id << std::endl;
         int processed_count = 0;
         if (req->is_prefill)
           processed_count = req->tokens.size();
@@ -575,8 +613,11 @@ void EngineLoop(EngineState *state) {
             densecore::simd::NormalizeL2(embedding.data(), n_embd);
           }
 
+          // Push embedding result to callback queue (RAII-safe via std::move)
           if (req->embedding_callback) {
-            req->embedding_callback(embedding.data(), n_embd, req->user_data);
+            // Move the embedding vector directly - no manual allocation needed
+            PushEmbeddingResultEvent(state, req->id, std::move(embedding),
+                                     req->embedding_callback, req->user_data);
           }
           req->finished = true;
 
@@ -614,6 +655,8 @@ void EngineLoop(EngineState *state) {
           }
 
           int best_token = SampleToken(output, last_token_idx, sampling_params);
+          std::cerr << "[TRACE] Sampled token " << best_token << " for request "
+                    << req->id << std::endl;
 
           req->tokens.clear();
           req->tokens.push_back(best_token);
@@ -627,42 +670,16 @@ void EngineLoop(EngineState *state) {
           }
 
           // =========================================================================
-          // CALLBACK INVOCATION (Exception-Safe - Zombie Leak Prevention)
+          // TOKEN STREAMING VIA CALLBACK QUEUE (GIL-Free Hot Path)
           // =========================================================================
-          // Track callback exceptions to force cleanup. Without this,
-          // exceptions would skip RemoveRequest(), leaving the request in
-          // scheduler forever.
+          // Push token to callback queue instead of invoking callback directly.
+          // This prevents the worker thread from blocking on Python GIL.
           // =========================================================================
-          bool callback_exception = false;
           if (req->callback) {
-            try {
-              req->callback(token_str.c_str(), 0, req->user_data);
-            } catch (...) {
-              std::cerr << "[DenseCore] ERROR: Exception in request callback ("
-                        << req->id << ")" << std::endl;
-              callback_exception = true;
-            }
-          }
-
-          // Force cleanup on callback exception (prevents zombie requests)
-          if (callback_exception) {
-            req->finished = true;
-            state->metrics.failed_requests++;
-            // Free blocks and remove from scheduler
-            current_kv_cache->block_manager->Free(req->block_table);
-            req->block_table.clear();
-            // Cleanup using stored seq_id (O(1) instead of O(n))
-            if (req->seq_id >= 0) {
-              state->scheduler->RemoveRequest(req->seq_id, false);
-              seq_to_request.erase(req->seq_id);
-            }
-            {
-              std::lock_guard<std::mutex> lk(req->mu);
-              req->cv.notify_all();
-            }
-            // Skip rest of generation logic for this request
-            token_offset += processed_count;
-            continue;
+            std::cerr << "[TRACE] Pushing result for request " << req->id
+                      << std::endl;
+            PushResultEvent(state, req->id, token_str, false, false,
+                            req->callback, req->user_data);
           }
 
           state->metrics.total_tokens_generated++;
@@ -696,8 +713,11 @@ void EngineLoop(EngineState *state) {
               req->finished = true;
               state->metrics.oom_errors++;
               state->metrics.failed_requests++;
-              if (req->callback)
-                req->callback("Error: Out of memory", 1, req->user_data);
+              // Push OOM error to callback queue (instead of direct callback)
+              if (req->callback) {
+                PushResultEvent(state, req->id, "Error: Out of memory", true,
+                                true, req->callback, req->user_data);
+              }
               break;
             }
             req->block_table.push_back(new_blocks[0]);
@@ -708,8 +728,12 @@ void EngineLoop(EngineState *state) {
               req->generated_count >= req->max_tokens) {
             req->finished = true;
             state->metrics.completed_requests++;
-            if (req->callback)
-              req->callback("", 1, req->user_data);
+            // Push finished signal to callback queue (instead of direct
+            // callback)
+            if (req->callback) {
+              PushResultEvent(state, req->id, "", true, false, req->callback,
+                              req->user_data);
+            }
             {
               std::lock_guard<std::mutex> lk(req->mu);
               req->cv.notify_all();

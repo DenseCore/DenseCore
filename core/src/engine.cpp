@@ -40,7 +40,8 @@ int SubmitEmbeddingRequestEx(DenseCoreHandle handle, const char *prompt,
     return -1;
   }
 
-  Request *req = new Request();
+  Request *req = state->request_pool.Acquire();
+  req->Reset();
   static std::atomic<int> global_req_id{1};
   req->id = global_req_id.fetch_add(1);
 
@@ -250,9 +251,13 @@ DENSECORE_API DenseCoreHandle InitEngine(const char *model_path,
     // Initialize compute buffer (Persistent, Aligned)
     state->InitComputeBuffer();
 
-    // Start background thread
+    // Start background threads
     state->status = EngineStatus::RUNNING;
     state->worker_thread = std::thread(EngineLoop, state);
+    state->callback_thread = std::thread(CallbackLoop, state);
+
+    std::cout << "[DenseCore] Started worker thread and callback thread"
+              << std::endl;
 
     return (DenseCoreHandle)state;
   } catch (const std::exception &e) {
@@ -262,6 +267,76 @@ DENSECORE_API DenseCoreHandle InitEngine(const char *model_path,
   } catch (...) {
     std::cerr << "[DenseCore] Unknown exception in InitEngine" << std::endl;
     return nullptr;
+  }
+}
+
+/**
+ * CallbackLoop - Dedicated thread for callback execution.
+ *
+ * This function runs on a dedicated thread to execute callbacks without
+ * blocking the worker thread. It waits on result_cv for new ResultEvents,
+ * pops events from the result_queue, and executes the callbacks.
+ *
+ * This decoupling prevents the Python GIL from blocking the inference
+ * hot path, resolving the streaming deadlock.
+ */
+void CallbackLoop(EngineState *state) {
+  try {
+    while (true) {
+      ResultEvent event;
+      {
+        std::unique_lock<std::mutex> lock(state->result_mu);
+        state->result_cv.wait(lock, [state]() {
+          return !state->result_queue.empty() ||
+                 state->status == EngineStatus::STOPPED;
+        });
+
+        // Check exit condition: STOPPED and queue empty
+        if (state->result_queue.empty() &&
+            state->status == EngineStatus::STOPPED) {
+          break; // Exit: shutdown complete
+        }
+
+        if (state->result_queue.empty())
+          continue;
+
+        event = std::move(state->result_queue.front());
+        state->result_queue.pop_front();
+      }
+
+      std::cerr << "[TRACE] CallbackLoop popped event for request "
+                << event.request_id << " (finished=" << event.finished << ")"
+                << std::endl;
+
+      // Execute callback OUTSIDE the lock (GIL acquisition happens here)
+      // This is the ONLY place callbacks should be invoked!
+      try {
+        if (event.callback) {
+          event.callback(event.token_str.c_str(),
+                         event.finished ? 1 : (event.error ? 1 : 0),
+                         event.user_data);
+        } else if (event.emb_callback && !event.embedding_data.empty()) {
+          event.emb_callback(event.embedding_data.data(),
+                             static_cast<int>(event.embedding_data.size()),
+                             event.user_data);
+          // Note: embedding_data is RAII-managed by std::vector, no manual free
+        }
+      } catch (const std::exception &e) {
+        std::cerr << "[DenseCore] Exception in callback (request "
+                  << event.request_id << "): " << e.what() << std::endl;
+      } catch (...) {
+        std::cerr << "[DenseCore] Unknown exception in callback (request "
+                  << event.request_id << ")" << std::endl;
+      }
+    }
+
+    std::cerr << "[DenseCore] CallbackLoop exiting" << std::endl;
+  } catch (const std::exception &e) {
+    std::cerr << "[DenseCore] CallbackLoop thread exception: " << e.what()
+              << std::endl;
+  } catch (...) {
+    std::cerr << "[DenseCore] CallbackLoop thread unknown exception"
+              << std::endl;
   }
 }
 
@@ -279,6 +354,7 @@ int SubmitRequest(DenseCoreHandle handle, const char *prompt, int max_tokens,
   }
 
   Request *req = state->request_pool.Acquire();
+  req->Reset();
   static std::atomic<int> global_req_id{1};
   req->id = global_req_id.fetch_add(1);
 
@@ -322,6 +398,7 @@ int SubmitRequestIds(DenseCoreHandle handle, const int *tokens, int n_tokens,
   EngineState *state = (EngineState *)handle;
 
   Request *req = state->request_pool.Acquire();
+  req->Reset();
   static std::atomic<int> global_req_id{1};
   req->id = global_req_id.fetch_add(1);
 
@@ -372,6 +449,7 @@ int SubmitRequestWithFormat(DenseCoreHandle handle, const char *prompt,
   }
 
   Request *req = state->request_pool.Acquire();
+  req->Reset();
   static std::atomic<int> global_req_id{1};
   req->id = global_req_id.fetch_add(1);
 

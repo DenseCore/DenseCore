@@ -132,6 +132,11 @@ AlignedPtr<T> make_aligned(size_t count, size_t alignment = DEFAULT_ALIGNMENT) {
   return AlignedPtr<T>(ptr);
 }
 
+class DeviceAllocator {
+    virtual void* Allocate(size_t size) = 0;
+    virtual void CopyToDevice(void* dst, const void* src, size_t size) = 0;
+};
+
 // =============================================================================
 // STL-Compatible Allocator
 // =============================================================================

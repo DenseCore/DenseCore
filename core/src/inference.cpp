@@ -816,14 +816,16 @@ struct GemvUserData {
 };
 
 // Thread-local pool for GEMV userdata
-static constexpr int kMaxGemvUserDataSlots = 128;
+// MUST be large enough for all mul_mat ops in a single graph (deep models >
+// 128)
+static constexpr int kMaxGemvUserDataSlots = 2048;
 static thread_local GemvUserData g_gemv_userdata_pool[kMaxGemvUserDataSlots];
 static thread_local int g_gemv_userdata_index = 0;
 
 // =============================================================================
 // Thread-local buffer for pre-quantized input (Q8_K format)
 // =============================================================================
-static constexpr size_t kMaxQuantInputBufferSize = 16384;
+static constexpr size_t kMaxQuantInputBufferSize = 65536; // 64KB for large N
 alignas(64) static thread_local uint8_t
     g_quant_input_buffer[kMaxQuantInputBufferSize];
 
@@ -838,24 +840,59 @@ inline GemvUserData *GetGemvUserData() {
 
 /**
  * Custom callback for parallel GEMV (decode-phase)
+ *
+ * REFACTORED: Uses GGML_OP_CUSTOM signature to allow output tensor shape
+ * to be independent of input tensor shape. This fixes memory corruption
+ * when Qwen3 projections change dimensions (e.g., 1024 -> 2048).
+ *
+ * Signature: void (*)(struct ggml_tensor *dst, int ith, int nth, void
+ * *userdata) Input tensor accessed via dst->src[0]
  */
-void cb_gemv_parallel(struct ggml_tensor *dst, const struct ggml_tensor *src,
-                      int ith, int nth, void *userdata) {
+void cb_gemv_custom(struct ggml_tensor *dst, int ith, int nth, void *userdata) {
   auto *ud = static_cast<GemvUserData *>(userdata);
   if (!ud || !ud->weight_tensor)
     return;
 
+  // Extract input tensor from dst->src[0] (GGML_OP_CUSTOM convention)
+  const struct ggml_tensor *src = dst->src[0];
+  if (!src)
+    return;
+
+  // Extract weight tensor from dst->src[1] (reliable graph topology, not
+  // userdata)
+  const struct ggml_tensor *weight_tensor = dst->src[1];
+  if (!weight_tensor || !weight_tensor->data) {
+    fprintf(stderr, "CRITICAL: GEMV weight tensor is null or has no data\n");
+    return;
+  }
+
   // Get data pointers at runtime (guaranteed valid after GGML allocates)
   const float *x_f32 = reinterpret_cast<const float *>(src->data);
-  const void *weight_data = ud->weight_tensor->data;
+  const void *weight_data = weight_tensor->data;
   float *output = reinterpret_cast<float *>(dst->data);
 
   if (!x_f32 || !weight_data || !output)
     return;
 
-  const int N = ud->N; // Input dimension
-  const int K = ud->K; // Output dimension
-  const ggml_type weight_type = ud->weight_type;
+  // ==========================================================================
+  // DIMENSION VALIDATION (using weight tensor from graph, not stale userdata)
+  // ==========================================================================
+  const int K =
+      static_cast<int>(weight_tensor->ne[1]); // Output dimension from weight
+  const int N =
+      static_cast<int>(weight_tensor->ne[0]); // Input dimension from weight
+
+  // Validate output tensor matches expected K
+  if (dst->ne[0] != K) {
+    fprintf(
+        stderr,
+        "CRITICAL: GEMV buffer mismatch! dst->ne[0](%ld) != weight->ne[1](%d). "
+        "Output tensor was sized incorrectly.\n",
+        (long)dst->ne[0], K);
+    return;
+  }
+
+  const ggml_type weight_type = weight_tensor->type;
 
   // ==========================================================================
   // DEFERRED PRE-QUANTIZATION:
@@ -891,7 +928,7 @@ void cb_gemv_parallel(struct ggml_tensor *dst, const struct ggml_tensor *src,
   // ==========================================================================
   // CASE B: Quantized weights with pre-quantized input - use native vec_dot
   // ==========================================================================
-  const size_t row_stride = ud->weight_tensor->nb[1]; // Bytes per row
+  const size_t row_stride = weight_tensor->nb[1]; // Bytes per row
   const auto *type_traits_cpu = ggml_get_type_traits_cpu(weight_type);
 
   if (quant_input && type_traits_cpu && type_traits_cpu->vec_dot) {
@@ -930,6 +967,11 @@ void cb_gemv_parallel(struct ggml_tensor *dst, const struct ggml_tensor *src,
 
 /**
  * Create a custom GGML operation for parallel GEMV
+ *
+ * REFACTORED: Uses GGML_OP_CUSTOM instead of GGML_OP_MAP_CUSTOM1.
+ * GGML_OP_MAP_CUSTOM1 assumes output shape == input shape, which causes
+ * buffer overflows when Qwen3 projections change dimensions (e.g., 1024->2048).
+ * GGML_OP_CUSTOM allows the output tensor shape to be independent of inputs.
  */
 inline struct ggml_tensor *ggml_mul_mat_gemv(struct ggml_context *ctx,
                                              struct ggml_tensor *weight,
@@ -982,43 +1024,69 @@ inline struct ggml_tensor *ggml_mul_mat_gemv(struct ggml_context *ctx,
   if (K < 64)
     n_threads = 1;
 
-  struct ggml_tensor *result =
-      ggml_map_custom1(ctx, input, cb_gemv_parallel, n_threads, userdata);
+  // ===========================================================================
+  // Create output tensor with correct dimension K (INDEPENDENT of input shape)
+  // This is the critical fix: GGML_OP_CUSTOM allows explicit output dimensions
+  // ===========================================================================
+  const int64_t ne_res[4] = {K, 1, 1, 1};
+  struct ggml_tensor *result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_res);
+
+  // ===========================================================================
+  // Configure GGML_OP_CUSTOM (NOT MAP_CUSTOM1 which assumes shape preservation)
+  // ===========================================================================
+  result->op = GGML_OP_CUSTOM;
+  result->src[0] = input; // Input tensor accessible via dst->src[0] in callback
+  result->src[1] =
+      weight; // Weight tensor accessible via dst->src[1] in callback
+
+  // Custom op params (layout must match ggml_custom_op_params)
+  // Signature: { ggml_custom_op_t fun, int n_tasks, void *userdata }
+  // NOTE: userdata is still passed for pre-quantized input buffer pointer,
+  //       but dimensions/weight are read directly from dst->src[1] for
+  //       reliability
+  struct {
+    ggml_custom_op_t fun;
+    int n_tasks;
+    void *userdata;
+  } params = {cb_gemv_custom, n_threads, userdata};
+  static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "params too large");
+  memcpy(result->op_params, &params, sizeof(params));
 
   return result;
 }
 
 /**
  * Smart matrix multiplication dispatcher
+ *
+ * CRITICAL: For decode-phase (batch=1), uses optimized GEMV path but ONLY when
+ * dimensions are compatible. The custom GEMV kernel expects weight->ne[0] ==
+ * input->ne[0]. If incompatible (e.g., Qwen3 transposed weights), falls back
+ * to ggml_mul_mat which handles stride/transpose correctly.
  */
 inline struct ggml_tensor *smart_mul_mat(struct ggml_context *ctx,
                                          struct ggml_tensor *weight,
                                          struct ggml_tensor *input) {
-
   const int input_cols = input->ne[1];
 
-  if (input_cols == 1 &&
-      (weight->type == GGML_TYPE_F32 || ggml_is_quantized(weight->type))) {
+  // STRICT COMPATIBILITY CHECK (zero-overhead: evaluated at graph build time)
+  const bool is_compatible = (weight->ne[0] == input->ne[0]);
+  const bool is_gemv_candidate =
+      (input_cols == 1) &&
+      (weight->type == GGML_TYPE_F32 || ggml_is_quantized(weight->type));
+
+  if (is_gemv_candidate && is_compatible) {
+    // Optimized GEMV path - dimensions
+    if (input->type != GGML_TYPE_F32) {
+      fprintf(stderr,
+              "CRITICAL: smart_mul_mat input type is %d! Tensor name: %s\n",
+              input->type, input->name);
+    }
     GemvUserData *ud = GetGemvUserData();
-    if (weight->ne[0] != input->ne[0]) {
-      std::cerr << "[DEBUG] smart_mul_mat (GEMV) SHAPE MISMATCH: weight=["
-                << weight->ne[0] << "," << weight->ne[1] << "] input=["
-                << input->ne[0] << "," << input->ne[1] << "]" << std::endl;
-    }
     return ggml_mul_mat_gemv(ctx, weight, input, ud);
-  } else {
-    // FALLBACK PATH
-    if (weight->ne[0] != input->ne[0]) {
-      std::cerr << "[DEBUG] smart_mul_mat (FALLBACK) SHAPE MISMATCH: weight=["
-                << weight->ne[0] << "," << weight->ne[1] << "] input=["
-                << input->ne[0] << "," << input->ne[1] << "]" << std::endl;
-    } else {
-      std::cerr << "[DEBUG] smart_mul_mat (FALLBACK): W=[" << weight->ne[0]
-                << "x" << weight->ne[1] << "] I=[" << input->ne[0] << "x"
-                << input->ne[1] << "]" << std::endl;
-    }
-    return ggml_mul_mat(ctx, weight, input);
   }
+
+  // Standard GGML fallback (handles transpose/stride correctly)
+  return ggml_mul_mat(ctx, weight, input);
 }
 
 // ============================================================================
@@ -1076,6 +1144,10 @@ struct ggml_tensor *BuildTransformerGraph(
     struct ggml_tensor *inpL = cur;
 
     // Attention Norm
+    if (cur->type != GGML_TYPE_F32) {
+      fprintf(stderr, "CRITICAL: Layer %d input type is %d! Tensor name: %s\n",
+              il, cur->type, cur->name);
+    }
     cur = ggml_rms_norm(ctx_c, cur, model->hparams.f_norm_rms_eps);
     cur = ggml_mul(ctx_c, cur, model->layers[il].attention_norm);
 
@@ -1110,69 +1182,39 @@ struct ggml_tensor *BuildTransformerGraph(
     }
 
     // Dynamically infer head dimensions from the actual projected tensors
-    // This allows universal support regardless of what GGUF metadata says
     int dim_q = Qcur->ne[0];
     int dim_k = Kcur->ne[0];
     int dim_v = Vcur->ne[0];
 
-    // Use hyperparameters as authoritative source for head counts
     int n_head_kv = model->hparams.n_head_kv;
-
-    // Compute head dimensions from tensor shapes
     int head_dim_q = dim_q / n_head;
-
-    // Use n_embd_head_k from hyperparameters if available (authoritative)
-    // Otherwise compute from tensor shape
     int head_dim_kv = (model->hparams.n_embd_head_k > 0)
                           ? model->hparams.n_embd_head_k
                           : (dim_k / n_head_kv);
 
-    // Validate: If computed head_dim_kv doesn't match head_dim_q, there may
-    // be a model loading issue. For Qwen3, they should be equal.
-    if (head_dim_kv != head_dim_q && il == 0) {
-      static bool logged_mismatch = false;
-      if (!logged_mismatch) {
-        std::cerr << "[DenseCore] WARN: head_dim mismatch (Q=" << head_dim_q
-                  << ", KV=" << head_dim_kv
-                  << "). Using Q head_dim for consistency." << std::endl;
-        logged_mismatch = true;
-      }
-      // For correctness, use head_dim_q (they should match for Qwen3)
-      head_dim_kv = head_dim_q;
-    }
-
     bool k_done = false;
     bool v_done = false;
-
-    // Handle MHA fallback (Layer 0 Anomaly): If K tensor dimension equals
-    // n_embd, this layer uses MHA instead of GQA. Adjust n_head_kv locally.
-    if (dim_k == static_cast<int>(model->hparams.n_embd) &&
-        n_head_kv != n_head) {
-      static bool logged_mha = false;
-      if (!logged_mha) {
-        std::cerr << "[DenseCore] INFO: Layer uses MHA tensor (dim_k=" << dim_k
-                  << " == n_embd). Treating as MHA." << std::endl;
-        logged_mha = true;
-      }
-      n_head_kv = n_head;
-      head_dim_kv = head_dim_q;
-    }
 
     // Reshape Q (Standard)
     Qcur = ggml_reshape_3d(ctx_c, Qcur, head_dim_q, n_head, N);
 
     // Reshape K/V
-    if (!k_done)
+    if (!k_done) {
       Kcur = ggml_reshape_3d(ctx_c, Kcur, head_dim_kv, n_head_kv, N);
-    if (!v_done)
+    }
+    if (!v_done) {
       Vcur = ggml_reshape_3d(ctx_c, Vcur, head_dim_kv, n_head_kv, N);
+    }
 
     // =========================================================================
-    // Per-Head QK-Norm (Required for Qwen3/Qwen2.5)
+    // Per-Head QK-Norm (Architecture-flag based for Qwen3/Qwen2.5)
     // =========================================================================
     // Qwen3 requires RMS normalization applied per-head, not over the entire
     // embedding dimension. We reshape to [head_dim, n_heads * n_tokens] so that
     // ggml_rms_norm normalizes each head_dim vector independently.
+    //
+    // Using arch_flags for explicit requirement checking instead of implicit
+    // null pointer guards. The tensor null check is kept for safety.
     //
     // Flow:
     //   1. Reshape Q from [head_dim, n_head, N] to [head_dim, n_head * N]
@@ -1180,29 +1222,33 @@ struct ggml_tensor *BuildTransformerGraph(
     //   3. Multiply by weight [head_dim] (broadcasts across all head*token)
     //   4. Reshape back to [head_dim, n_head, N]
     // =========================================================================
-    if (model->layers[il].attn_q_norm) {
-      const int64_t q_head_dim = Qcur->ne[0]; // head_dim after 3D reshape
-      const int64_t q_n_head = Qcur->ne[1];   // n_head
+    // Q Normalization (required for Qwen3, optional for others)
+    if (model->arch_flags.requires_q_norm && model->layers[il].attn_q_norm) {
       const int64_t q_n_tokens = Qcur->ne[2]; // N (batch size)
 
-      if (q_head_dim == model->layers[il].attn_q_norm->ne[0]) {
+      if (head_dim_q == model->layers[il].attn_q_norm->ne[0]) {
         // Reshape to 2D: [head_dim, n_head * n_tokens] for per-head norm
         struct ggml_tensor *Q_2d =
-            ggml_reshape_2d(ctx_c, Qcur, q_head_dim, q_n_head * q_n_tokens);
+            ggml_reshape_2d(ctx_c, Qcur, head_dim_q, n_head * q_n_tokens);
 
         // Apply RMS norm (normalizes over ne[0] = head_dim independently)
+        if (Q_2d->type != GGML_TYPE_F32) {
+          fprintf(stderr,
+                  "CRITICAL: Layer %d Q_2d type is %d! Tensor name: %s\n", il,
+                  Q_2d->type, Q_2d->name);
+        }
         Q_2d = ggml_rms_norm(ctx_c, Q_2d, model->hparams.f_norm_rms_eps);
 
         // Multiply by weight [head_dim] - broadcasts across second dimension
         Q_2d = ggml_mul(ctx_c, Q_2d, model->layers[il].attn_q_norm);
 
-        // Reshape back to 3D: [head_dim, n_head, n_tokens]
-        Qcur = ggml_reshape_3d(ctx_c, Q_2d, q_head_dim, q_n_head, q_n_tokens);
+        // Reshape back to original 3D: [head_dim, n_head, n_tokens]
+        Qcur = ggml_reshape_3d(ctx_c, Q_2d, head_dim_q, n_head, q_n_tokens);
       } else if (il == 0) {
         static bool logged_q_mismatch = false;
         if (!logged_q_mismatch) {
           std::cerr << "[DenseCore] WARN: attn_q_norm dimension mismatch! "
-                    << "Qcur->ne[0]=" << q_head_dim << " vs norm->ne[0]="
+                    << "Qcur->ne[0]=" << Qcur->ne[0] << " vs norm->ne[0]="
                     << model->layers[il].attn_q_norm->ne[0]
                     << ". Skipping Q normalization." << std::endl;
           logged_q_mismatch = true;
@@ -1210,29 +1256,33 @@ struct ggml_tensor *BuildTransformerGraph(
       }
     }
 
-    if (model->layers[il].attn_k_norm) {
-      const int64_t k_head_dim = Kcur->ne[0]; // head_dim_kv after 3D reshape
-      const int64_t k_n_head = Kcur->ne[1];   // n_head_kv (GQA: fewer KV heads)
+    // K Normalization (required for Qwen3, optional for others)
+    if (model->arch_flags.requires_k_norm && model->layers[il].attn_k_norm) {
       const int64_t k_n_tokens = Kcur->ne[2]; // N (batch size)
 
-      if (k_head_dim == model->layers[il].attn_k_norm->ne[0]) {
+      if (head_dim_kv == model->layers[il].attn_k_norm->ne[0]) {
         // Reshape to 2D: [head_dim, n_head_kv * n_tokens] for per-head norm
         struct ggml_tensor *K_2d =
-            ggml_reshape_2d(ctx_c, Kcur, k_head_dim, k_n_head * k_n_tokens);
+            ggml_reshape_2d(ctx_c, Kcur, head_dim_kv, n_head_kv * k_n_tokens);
 
         // Apply RMS norm (normalizes over ne[0] = head_dim independently)
+        if (K_2d->type != GGML_TYPE_F32) {
+          fprintf(stderr,
+                  "CRITICAL: Layer %d K_2d type is %d! Tensor name: %s\n", il,
+                  K_2d->type, K_2d->name);
+        }
         K_2d = ggml_rms_norm(ctx_c, K_2d, model->hparams.f_norm_rms_eps);
 
         // Multiply by weight [head_dim] - broadcasts across second dimension
         K_2d = ggml_mul(ctx_c, K_2d, model->layers[il].attn_k_norm);
 
-        // Reshape back to 3D: [head_dim, n_head_kv, n_tokens]
-        Kcur = ggml_reshape_3d(ctx_c, K_2d, k_head_dim, k_n_head, k_n_tokens);
+        // Reshape back to original 3D: [head_dim, n_head_kv, n_tokens]
+        Kcur = ggml_reshape_3d(ctx_c, K_2d, head_dim_kv, n_head_kv, k_n_tokens);
       } else if (il == 0) {
         static bool logged_k_mismatch = false;
         if (!logged_k_mismatch) {
           std::cerr << "[DenseCore] WARN: attn_k_norm dimension mismatch! "
-                    << "Kcur->ne[0]=" << k_head_dim << " vs norm->ne[0]="
+                    << "Kcur->ne[0]=" << Kcur->ne[0] << " vs norm->ne[0]="
                     << model->layers[il].attn_k_norm->ne[0]
                     << ". Skipping K normalization." << std::endl;
           logged_k_mismatch = true;
@@ -1668,10 +1718,11 @@ struct ggml_tensor *BuildTransformerGraph(
           // Validate mul_mat dimension compatibility: cols(A) == rows(B)
           // K_head: [head_dim_kv, n_total_tokens] (A)
           // Q_group: [head_dim_q, N, n_rep]       (B)
-          std::cerr << "[DEBUG GQA Loop] h_kv=" << h_kv << " K_head=["
-                    << K_head->ne[0] << "," << K_head->ne[1] << "]"
-                    << " Q_group=[" << Q_group->ne[0] << "," << Q_group->ne[1]
-                    << "," << Q_group->ne[2] << "]" << std::endl;
+          // std::cerr << "[DEBUG GQA Loop] h_kv=" << h_kv << " K_head=["
+          //           << K_head->ne[0] << "," << K_head->ne[1] << "]"
+          //           << " Q_group=[" << Q_group->ne[0] << "," <<
+          //           Q_group->ne[1]
+          //           << "," << Q_group->ne[2] << "]" << std::endl;
 
           if (K_head->ne[0] != Q_group->ne[0]) {
             std::cerr << "[DenseCore] ERROR: mul_mat dimension mismatch in "
@@ -1725,13 +1776,6 @@ struct ggml_tensor *BuildTransformerGraph(
         Q = ggml_cont(ctx_c, Q);
         K_fa = ggml_cont(ctx_c, K_fa);
         V_fa = ggml_cont(ctx_c, V_fa);
-
-#ifndef NDEBUG
-        std::cerr << "[DEBUG] MHA Check: Q=[" << Q->ne[0] << "," << Q->ne[1]
-                  << "," << Q->ne[2] << "] "
-                  << "K_fa=[" << K_fa->ne[0] << "," << K_fa->ne[1] << ","
-                  << K_fa->ne[2] << "]" << std::endl;
-#endif
 
         // Step 1: Q @ K^T -> [n_total, N, n_head]
         struct ggml_tensor *KQ = ggml_mul_mat(ctx_c, K_fa, Q);
@@ -1791,6 +1835,10 @@ struct ggml_tensor *BuildTransformerGraph(
     // FFN
     // =========================================================================
     struct ggml_tensor *inpFF = cur;
+    if (cur->type != GGML_TYPE_F32) {
+      fprintf(stderr, "CRITICAL: Layer %d input type is %d! Tensor name: %s\n",
+              il, cur->type, cur->name);
+    }
     cur = ggml_rms_norm(ctx_c, cur, model->hparams.f_norm_rms_eps);
     cur = ggml_mul(ctx_c, cur, model->layers[il].ffn_norm);
 

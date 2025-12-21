@@ -135,19 +135,23 @@ class DummyTokenizer:
     def encode(self, text, **kwargs): return [1, 2, 3]
     def decode(self, tokens, **kwargs): return "x" * len(tokens)
 
-def benchmark_raw(model_path: str, repo_id: Optional[str] = None, n_tokens: int = 128, threads: int = 0, mock: bool = False):
+def benchmark_raw(model_path: str, repo_id: Optional[str] = None, n_tokens: int = 128, threads: int = 0, mock: bool = False, args: Any = None):
     print(f"Running Scenario A: Raw Engine Throughput...")
     if mock:
         engine = MockDenseCore(model_path)
     else:
-        # Auto-infer repo_id from model path if not provided
-        effective_repo_id = repo_id or infer_repo_id_from_path(model_path)
-        if effective_repo_id and not repo_id:
-            print(f"  [Info] Auto-detected tokenizer repo: {effective_repo_id}")
+        # Auto-infer repo_id from model path if not provided (unless dummy requested)
+        effective_repo_id = repo_id
+        use_dummy = args.dummy_tokenizer if args else False
         
-        engine = densecore.DenseCore(model_path=model_path, hf_repo_id=effective_repo_id, threads=threads, verbose=False)
-        if engine.tokenizer is None:
-             print("  [Warn] Tokenizer not found. Using DummyTokenizer (results may be unreliable).")
+        if not effective_repo_id and not use_dummy:
+             effective_repo_id = infer_repo_id_from_path(model_path)
+             if effective_repo_id:
+                 print(f"  [Info] Auto-detected tokenizer repo: {effective_repo_id}")
+        
+        engine = densecore.DenseCore(model_path=model_path, hf_repo_id=effective_repo_id, threads=threads, verbose=True)
+        if not hasattr(engine, 'tokenizer') or engine.tokenizer is None:
+             print("  [Warn] Tokenizer not found/initialized. Using DummyTokenizer (results may be unreliable).")
              engine.tokenizer = DummyTokenizer()
 
     # TTFT and TPS measurement
@@ -234,12 +238,15 @@ def main():
     parser.add_argument("--mock", action="store_true", help="Run in mock mode")
     parser.add_argument("--n-predict", type=int, default=100, help="Number of tokens to generate")
     parser.add_argument("--scan-cache", "-L", action="store_true", help="Scan local cache for models")
-    args = parser.parse_args()
-    
+    parser.add_argument("--dummy-tokenizer", action="store_true", help="Use dummy tokenizer (bypass HuggingFace/Torch)")
     args = parser.parse_args()
     
     model_path = args.model
     repo_id = args.repo_id
+    
+    if args.dummy_tokenizer:
+        print("  [Info] User requested dummy tokenizer. Bypassing HuggingFace tokenizer initialization.")
+        repo_id = None # Force None to skip loading in DenseCore constructor
 
     if args.scan_cache:
         models = scan_cached_models()
@@ -282,7 +289,7 @@ def main():
     print(f"{'='*60}")
     
     # Run Scenario A
-    ttft, tps = benchmark_raw(model_path, repo_id=repo_id, n_tokens=args.n_predict, threads=args.threads, mock=args.mock or (densecore is None))
+    ttft, tps = benchmark_raw(model_path, repo_id=repo_id, n_tokens=args.n_predict, threads=args.threads, mock=args.mock or (densecore is None), args=args)
     
     # Run Scenario B
     agent_latency = benchmark_langchain(model_path, repo_id=repo_id, threads=args.threads if args.threads > 0 else 16, mock=args.mock or (densecore is None))

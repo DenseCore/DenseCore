@@ -24,6 +24,12 @@
 #include <thread>
 #include <vector>
 
+// For _mm_pause() / yield intrinsics
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) ||             \
+    defined(_M_IX86)
+#include <immintrin.h>
+#endif
+
 #if defined(_WIN32)
 #include <malloc.h> // For _aligned_malloc/_aligned_free
 #else
@@ -230,13 +236,23 @@ private:
     if (initialized_)
       return; // Double-check
 
+    std::cerr << "[DEBUG] StaticThreadPool::EnsureInitialized: Creating "
+              << num_threads_ << " threads..." << std::endl;
+
     // Create worker threads (thread 0 is main thread, workers are 1..N-1)
     shutdown_ = false;
     workers_.reserve(num_threads_ - 1);
 
     for (int i = 1; i < num_threads_; ++i) {
-      workers_.emplace_back([this, i]() { WorkerLoop(i); });
+      std::cerr << "[DEBUG] Creating worker " << i << std::endl;
+      workers_.emplace_back([this, i]() {
+        std::cerr << "[DEBUG] Worker " << i << " started" << std::endl;
+        WorkerLoop(i);
+      });
     }
+
+    std::cerr << "[DEBUG] StaticThreadPool::EnsureInitialized: Done."
+              << std::endl;
 
     initialized_ = true;
   }
@@ -265,8 +281,46 @@ private:
     uint64_t my_generation = 0;
 
     while (true) {
-      // Wait for work
-      {
+      // =========================================================================
+      // HYBRID SPINNING: Busy-spin before falling back to cv.wait()
+      // =========================================================================
+      // During rapid token generation (decode phase), threads stay "hot" by
+      // spinning for a short duration before sleeping. This reduces wake-up
+      // latency from ~10-50µs to sub-microsecond.
+      //
+      // The spin loop checks generation_ without taking the lock, using
+      // acquire semantics for proper synchronization.
+      // =========================================================================
+      // During rapid token generation (decode phase), threads stay "hot" by
+      // spinning for a short duration before sleeping. This reduces wake-up
+      // latency from ~10-50µs to sub-microsecond.
+      // =========================================================================
+      constexpr int kSpinIterations = 5000; // ~100-500µs on modern CPUs
+      bool got_work = false;
+
+      for (int spin = 0; spin < kSpinIterations; ++spin) {
+        // Check for new work without lock
+        if (generation_.load(std::memory_order_acquire) > my_generation) {
+          got_work = true;
+          break;
+        }
+        // CPU pause instruction - reduces power while keeping core active
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) ||             \
+    defined(_M_IX86)
+        _mm_pause();
+#elif defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
+      }
+
+      if (got_work) {
+        // Found work during spin
+      } else {
+        // Fallback to wait
+      }
+
+      // If spinning didn't find work, fall back to condition variable
+      if (!got_work) {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_work_.wait(lock, [this, &my_generation] {
           return shutdown_ || (work_ready_ && generation_ > my_generation);
@@ -274,9 +328,11 @@ private:
 
         if (shutdown_)
           return;
-
-        my_generation = generation_;
       }
+
+      // Important: Always update my_generation to the current generation
+      // before executing work, to ensure we don't re-execute the same work.
+      my_generation = generation_.load(std::memory_order_acquire);
 
       // Execute work
       if (is_gemv_work_) {
@@ -314,9 +370,9 @@ private:
   std::condition_variable cv_work_;
   std::condition_variable cv_done_;
   std::atomic<int> completed_count_{0};
-  bool work_ready_ = false;
-  bool shutdown_ = false;
-  uint64_t generation_ = 0;
+  std::atomic<bool> work_ready_{false}; // Atomic for lock-free spin check
+  std::atomic<bool> shutdown_{false};   // Atomic for lock-free spin check
+  std::atomic<uint64_t> generation_{0}; // Atomic for lock-free spin check
 
   // Work specification (generic parallel_for)
   const std::function<void(int, int, int)> *current_work_fn_ = nullptr;

@@ -98,6 +98,49 @@ struct InternalMetrics {
 };
 
 /**
+ * ResultEvent structure for decoupled callback execution.
+ *
+ * This struct stores all necessary data to execute a callback without
+ * holding a reference to the Request object. This allows EngineLoop to
+ * release requests immediately after pushing to the queue, avoiding the
+ * need for complex reference counting.
+ *
+ * For embedding callbacks, embedding_data uses std::vector for RAII-safe
+ * memory management - no manual new/delete required.
+ */
+struct ResultEvent {
+  int request_id;
+  std::string token_str;
+  bool finished;
+  bool error;
+
+  // Callback pointers (copied from Request at event creation time)
+  TokenCallback callback;
+  EmbeddingCallback emb_callback;
+  void *user_data;
+
+  // Embedding data (RAII-managed via std::vector)
+  std::vector<float> embedding_data;
+
+  ResultEvent()
+      : request_id(-1), finished(false), error(false), callback(nullptr),
+        emb_callback(nullptr), user_data(nullptr) {}
+
+  // Move constructor - std::vector handles move semantics automatically
+  ResultEvent(ResultEvent &&other) noexcept = default;
+
+  // Move assignment - std::vector handles move semantics automatically
+  ResultEvent &operator=(ResultEvent &&other) noexcept = default;
+
+  // Disable copy (maintain move-only semantics for queue efficiency)
+  ResultEvent(const ResultEvent &) = delete;
+  ResultEvent &operator=(const ResultEvent &) = delete;
+
+  // Default destructor - std::vector handles cleanup automatically
+  ~ResultEvent() = default;
+};
+
+/**
  * Request structure representing a single inference request.
  *
  * Lifecycle:
@@ -156,6 +199,34 @@ struct Request {
   // Scheduler sequence ID (assigned by scheduler->AddRequest)
   // -1 indicates not yet registered with scheduler
   int seq_id = -1;
+
+  // Reset request state for pool reuse
+  void Reset() {
+    id = -1;
+    prompt = "";
+    max_tokens = 0;
+    callback = nullptr;
+    user_data = nullptr;
+    tokens.clear();
+    n_past = 0;
+    is_prefill = true;
+    generated_count = 0;
+    finished = false;
+    cancelled = false;
+    tier = "standard";
+    block_table.clear();
+    is_embedding = false;
+    embedding_callback = nullptr;
+    pooling_type = densecore::PoolingStrategy::MEAN;
+    normalize_embedding = true;
+    json_mode = false;
+    grammar.enabled = false;
+    grammar.is_json_mode = false;
+    priority = 100;
+    is_high_priority = false;
+    estimated_length = 0;
+    seq_id = -1;
+  }
 
   // Destructor for cleanup
   ~Request() {
@@ -334,6 +405,18 @@ struct EngineState {
 
   // Metrics
   InternalMetrics metrics;
+
+  // ===========================================================================
+  // DECOUPLED CALLBACK QUEUE (Resolves Streaming Deadlock)
+  // ===========================================================================
+  // Callbacks are pushed to this queue by EngineLoop and executed by a
+  // dedicated CallbackLoop thread. This prevents the worker thread from
+  // blocking on the Python GIL during callback execution.
+  // ===========================================================================
+  std::deque<ResultEvent> result_queue;
+  std::mutex result_mu;
+  std::condition_variable result_cv;
+  std::thread callback_thread;
 
   // Persistent compute buffer for GGML context (eliminates malloc overhead)
   // Allocated once at startup, reused across iterations
@@ -543,9 +626,15 @@ struct EngineState {
     // Transition to STOPPED and notify worker
     status = EngineStatus::STOPPED;
     queue_cv.notify_all();
+    result_cv.notify_all(); // Wake up callback thread
 
     if (worker_thread.joinable()) {
       worker_thread.join();
+    }
+
+    // Join callback thread after draining result queue
+    if (callback_thread.joinable()) {
+      callback_thread.join();
     }
 
     // Cleanup all models - smart pointers handle automatic cleanup
@@ -568,7 +657,50 @@ struct EngineState {
   }
 };
 
-// Worker function declaration
+// Worker function declarations
 void EngineLoop(EngineState *state);
+void CallbackLoop(EngineState *state);
+
+// Helper to push result events to the callback queue
+inline void PushResultEvent(EngineState *state, int request_id,
+                            const std::string &token, bool finished, bool error,
+                            TokenCallback cb, void *user_data) {
+  ResultEvent event;
+  event.request_id = request_id;
+  event.token_str = token;
+  event.finished = finished;
+  event.error = error;
+  event.callback = cb;
+  event.user_data = user_data;
+  event.emb_callback = nullptr;
+  // embedding_data is default-constructed as empty vector (no assignment
+  // needed)
+
+  {
+    std::lock_guard<std::mutex> lock(state->result_mu);
+    state->result_queue.push_back(std::move(event));
+  }
+  state->result_cv.notify_one();
+}
+
+// Helper for embedding results (RAII-safe: takes ownership via std::move)
+inline void PushEmbeddingResultEvent(EngineState *state, int request_id,
+                                     std::vector<float> embedding_data,
+                                     EmbeddingCallback cb, void *user_data) {
+  ResultEvent event;
+  event.request_id = request_id;
+  event.finished = true;
+  event.error = false;
+  event.callback = nullptr;
+  event.emb_callback = cb;
+  event.user_data = user_data;
+  event.embedding_data = std::move(embedding_data); // RAII ownership transfer
+
+  {
+    std::lock_guard<std::mutex> lock(state->result_mu);
+    state->result_queue.push_back(std::move(event));
+  }
+  state->result_cv.notify_one();
+}
 
 #endif // DENSECORE_ENGINE_INTERNAL_H

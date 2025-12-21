@@ -17,9 +17,13 @@ from typing import Any, Optional, Union
 
 # Try to import torch for tensor compatibility
 try:
-    import torch
+    if False: # Forced disable to debug hang
+        print("[DEBUG] generate_output: importing torch...")
+        import torch
+        print("[DEBUG] generate_output: torch imported")
 
-    TORCH_AVAILABLE = True
+    TORCH_AVAILABLE = False
+    torch = None
 except ImportError:
     TORCH_AVAILABLE = False
     torch = None  # type: ignore

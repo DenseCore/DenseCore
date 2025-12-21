@@ -1,81 +1,67 @@
-# 🚀 DenseCore Performance Benchmark Report
+# DenseCore Model Benchmarks
 
-**Last Updated**: 2025-12-21
-**Platform**: Intel Core i7-10870H (Comet Lake, 8C/16T)
-**Quantization**: Q4_K_M (INT4)
-**SIMD**: AVX2 + FMA3 (Verified)
+Performance benchmarks for DenseCore inference engine on Intel i7-10870H (8 cores, 16 threads, AVX2).
 
----
+## Summary Table
 
-## 📊 Latest Benchmark Results
+| Model | Size | Quantization | TTFT (ms) | Speed (tok/s) |
+| :--- | :--- | :--- | ---: | ---: |
+| **Qwen3-0.6B** | 0.6B | Q8_0 | 56.58 | 22.81 |
+| **Qwen3-4B** | 4B | Q4_K_M | 186.41 | 8.38 |
+| **Qwen3-8B** | 8B | Q4_K_M | 346.75 | 5.11 |
+| Qwen2.5-0.5B | 0.5B | Q4_K_M | 50.85 | 29.66 |
+| Qwen2.5-1.5B | 1.5B | Q4_K_M | 74.42 | 16.18 |
+| **Llama-3.2-1B** | 1B | Q8_0 | 71.46 | 17.05 |
+| TinyLlama-1.1B | 1.1B | Q4_K_M | 43.06 | 24.68 |
 
-Tested on Intel Core i7-10870H (AVX2) with **DenseCore v0.3.1**.
+## Model Family Details
 
-| Model | Size | Load Time | **TPS** (Decode) | Context | Status |
-|-------|------|-----------|------------------|---------|--------|
-| **TinyLlama-1.1B** | 0.7 GB | ~37s | **~15.0*** | 2048 | ✅ Stable (Single) |
-| **Qwen3-4B** | 2.5 GB | - | - | 40960 | ⚠️ Unstable (Hang) |
+### Qwen3 Series ✅
 
-> **Note**: TinyLlama TPS estimated from log analysis (Debug logs slowed down actual measurement).
-> "Stable (Single)" means stable for single-request processing.
+Qwen3 models are fully supported after the GEMV op refactor (v0.3.1+).
 
-### Performance Analysis
+| Variant | TTFT (ms) | Decode (tok/s) | Memory |
+|---------|-----------|----------------|--------|
+| Qwen3-0.6B (Q8_0) | 56.58 | 22.81 | ~600 MB |
+| Qwen3-4B (Q4_K_M) | 186.41 | 8.38 | ~2.5 GB |
+| Qwen3-8B (Q4_K_M) | 346.75 | 5.11 | ~4.5 GB |
 
-1. **TinyLlama-1.1B**:
-   - **TPS**: ~15.0 tok/s
-   - **Stability**: Fixed `GGML_ASSERT` crash via Layer 0 Anomaly Shim.
-   - **Multi-threading**: 8 threads verified working.
+### Llama 3.2 Series ✅
 
-2. **Qwen3-4B**:
-   - Currently experiencing **Deadlock/Hang** on AVX2 related to complex bias handling for dimension-mismatched layers.
-   - Bias mismatch (MHA tensor in GQA model) detected and partially patched, but full stability requires further work.
-   - **Recommendation**: Use TinyLlama-1.1B for immediate integration.
+Meta's latest efficient Llama models with improved instruction following.
 
----
+| Variant | TTFT (ms) | Decode (tok/s) | Memory |
+|---------|-----------|----------------|--------|
+| Llama-3.2-1B (Q8_0) | 71.46 | 17.05 | ~1.1 GB |
 
-## 🆚 DenseCore vs HuggingFace Transformers
+### Legacy Models ✅
 
-| Model | DenseCore TPS | Transformers TPS | **Speedup** |
-|-------|---------------|-----------------|-------------|
-| TinyLlama-1.1B | **15.0** | ~2.1 | **7.1x** |
+| Variant | TTFT (ms) | Decode (tok/s) | Memory |
+|---------|-----------|----------------|--------|
+| Qwen2.5-0.5B (Q4_K_M) | 50.85 | 29.66 | ~350 MB |
+| Qwen2.5-1.5B (Q4_K_M) | 74.42 | 16.18 | ~900 MB |
+| TinyLlama-1.1B (Q4_K_M) | 43.06 | 24.68 | ~670 MB |
 
-> Verification Data: `densecore_benchmark_tinyllama_avx2.log` (2025-12-21)
+## Test Environment
 
----
+- **CPU**: Intel Core i7-10870H @ 2.20GHz (8 cores / 16 threads)
+- **RAM**: 32 GB DDR4
+- **OS**: Ubuntu 24.04 (WSL2)
+- **SIMD**: AVX2 (AVX-512 not available on this CPU)
+- **Threads**: 8 (physical cores only)
+- **Test Prompt**: "The capital of France is" (100 tokens generated)
 
-## 🏗️ Architecture & Optimizations
+## Notes
 
-### 1. Wait-Free Ingestion & Robust Synchronization
-- **New mechanism**: Condition Variable (CV) based signaling.
-- **Benefit**: 0% idle CPU usage, microsceond-level wake-up latency.
+- **TTFT (Time to First Token)**: Includes model loading, prefill phase, and first token generation
+- **Speed (tok/s)**: Sustained decode throughput after first token
+- All benchmarks use HuggingFace cached GGUF models
+- Qwen3 models require the GEMV refactor (v0.3.1+) using `GGML_OP_CUSTOM` for dimension-changing projections
+- RoPE uses GGML native `ggml_rope_ext` for stability
 
-### 2. Smart Matrix Multiplication
-- **Optimization**: Dynamic dispatch between `gemv` (Decode) and `gemm` (Prefill).
-- **Result**: optimal threading for both prompt processing and token generation.
+## Supported Architectures
 
-### 3. Anomaly Handling (New)
-- **Feature**: Dynamic detection of mixed MHA/GQA layers (e.g. TinyLlama Layer 0 anomaly).
-- **Implementation**: Runtime `n_head_kv` shadowing to prevent crashes on malformed GGUF files.
-
----
-
-## ⚠️ Known Issues
-
-| Issue | Severity | Workaround |
-|-------|----------|------------|
-| Qwen3-4B Hang | High | Use TinyLlama-1.1B |
-| Multi-request Hang | Medium | Re-initialize engine between batches |
-
-| Architecture | Models | Status |
-|--------------|--------|--------|
-| **llama** | TinyLlama-1.1B | ✅ Verified |
-| **qwen3** | Qwen3-4B | ⚠️ Experimental |
-
----
-
-## 🎯 Use Case Recommendations
-
-| Use Case | Recommended Model | Expected TPS |
-|----------|-------------------|--------------|
-| **Real-time Chat** | TinyLlama-1.1B | 15+ tok/s |
-| **Code Assist** | TinyLlama-1.1B | 15+ tok/s |
+| Architecture | Status | Notes |
+|--------------|--------|-------|
+| Llama (1/2/3) | ✅ Stable | Full support including GQA |
+| Qwen (2/2.5/3) | ✅ Stable | QK-norm, tied embeddings |

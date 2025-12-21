@@ -305,19 +305,25 @@ void Scheduler::ScheduleWaiting(SchedulerOutput &output) {
     }
 
     int blocks_needed = (tokens_needed + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
+    int seq_id = group.sequence_ids[0];
     if (block_manager_->GetFreeBlockCount() < blocks_needed) {
+      std::cerr << "[TRACE] Scheduler: Not enough blocks for seq " << seq_id
+                << " (needed " << blocks_needed << ", free "
+                << block_manager_->GetFreeBlockCount() << ")" << std::endl;
       still_waiting.push_back(group);
       continue;
     }
 
     std::vector<int> new_blocks = block_manager_->Allocate(blocks_needed);
     if (new_blocks.empty()) {
+      std::cerr << "[TRACE] Scheduler: Allocate failed for seq " << seq_id
+                << std::endl;
       still_waiting.push_back(group);
       continue;
     }
 
-    int seq_id = group.sequence_ids[0];
+    std::cerr << "[TRACE] Scheduler: Scheduled seq " << seq_id << " (prefill)"
+              << std::endl;
     output.prefill_seq_ids.push_back(seq_id);
     output.num_prefill_tokens += tokens_needed;
     output.total_tokens += tokens_needed;
