@@ -1,20 +1,20 @@
 # DenseCore Python SDK
 
-The official Python client for DenseCore—**blazing fast CPU inference for LLMs**.
+The official Python client for DenseCore — **high-performance CPU inference for LLMs**.
 
 [![PyPI](https://img.shields.io/pypi/v/densecore)](https://pypi.org/project/densecore/)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
+
 ---
+
 ## Installation
+
 ```bash
 pip install densecore
 ```
+
 **Optional extras:**
-
-...
-
-**Apache 2.0 License** • [Issues](https://github.com/Jake-Network/DenseCore/issues) • [Discord](https://discord.gg/densecore)
 ```bash
 pip install densecore[langchain]  # LangChain/LangGraph support
 pip install densecore[full]       # All optional dependencies
@@ -25,14 +25,14 @@ pip install densecore[full]       # All optional dependencies
 ## Quick Start
 
 ```python
-import densecore
+from densecore import DenseCore
 
 # Load from HuggingFace (auto-downloads GGUF)
-model = densecore.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+model = DenseCore(hf_repo_id="Qwen/Qwen3-0.6B-GGUF")
 
-# Generate
-response = model.generate("Explain quantum computing in simple terms.")
-print(response)
+# Generate with streaming
+for token in model.generate("Explain quantum computing:", max_tokens=100, stream=True):
+    print(token, end="", flush=True)
 ```
 
 ---
@@ -94,7 +94,7 @@ DenseCore has first-class LangChain and LangGraph support with **tool calling**.
 from densecore.integrations import DenseCoreChatModel
 from langchain_core.messages import HumanMessage
 
-chat = DenseCoreChatModel(hf_repo_id="Qwen/Qwen2.5-0.5B-Instruct")
+chat = DenseCoreChatModel(hf_repo_id="Qwen/Qwen3-0.6B-GGUF")
 response = chat.invoke([HumanMessage("Hello!")])
 print(response.content)
 ```
@@ -110,30 +110,12 @@ def calculator(expression: str) -> str:
     """Evaluate a math expression."""
     return str(eval(expression))
 
-chat = DenseCoreChatModel(hf_repo_id="Qwen/Qwen2.5-0.5B-Instruct")
+chat = DenseCoreChatModel(hf_repo_id="Qwen/Qwen3-0.6B-GGUF")
 chat_with_tools = chat.bind_tools([calculator])
 
 response = chat_with_tools.invoke([HumanMessage("What is 25 * 4?")])
 if response.tool_calls:
     print(f"Tool call: {response.tool_calls}")
-```
-
-### ReAct Agents
-
-```python
-from densecore.integrations import DenseCoreChatModel, create_react_agent
-from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage
-
-@tool
-def search(query: str) -> str:
-    """Search the web."""
-    return f"Results for: {query}"
-
-llm = DenseCoreChatModel(hf_repo_id="Qwen/Qwen2.5-0.5B-Instruct")
-agent = create_react_agent(llm, [search])
-
-result = agent.invoke({"messages": [HumanMessage("Find info about DenseCore")]})
 ```
 
 📖 **[Full LangChain Guide →](docs/LANGCHAIN_GUIDE.md)**
@@ -142,10 +124,10 @@ result = agent.invoke({"messages": [HumanMessage("Find info about DenseCore")]})
 
 ## 🔄 LoRA Runtime Switching
 
-Hot-swap LoRA adapters without reloading the base model—ideal for multi-tenant serving:
+Hot-swap LoRA adapters without reloading the base model:
 
 ```python
-model = densecore.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+model = DenseCore(hf_repo_id="Qwen/Qwen3-0.6B-GGUF")
 
 # Load multiple adapters
 model.load_lora("customer_support.gguf", scale=0.8, name="support")
@@ -157,37 +139,6 @@ print(model.generate("def quicksort(arr):"))
 
 model.enable_lora("support")
 print(model.generate("How can I help you today?"))
-
-# Use base model (disable all adapters)
-model.disable_lora()
-```
-
----
-
-## Advanced Features
-
-### Model Quantization
-
-```python
-from densecore.quantize import quantize_model, Q4_K_M_CFG
-
-quantize_model(
-    input_path="model-fp16.gguf",
-    output_path="model-q4km.gguf",
-    config=Q4_K_M_CFG  # 4x smaller, ~5% quality loss
-)
-```
-
-### Model Pruning
-
-```python
-from densecore.prune import prune_model, DEPTH_PRUNE_50_CFG
-
-prune_model(
-    input_path="llama-7b.gguf",
-    output_path="llama-3.5b.gguf",
-    config=DEPTH_PRUNE_50_CFG  # Remove 50% of layers
-)
 ```
 
 ---
@@ -219,8 +170,6 @@ from densecore.integrations import (
     DenseCoreLLM,           # LangChain LLM
     DenseCoreChatModel,     # LangChain ChatModel with tool calling
     create_react_agent,     # LangGraph ReAct agent
-    create_tool_node,       # LangGraph tool execution
-    create_densecore_node,  # LangGraph node factory
 )
 ```
 
@@ -231,13 +180,13 @@ Full API docs: [API Reference](../docs/API_REFERENCE.md)
 ## Troubleshooting
 
 ### "Memory allocation failed"
-Use a quantized model: `qwen-7b-q4.gguf` instead of `qwen-7b-fp16.gguf`
+Use a quantized model: `Qwen3-0.6B-Q8_0.gguf` instead of FP16
 
 ### "Illegal instruction"  
 Your CPU doesn't support AVX2. Rebuild with `cmake -DDENSECORE_AVX2=OFF`
 
 ### "Garbage output"
-Use HuggingFace tokenizer: `DenseCore("model.gguf", hf_repo_id="Qwen/Qwen2.5")`
+Use HuggingFace tokenizer: `DenseCore(hf_repo_id="Qwen/Qwen3-0.6B")`
 
 ---
 
@@ -250,4 +199,4 @@ Use HuggingFace tokenizer: `DenseCore("model.gguf", hf_repo_id="Qwen/Qwen2.5")`
 
 ---
 
-**Apache 2.0 License** • [Issues](https://github.com/Jake-Network/DenseCore/issues) • [Discord](https://discord.gg/densecore)
+**Apache 2.0 License** • [Issues](https://github.com/Jake-Network/DenseCore/issues)

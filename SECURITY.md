@@ -4,8 +4,8 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 2.x.x   | :white_check_mark: |
-| < 2.0   | :x:                |
+| 0.3.x   | :white_check_mark: |
+| 0.2.x   | :white_check_mark: |
 
 ## Reporting a Vulnerability
 
@@ -15,7 +15,7 @@ We take security seriously. If you discover a security vulnerability in DenseCor
 
 **Please do NOT open public issues for security vulnerabilities.**
 
-Instead, send your report via email to: **security@densecore.io**
+Instead, send your report via email to: **jwsong9294@gmail.com**
 
 ### What to Include
 
@@ -23,15 +23,6 @@ Instead, send your report via email to: **security@densecore.io**
 - Steps to reproduce (if applicable)
 - Potential impact assessment
 - Any suggested fixes (optional)
-
-### Response Timeline
-
-| Action | Timeframe |
-|--------|-----------|
-| Acknowledgment | Within 48 hours |
-| Initial assessment | Within 7 days |
-| Status update | Every 14 days |
-| Fix release | ASAP (based on severity) |
 
 ### Disclosure Policy
 

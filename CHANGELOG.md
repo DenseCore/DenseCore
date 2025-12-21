@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] - 2025-12-21
+
+### Added
+
+- **Full Qwen3 Support**: Fixed GEMV dimension mismatch for Qwen3 projection layers
+- **Llama 3.2 Support**: Verified Llama-3.2-1B-Instruct compatibility
+- **CI/CD Improvements**: Simplified GitHub Actions workflows with relaxed lint rules
+
+### Fixed
+
+- **GEMV Memory Corruption**: Refactored from `GGML_OP_MAP_CUSTOM1` to `GGML_OP_CUSTOM` to support independent output tensor dimensions
+- **Userdata Pool Corruption**: Weight tensor now stored in `dst->src[1]` instead of potentially stale userdata pool
+- **CPU Backend Build**: Fixed `__attribute__` placement in `cpu_backend_opt.cpp` for GCC/Clang compatibility
+
+### Performance
+
+| Model | Quantization | TTFT (ms) | Speed (tok/s) |
+|-------|--------------|-----------|---------------|
+| **Qwen3-0.6B** | Q8_0 | 56.58 | 22.81 |
+| **Qwen3-4B** | Q4_K_M | 186.41 | 8.38 |
+| **Qwen3-8B** | Q4_K_M | 346.75 | 5.11 |
+| **Llama-3.2-1B** | Q8_0 | 71.46 | 17.05 |
+
+*Tested on Intel i7-10870H (8 cores, AVX2)*
+
+---
+
 ## [0.2.0] - 2025-12-16
 
 ### Added
@@ -99,27 +126,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - High memory usage (no paging)
 - No quantization support
 - CLI-only interface
-
----
-
-## [Unreleased]
-
-### Planned Features
-
-- **Width Pruning:** Reduce hidden dimensions for additional compression
-- **Attention Pruning:** Remove unnecessary attention heads
-- **SmoothQuant:** Better INT8 quantization for activation-sensitive models
-- **Mixed Precision:** INT4/INT8 hybrid quantization
-- **Model Conversion CLI:** Direct HF→GGUF conversion tool
-- **Batch Processing:** Native batch inference support
-- **Tool Calling:** Function calling for agent applications
-- **Structured Output:** JSON schema enforcement
-
-### Performance Targets
-
-- 5x speedup vs. Transformers (from current 3x)
-- Support for 70B+ models on CPU
-- Sub-50ms latency for 0.5B models
 
 ---
 
