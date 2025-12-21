@@ -96,28 +96,36 @@ ENV CGO_CFLAGS="-I/app/core/include"
 RUN CGO_ENABLED=1 GOOS=linux go build -o /densecore-server .
 
 # ============================================
-# Stage 3: Runtime
+# Stage 3: Runtime (Debian glibc for C++ performance)
 # ============================================
-FROM alpine:3.19
+FROM debian:bookworm-slim
 
 # Install runtime dependencies
-RUN apk add --no-cache \
-    libstdc++ \
-    libgcc \
-    libgomp \
+# - libgomp1: OpenMP runtime for parallel C++ kernels
+# - libstdc++6: C++ standard library (glibc version)
+# - tini: proper init for signal handling in containers
+# - curl: for health checks (lighter than wget on Debian)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    wget \
-    tini
+    libgomp1 \
+    libstdc++6 \
+    tini \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN addgroup -g 1000 densecore && \
-    adduser -u 1000 -G densecore -D densecore
+# Create non-root user (Debian syntax)
+RUN groupadd -g 1000 densecore && \
+    useradd -u 1000 -g densecore -m -s /sbin/nologin densecore
 
 # Create directories
 RUN mkdir -p /app/models /app/lib && \
     chown -R densecore:densecore /app
 
 WORKDIR /app
+
+# Copy entrypoint script for OMP thread tuning
+COPY scripts/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # Copy binaries and libraries
 COPY --from=builder /densecore-server /app/densecore-server
@@ -148,12 +156,9 @@ ENV PORT=8080 \
 # Expose port
 EXPOSE 8080
 
-# Health check
+# Health check (using curl instead of wget for Debian)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD wget -q --spider http://localhost:8080/health/live || exit 1
+    CMD curl -sf http://localhost:8080/health/live || exit 1
 
-# Use tini as init system for proper signal handling
-ENTRYPOINT ["/sbin/tini", "--"]
-
-# Run the server
-CMD ["/app/densecore-server"]
+# Use tini as init system with entrypoint for OMP configuration
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]

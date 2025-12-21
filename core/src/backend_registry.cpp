@@ -1,0 +1,124 @@
+/**
+ * @file backend_registry.cpp
+ * @brief Backend registry implementation
+ *
+ * Provides global backend management with thread-safe registration
+ * and default backend selection.
+ */
+
+#include "backend_registry.h"
+#include "cpu_backend.h"
+#include <iostream>
+
+namespace densecore {
+
+// =============================================================================
+// Singleton Instance
+// =============================================================================
+
+BackendRegistry &BackendRegistry::Instance() {
+  static BackendRegistry instance;
+  return instance;
+}
+
+// =============================================================================
+// Registration
+// =============================================================================
+
+void BackendRegistry::RegisterCpuBackend() {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // Already registered?
+  if (backends_.find(DeviceType::CPU) != backends_.end()) {
+    return;
+  }
+
+  // Create and register CPU backend
+  auto cpu_backend = std::make_unique<CpuBackend>();
+  std::cout << "[BackendRegistry] Registered CPU backend: "
+            << cpu_backend->Name() << std::endl;
+
+  backends_[DeviceType::CPU] = std::move(cpu_backend);
+  default_device_ = DeviceType::CPU;
+  initialized_ = true;
+}
+
+void BackendRegistry::Register(DeviceType device,
+                               std::unique_ptr<ComputeBackend> backend) {
+  if (!backend) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  std::cout << "[BackendRegistry] Registered backend: " << backend->Name()
+            << " for device: " << DeviceTypeName(device) << std::endl;
+
+  backends_[device] = std::move(backend);
+
+  // If this is the first backend, set it as default
+  if (!initialized_) {
+    default_device_ = device;
+    initialized_ = true;
+  }
+}
+
+// =============================================================================
+// Accessors
+// =============================================================================
+
+ComputeBackend *BackendRegistry::Get(DeviceType device) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto it = backends_.find(device);
+  if (it != backends_.end()) {
+    return it->second.get();
+  }
+
+  return nullptr;
+}
+
+ComputeBackend *BackendRegistry::GetDefault() {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  // Auto-register CPU backend on first use if nothing registered
+  if (!initialized_) {
+    mutex_.unlock(); // Release lock before calling RegisterCpuBackend
+    RegisterCpuBackend();
+    mutex_.lock();
+  }
+
+  auto it = backends_.find(default_device_);
+  if (it != backends_.end()) {
+    return it->second.get();
+  }
+
+  // Fallback: return first available backend
+  if (!backends_.empty()) {
+    return backends_.begin()->second.get();
+  }
+
+  return nullptr;
+}
+
+bool BackendRegistry::SetDefault(DeviceType device) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  if (backends_.find(device) != backends_.end()) {
+    default_device_ = device;
+    std::cout << "[BackendRegistry] Default backend set to: "
+              << DeviceTypeName(device) << std::endl;
+    return true;
+  }
+
+  std::cerr << "[BackendRegistry] Cannot set default: device "
+            << DeviceTypeName(device) << " not registered" << std::endl;
+  return false;
+}
+
+bool BackendRegistry::IsRegistered(DeviceType device) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return backends_.find(device) != backends_.end();
+}
+
+} // namespace densecore

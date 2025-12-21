@@ -20,7 +20,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <new> // For std::hardware_destructive_interference_size
+#include <queue>
+#include <string>
 
 namespace densecore {
 
@@ -256,16 +259,20 @@ public:
    *
    * @param item Item to enqueue
    * @param tier Priority tier ("premium", "standard", "batch")
+   *
+   * NOTE: Mutex synchronization added for robust cross-platform thread-safety.
+   * Lock-free was causing visibility issues on some platforms (WSL, ARM).
    */
   void Push(T *item, const std::string &tier) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (tier == "premium") {
-      premium_.Push(item);
+      premium_.push(item);
     } else if (tier == "batch") {
-      batch_.Push(item);
+      batch_.push(item);
     } else {
-      standard_.Push(item);
+      standard_.push(item);
     }
-    size_.fetch_add(1, std::memory_order_relaxed);
+    size_++;
   }
 
   /**
@@ -274,17 +281,24 @@ public:
    * @return Item pointer, or nullptr if all queues empty
    */
   T *Pop() {
+    std::lock_guard<std::mutex> lock(mutex_);
     // Check tiers in priority order
-    if (T *item = premium_.Pop()) {
-      size_.fetch_sub(1, std::memory_order_relaxed);
+    if (!premium_.empty()) {
+      T *item = premium_.front();
+      premium_.pop();
+      size_--;
       return item;
     }
-    if (T *item = standard_.Pop()) {
-      size_.fetch_sub(1, std::memory_order_relaxed);
+    if (!standard_.empty()) {
+      T *item = standard_.front();
+      standard_.pop();
+      size_--;
       return item;
     }
-    if (T *item = batch_.Pop()) {
-      size_.fetch_sub(1, std::memory_order_relaxed);
+    if (!batch_.empty()) {
+      T *item = batch_.front();
+      batch_.pop();
+      size_--;
       return item;
     }
     return nullptr;
@@ -294,19 +308,24 @@ public:
    * @brief Check if all queues appear empty
    */
   bool Empty() const noexcept {
-    return premium_.Empty() && standard_.Empty() && batch_.Empty();
+    std::lock_guard<std::mutex> lock(mutex_);
+    return premium_.empty() && standard_.empty() && batch_.empty();
   }
 
   /**
-   * @brief Get approximate queue size
+   * @brief Get queue size
    */
-  size_t Size() const noexcept { return size_.load(std::memory_order_relaxed); }
+  size_t Size() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return size_;
+  }
 
 private:
-  LockFreeQueue<T> premium_;  // Tier 0: highest priority
-  LockFreeQueue<T> standard_; // Tier 1: default
-  LockFreeQueue<T> batch_;    // Tier 2: lowest priority
-  std::atomic<size_t> size_{0};
+  mutable std::mutex mutex_; // For thread-safe access
+  std::queue<T *> premium_;  // Tier 0: highest priority
+  std::queue<T *> standard_; // Tier 1: default
+  std::queue<T *> batch_;    // Tier 2: lowest priority
+  size_t size_{0};
 };
 
 } // namespace densecore

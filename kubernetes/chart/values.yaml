@@ -147,6 +147,9 @@ autoscaling:
   # KEDA-specific configuration (used when type: "keda")
   # ==========================================================================
   keda:
+    # Enable KEDA ScaledObject (set to true to disable HPA and use KEDA instead)
+    enabled: false
+    
     # Prometheus server address
     prometheusServerAddress: "http://prometheus-server.monitoring.svc.cluster.local:80"
     

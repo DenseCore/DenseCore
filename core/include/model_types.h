@@ -9,6 +9,27 @@
 #include <string>
 #include <vector>
 
+// ============================================================================
+// Model Architecture Enum
+// ============================================================================
+// Explicit enumeration of supported model architectures for fail-fast
+// validation and architecture-specific code paths.
+// ============================================================================
+enum class ModelArch : uint8_t {
+  UNKNOWN = 0,
+  LLAMA,
+  QWEN2,
+  QWEN3,
+  // Add more architectures as needed
+};
+
+// Architecture-specific feature flags
+// These flags enable explicit checks instead of implicit null-pointer guards
+struct ModelArchFlags {
+  bool requires_q_norm = false; // Qwen3: RMS norm on Q before attention
+  bool requires_k_norm = false; // Qwen3: RMS norm on K before attention
+};
+
 // Forward declaration for RoPE table (defined in simd_ops.h)
 namespace densecore {
 namespace simd {
@@ -100,6 +121,10 @@ struct TransformerModel {
   // Tied embeddings flag (output = tok_embeddings)
   bool tied_embeddings = false;
   struct gguf_context *ctx_gguf = nullptr;
+
+  // Architecture detection (for arch-specific code paths and validation)
+  ModelArch arch = ModelArch::UNKNOWN;
+  ModelArchFlags arch_flags;
 
   // Tokenizer data
   std::vector<std::string> vocab_tokens;

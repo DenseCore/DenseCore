@@ -1,156 +1,83 @@
-<div align="center">
+# DenseCore: High-Performance CPU Inference for LLMs
 
-# 🚀 DenseCore
+DenseCore is a specialized C++ inference engine optimized for Intel/AMD CPUs, delivering state-of-the-art performance for LLMs on consumer and server hardware.
 
-### **High-Performance CPU Inference Engine for LLMs**
+## 🚀 Key Features
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/densecore?color=blue)](https://pypi.org/project/densecore/)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](python/)
-[![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](Dockerfile)
+- **SIMD Optimized**: AVX2, AVX-512, and ARM NEON support
+- **Quantization**: Q4_K_M, Q8_0 with native vec_dot kernels
+- **Smart Dispatching**: Hybrid GEMV (Decode) / GEMM (Prefill) strategies
+- **Cloud Native**: Kubernetes, Helm charts, Docker multi-stage builds
+- **GGUF Native**: Direct HuggingFace model loading
 
-**Make Small Language Models production-ready on CPUs with AVX-512 optimization.**
+## 📊 Performance Benchmarks
 
-[Quick Start](#-quick-start) • [Why DenseCore](#-why-densecore) • [LangChain](#-langchain-integration) • [Benchmarks](#-benchmarks)
+*Intel i7-10870H (8 cores, AVX2)*
 
-</div>
+| Model | Quantization | TTFT (ms) | Speed (tok/s) |
+|-------|--------------|-----------|---------------|
+| **Qwen3-0.6B** | Q8_0 | 56.58 | 22.81 |
+| **Qwen3-4B** | Q4_K_M | 186.41 | 8.38 |
+| **Qwen3-8B** | Q4_K_M | 346.75 | 5.11 |
+| **Llama-3.2-1B** | Q8_0 | 71.46 | 17.05 |
+| Qwen2.5-0.5B | Q4_K_M | 50.85 | 29.66 |
+| TinyLlama-1.1B | Q4_K_M | 43.06 | 24.68 |
 
----
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for full report.
 
-## ⚡ Quick Start
+## 🛠️ Quick Start
 
-### Installation
+```python
+from densecore import DenseCore
+
+# Load from HuggingFace
+model = DenseCore(hf_repo_id="Qwen/Qwen3-0.6B-GGUF")
+
+# Generate text
+for token in model.generate("The capital of France is", max_tokens=64, stream=True):
+    print(token, end="", flush=True)
+```
+
+## 📦 Installation
 
 ```bash
-# Install from source (requires C++ compiler)
-pip install .
-
-# Or install from PyPI
 pip install densecore
 ```
 
-### Python SDK
-
-```python
-from densecore import AutoModel
-
-# Auto-download and load model
-model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct-GGUF")
-
-# Generate text
-print(model.generate("Hello world!"))
-```
-
-### 🦜🔗 LangChain Integration
-
-Build agents in 5 lines of code:
-
-```python
-from densecore.langchain import DenseCoreChatModel
-from langchain_core.messages import HumanMessage
-
-chat = DenseCoreChatModel(hf_repo_id="Qwen/Qwen2.5-0.5B-Instruct-GGUF")
-chat_with_tools = chat.bind_tools([calculator_tool])
-
-response = chat_with_tools.invoke([HumanMessage(content="What is 25 * 4?")])
-print(response.content)
-```
-
----
-
-## 🎯 Why DenseCore?
-
-We built DenseCore because **GPUs are scarce**, but CPUs are everywhere.
-
-<table>
-<tr>
-<td width="50%">
-
-### 🔥 High-Performance Core
-- **AVX-512 & AMX Optimized**: Hand-tuned Assembly kernels.
-- **PagedAttention on CPU**: Zero-copy KV cache management.
-- **Runtime SIMD Dispatch**: Auto-selects AVX-512/AVX2/Scalar.
-- **Continuous Batching**: High throughput for server workloads.
-
-</td>
-<td width="50%">
-
-### 🛠️ Developer Ready
-- **OpenAI API Compatible**: Drop-in replacement server.
-- **LangChain/LangGraph Ready**: Native tool calling support.
-- **HuggingFace Integration**: Seamless model downloading.
-- **Easy Installation**: `pip install .` works out of the box.
-
-</td>
-</tr>
-</table>
-
----
-
-## 📊 Benchmarks
-
-**Environment:** 4-core vCPU, 8GB RAM (AWS c7i.large) — **No GPU**.
-
-| Model | DenseCore (AVX-512) | Transformers (Standard) | Speedup |
-|-------|---------------------|--------------------------|---------| 
-| **Qwen2.5-0.5B** | **Pending** | ~3-4 tok/s | **-** |
-| **Qwen3-4B** | **Pending** | ~1.5 tok/s | **-** |
-| **TinyLlama-1.1B** | **22.1** | ~2 tok/s | **11x** |
-
-> **Status Update (2025-12-20):** AVX2 kernel hardening applied. All SIMD unit tests pass (32/32).
-> Multi-threaded inference on AVX2 hardware (Intel Comet Lake) has a known threading issue being investigated.
-> Single-thread mode (`--threads 1`) or AVX-512 hardware works correctly.
-
-> Run the benchmark script to test your machine: `python benchmarks/benchmark_throughput.py --model model.gguf`
-
----
-
-## 🛠️ Model Optimization Tools
-
-Includes built-in tools to compress models (Quantization & Pruning) for edge deployment.
-
-```python
-from densecore.quantize import quantize_model, INT4_PAPER_CFG
-
-# Custom INT4 with AVX512-optimized kernels (5-6× faster inference!)
-quantize_model("model.gguf", "model-int4.gguf", config=INT4_PAPER_CFG(block_size=128))
-```
-
-📖 **[Optimization Guide →](docs/MODEL_OPTIMIZATION.md)**
-
----
-
-## 📚 Documentation
-
-| Component | Description |
-|-----------|-------------|
-| **[Python SDK](python/README.md)** | Full guide for Python developers. |
-| **[API Reference](docs/API_REFERENCE.md)** | Detailed API docs for Python, C, and Go. |
-| **[INT4 Quantization](docs/INT4_QUANTIZATION.md)** | AVX512-optimized INT4 with 5-6× speedup. |
-| **[NUMA Optimization](docs/NUMA_OPTIMIZATION.md)** | Multi-socket server optimization guide. |
-| **[Architecture](docs/ARCHITECTURE.md)** | Deep dive into the C++ internal design. |
-| **[Deployment](docs/DEPLOYMENT.md)** | Docker and Kubernetes setup guides. |
-| **[Contributing](CONTRIBUTING.md)** | How to build and contribute to DenseCore. |
-
----
-
-## 🤝 Contributing
-
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+## 🐳 Docker
 
 ```bash
-git clone https://github.com/Jake-Network/DenseCore.git
-cd DenseCore
-make lib && cd python && pip install -e ".[dev]"
-pytest
+docker pull densecore/densecore:latest
+docker run -p 8080:8080 -v /models:/app/models densecore/densecore
 ```
 
----
+## ☸️ Kubernetes
 
-<div align="center">
+```bash
+helm install densecore ./charts/densecore \
+  --set model.repository=Qwen/Qwen3-0.6B-GGUF
+```
 
-**Apache 2.0 License** • [Documentation](docs/) • [Discord](https://discord.gg/densecore) • [Twitter](https://twitter.com/densecore)
+## 🏗️ Build from Source
 
-Made with ❤️ for the CPU-first AI era
+```bash
+# Build C++ core
+cd core && mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
 
-</div>
+# Install Python bindings
+cd ../../python && pip install -e .
+```
+
+## 🎯 Supported Models
+
+| Family | Status | Examples |
+|--------|--------|----------|
+| **Llama** | ✅ Stable | Llama-2, Llama-3, Llama-3.2 |
+| **Qwen** | ✅ Stable | Qwen2.5, Qwen3 (0.6B-8B) |
+| **TinyLlama** | ✅ Stable | TinyLlama-1.1B |
+
+## 📄 License
+
+Apache 2.0

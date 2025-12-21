@@ -170,7 +170,7 @@ spec:
           volumeMounts:
             - name: model-volume
               mountPath: /models
-              readOnly: false  # initContainer needs write access
+              readOnly: true  # Init Container writes, main container reads only
       
       # ============================================
       # Volumes Configuration

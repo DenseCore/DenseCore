@@ -54,7 +54,7 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) ||             \
     defined(_M_IX86)
 #define DENSECORE_X86
-#include <immintrin.h>
+#include "simd_platform.h"
 #elif defined(__aarch64__) || defined(_M_ARM64)
 #define DENSECORE_ARM
 #include <arm_neon.h>
@@ -1342,11 +1342,14 @@ inline void ApplyRoPE_AVX2(float *out, const float *in, const float *cos_sin,
     float *out_ptr = out + t * head_dim;
 
     // Prefetch next token's cos/sin
+    // Removed for stability on AVX2 (potential OOB or TLB issues)
+    /*
     if (t + 1 < t_end) {
       _mm_prefetch(
           reinterpret_cast<const char *>(cos_sin + positions[t + 1] * head_dim),
           _MM_HINT_T0);
     }
+    */
 
     // Process 8 floats (4 pairs) at a time
     int d = 0;
@@ -3129,6 +3132,178 @@ inline void ComputeQKV(float *q, float *k, float *v, const float *x,
                       ith, nth);
   }
 }
+
+// =============================================================================
+// Parallel GEMV for Decode-Phase (N=1) Inference
+// =============================================================================
+// GGML's ggml_mul_mat parallelizes along M (batch) dimension.
+// During decode (batch_size=1), there's NO parallelism opportunity.
+// This kernel parallelizes along K (output features) dimension instead.
+//
+// Threading Contract:
+//   - Each thread computes output[start:end] = x @ W[start:end, :]^T
+//   - Thread-safe: no shared state between threads
+//   - ith: thread index (0-based), nth: total threads
+// =============================================================================
+
+/**
+ * @brief Parallel GEMV for decode-phase linear operations
+ *
+ * Computes: output[start:end] = x @ W[start:end, :]^T
+ * where start/end are computed from ith/nth thread indices.
+ *
+ * @param output Output vector [K] (only portion [start:end] is written)
+ * @param x Input vector [N] (shared by all threads, read-only)
+ * @param weight Weight matrix [K, N] row-major (W[k, :] is row k)
+ * @param N Input dimension (number of features)
+ * @param K Output dimension (number of output features)
+ * @param ith Thread index (0-based)
+ * @param nth Total number of threads
+ */
+inline void GemvParallel(float *output, const float *x, const float *weight,
+                         int N, int K, int ith, int nth) {
+  // Partition output dimension across threads
+  const int k_per_thread = (K + nth - 1) / nth; // Ceiling division
+  const int k_start = ith * k_per_thread;
+  const int k_end = std::min(k_start + k_per_thread, K);
+
+  // Early exit if this thread has no work
+  if (k_start >= K)
+    return;
+
+  static const SimdLevel level = DetectSimdLevel();
+
+#if defined(__AVX2__) || defined(__AVX512F__)
+  // AVX2/AVX512 path with 2x unrolling
+  constexpr int UNROLL = 2;
+
+  auto hsum256 = [](__m256 v) -> float {
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    return _mm_cvtss_f32(s);
+  };
+
+  int k = k_start;
+  for (; k + UNROLL <= k_end; k += UNROLL) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+
+    const float *w0 = weight + k * N;
+    const float *w1 = weight + (k + 1) * N;
+
+    int n = 0;
+    for (; n + 8 <= N; n += 8) {
+      __m256 x_vec = _mm256_loadu_ps(x + n);
+      acc0 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w0 + n), acc0);
+      acc1 = _mm256_fmadd_ps(x_vec, _mm256_loadu_ps(w1 + n), acc1);
+    }
+
+    float sum0 = hsum256(acc0);
+    float sum1 = hsum256(acc1);
+
+    // Scalar remainder
+    for (; n < N; n++) {
+      sum0 += x[n] * w0[n];
+      sum1 += x[n] * w1[n];
+    }
+
+    output[k + 0] = sum0;
+    output[k + 1] = sum1;
+  }
+
+  // Handle remaining output elements
+  for (; k < k_end; k++) {
+    __m256 acc = _mm256_setzero_ps();
+    const float *w = weight + k * N;
+    int n = 0;
+    for (; n + 8 <= N; n += 8) {
+      acc =
+          _mm256_fmadd_ps(_mm256_loadu_ps(x + n), _mm256_loadu_ps(w + n), acc);
+    }
+    float sum = hsum256(acc);
+    for (; n < N; n++) {
+      sum += x[n] * w[n];
+    }
+    output[k] = sum;
+  }
+#else
+  // Scalar fallback
+  for (int k = k_start; k < k_end; k++) {
+    float sum = 0.0f;
+    const float *w = weight + k * N;
+    for (int n = 0; n < N; n++) {
+      sum += x[n] * w[n];
+    }
+    output[k] = sum;
+  }
+#endif
+}
+
+// =============================================================================
+// Quantized Dot Product Dispatcher (defined in simd_ops.cpp)
+// =============================================================================
+// These functions use GGML's native vec_dot kernels for zero-allocation
+// dot products. The input must be PRE-QUANTIZED by the caller.
+// =============================================================================
+
+/**
+ * @brief Compute dot product between quantized weight row and pre-quantized
+ * input
+ *
+ * Uses GGML's native vec_dot kernels for maximum performance.
+ * ZERO ALLOCATION: No memory is allocated inside this function.
+ *
+ * @param weight_type GGML type of the weight row (e.g., GGML_TYPE_Q4_K)
+ * @param w_row Pointer to quantized weight row
+ * @param input Pointer to PRE-QUANTIZED input (Q8_K for K-quants, Q8_0 for
+ * Q8_0, F32 for F32)
+ * @param n Number of elements
+ * @param output Pointer to output scalar (single float result)
+ *
+ * NOTE: The caller must pre-quantize the input to the correct format:
+ *   - Q4_K, Q5_K, Q6_K weights → input must be Q8_K
+ *   - Q8_0 weights → input must be Q8_0
+ *   - F32/F16 weights → input must be F32
+ */
+void ComputeDotProduct(int weight_type, const void *w_row, const void *input,
+                       int n, float *output);
+
+/**
+ * @brief Compute multiple dot products for a range of output rows
+ *
+ * Uses native vec_dot kernels with pre-quantized input for zero-allocation
+ * performance. Useful for parallel GEMV where each thread handles a subset
+ * of output rows.
+ *
+ * @param weight_type GGML type of the weight tensor
+ * @param weight Base pointer to weight tensor data
+ * @param row_stride Stride in bytes between rows
+ * @param input Pre-quantized input vector (same format requirements as above)
+ * @param n Number of elements per row
+ * @param output Float output vector [k_end - k_start]
+ * @param k_start First output row index (inclusive)
+ * @param k_end Last output row index (exclusive)
+ */
+void ComputeDotProductBatch(int weight_type, const void *weight,
+                            size_t row_stride, const void *input, int n,
+                            float *output, int k_start, int k_end);
+
+/**
+ * @brief Query the maximum supported buffer size for dequantization
+ * @return Maximum number of float elements that can be dequantized
+ * @note With pre-quantization, this is less relevant but kept for API compat
+ */
+size_t GetDequantizationBufferSize();
+
+/**
+ * @brief Check if a GGML type is supported by ComputeDotProduct
+ * @param type GGML type to check
+ * @return true if type is supported, false otherwise
+ */
+bool IsTypeSupported(int type);
 
 } // namespace simd
 } // namespace densecore

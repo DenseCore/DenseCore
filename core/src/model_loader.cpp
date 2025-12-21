@@ -148,6 +148,19 @@ TransformerModel *LoadGGUFModel(const char *path) {
 
   std::cout << "[DenseCore] Detected architecture: " << arch << std::endl;
 
+  // Set architecture enum and flags from detected string
+  if (arch == "llama") {
+    model->arch = ModelArch::LLAMA;
+  } else if (arch == "qwen2") {
+    model->arch = ModelArch::QWEN2;
+  } else if (arch == "qwen3") {
+    model->arch = ModelArch::QWEN3;
+    model->arch_flags.requires_q_norm = true;
+    model->arch_flags.requires_k_norm = true;
+  } else {
+    model->arch = ModelArch::UNKNOWN;
+  }
+
   // 2. Generic parameter loader using architecture prefix
   auto get_u32 = [&](const std::string &suffix, uint32_t &val) {
     // Try architecture-specific key first, then fallback to general
@@ -299,6 +312,25 @@ TransformerModel *LoadGGUFModel(const char *path) {
     return t;
   };
 
+  // Helper with fallback: tries primary key, then fallback without ".weight"
+  // suffix
+  auto get_tensor_with_fallback =
+      [&](const std::string &primary) -> struct ggml_tensor * {
+    struct ggml_tensor *t = ggml_get_tensor(model->ctx_w, primary.c_str());
+    if (t)
+      return t;
+
+    // Fallback: strip ".weight" suffix if present and try again
+    const std::string suffix = ".weight";
+    if (primary.size() > suffix.size() &&
+        primary.compare(primary.size() - suffix.size(), suffix.size(),
+                        suffix) == 0) {
+      std::string fallback = primary.substr(0, primary.size() - suffix.size());
+      t = ggml_get_tensor(model->ctx_w, fallback.c_str());
+    }
+    return t;
+  };
+
   model->tok_embeddings = get_tensor("token_embd.weight");
   model->output_norm = get_tensor("output_norm.weight");
 
@@ -373,16 +405,21 @@ TransformerModel *LoadGGUFModel(const char *path) {
     model->layers[i].bv = get_tensor(layer_prefix + "attn_v.bias");
     model->layers[i].bo = get_tensor(layer_prefix + "attn_output.bias");
 
-    // QK-Norm (Qwen3)
+    // QK-Norm (Qwen3) - uses fallback for different GGUF naming conventions
     model->layers[i].attn_q_norm =
-        get_tensor(layer_prefix + "attn_q_norm.weight");
+        get_tensor_with_fallback(layer_prefix + "attn_q_norm.weight");
     model->layers[i].attn_k_norm =
-        get_tensor(layer_prefix + "attn_k_norm.weight");
+        get_tensor_with_fallback(layer_prefix + "attn_k_norm.weight");
 
     if (i == 0) {
       if (model->layers[i].attn_q_norm && model->layers[i].attn_k_norm) {
-        std::cout << "[DenseCore] QK-Norm tensors found (Qwen3 architecture)"
-                  << std::endl;
+        std::cout
+            << "[DenseCore] Qwen3 architecture detected: Q/K Norms enabled"
+            << std::endl;
+        std::cout << "[DenseCore]   attn_q_norm shape: ["
+                  << model->layers[i].attn_q_norm->ne[0] << "]" << std::endl;
+        std::cout << "[DenseCore]   attn_k_norm shape: ["
+                  << model->layers[i].attn_k_norm->ne[0] << "]" << std::endl;
       }
     }
 
@@ -413,6 +450,39 @@ TransformerModel *LoadGGUFModel(const char *path) {
   std::cout << "[DenseCore] Head dimensions: n_embd_head_k="
             << model->hparams.n_embd_head_k
             << ", n_embd_head_v=" << model->hparams.n_embd_head_v << std::endl;
+
+  // =========================================================================
+  // QWEN3 ARCHITECTURE VALIDATION
+  // =========================================================================
+  // Qwen3 requires per-head Q/K normalization. If these tensors are missing,
+  // the model will produce incorrect outputs. Fail fast instead of silently
+  // corrupting results.
+  // =========================================================================
+  if (model->arch == ModelArch::QWEN3) {
+    bool has_qk_norms = true;
+    for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
+      if (!model->layers[i].attn_q_norm || !model->layers[i].attn_k_norm) {
+        has_qk_norms = false;
+        break;
+      }
+    }
+    if (!has_qk_norms) {
+      std::cerr << "[DenseCore] FATAL: Qwen3 model requires attn_q_norm and "
+                << "attn_k_norm tensors, but they are missing from GGUF file."
+                << std::endl;
+      std::cerr << "[DenseCore] This is a corrupted or incompatible GGUF. "
+                << "Aborting load to prevent incorrect outputs." << std::endl;
+      if (model->backend)
+        ggml_backend_free(model->backend);
+      gguf_free(ctx_gguf);
+      if (ctx_w)
+        ggml_free(ctx_w);
+      delete model;
+      return nullptr;
+    }
+    std::cout << "[DenseCore] Qwen3 architecture validated: Q/K norms present"
+              << std::endl;
+  }
 
   // Initialize pre-computed RoPE table for optimized inference
   std::cout << "[DenseCore] Initializing RoPE table..." << std::endl;

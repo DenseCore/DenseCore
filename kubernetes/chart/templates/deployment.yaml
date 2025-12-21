@@ -138,12 +138,7 @@ spec:
           volumeMounts:
             - name: model-volume
               mountPath: /models
-              {{- if eq .Values.persistence.type "pvc" }}
-              # PVC: main container reads only, init container writes
-              readOnly: false
-              {{- else }}
-              readOnly: false
-              {{- end }}
+              readOnly: true
       
       # ========================================================================
       # Volumes Configuration

@@ -98,6 +98,49 @@ struct InternalMetrics {
 };
 
 /**
+ * ResultEvent structure for decoupled callback execution.
+ *
+ * This struct stores all necessary data to execute a callback without
+ * holding a reference to the Request object. This allows EngineLoop to
+ * release requests immediately after pushing to the queue, avoiding the
+ * need for complex reference counting.
+ *
+ * For embedding callbacks, embedding_data uses std::vector for RAII-safe
+ * memory management - no manual new/delete required.
+ */
+struct ResultEvent {
+  int request_id;
+  std::string token_str;
+  bool finished;
+  bool error;
+
+  // Callback pointers (copied from Request at event creation time)
+  TokenCallback callback;
+  EmbeddingCallback emb_callback;
+  void *user_data;
+
+  // Embedding data (RAII-managed via std::vector)
+  std::vector<float> embedding_data;
+
+  ResultEvent()
+      : request_id(-1), finished(false), error(false), callback(nullptr),
+        emb_callback(nullptr), user_data(nullptr) {}
+
+  // Move constructor - std::vector handles move semantics automatically
+  ResultEvent(ResultEvent &&other) noexcept = default;
+
+  // Move assignment - std::vector handles move semantics automatically
+  ResultEvent &operator=(ResultEvent &&other) noexcept = default;
+
+  // Disable copy (maintain move-only semantics for queue efficiency)
+  ResultEvent(const ResultEvent &) = delete;
+  ResultEvent &operator=(const ResultEvent &) = delete;
+
+  // Default destructor - std::vector handles cleanup automatically
+  ~ResultEvent() = default;
+};
+
+/**
  * Request structure representing a single inference request.
  *
  * Lifecycle:
@@ -152,6 +195,38 @@ struct Request {
   int priority = 100;
   bool is_high_priority = false;
   int estimated_length = 0;
+
+  // Scheduler sequence ID (assigned by scheduler->AddRequest)
+  // -1 indicates not yet registered with scheduler
+  int seq_id = -1;
+
+  // Reset request state for pool reuse
+  void Reset() {
+    id = -1;
+    prompt = "";
+    max_tokens = 0;
+    callback = nullptr;
+    user_data = nullptr;
+    tokens.clear();
+    n_past = 0;
+    is_prefill = true;
+    generated_count = 0;
+    finished = false;
+    cancelled = false;
+    tier = "standard";
+    block_table.clear();
+    is_embedding = false;
+    embedding_callback = nullptr;
+    pooling_type = densecore::PoolingStrategy::MEAN;
+    normalize_embedding = true;
+    json_mode = false;
+    grammar.enabled = false;
+    grammar.is_json_mode = false;
+    priority = 100;
+    is_high_priority = false;
+    estimated_length = 0;
+    seq_id = -1;
+  }
 
   // Destructor for cleanup
   ~Request() {
@@ -331,10 +406,22 @@ struct EngineState {
   // Metrics
   InternalMetrics metrics;
 
+  // ===========================================================================
+  // DECOUPLED CALLBACK QUEUE (Resolves Streaming Deadlock)
+  // ===========================================================================
+  // Callbacks are pushed to this queue by EngineLoop and executed by a
+  // dedicated CallbackLoop thread. This prevents the worker thread from
+  // blocking on the Python GIL during callback execution.
+  // ===========================================================================
+  std::deque<ResultEvent> result_queue;
+  std::mutex result_mu;
+  std::condition_variable result_cv;
+  std::thread callback_thread;
+
   // Persistent compute buffer for GGML context (eliminates malloc overhead)
   // Allocated once at startup, reused across iterations
   static constexpr size_t COMPUTE_BUFFER_SIZE =
-      1024ULL * 1024ULL * 4096ULL; // 4GB
+      1024ULL * 1024ULL * 512ULL; // 512MB (Reduced from 4GB for RAM efficiency)
   std::unique_ptr<char[]> compute_buffer;
   bool compute_buffer_initialized = false;
 
@@ -351,6 +438,10 @@ struct EngineState {
   std::map<int, GraphMetadata> graph_cache;
   std::mutex graph_mu;
 
+  // Persistent compute context for "Rebuild Graph, Reuse Memory" strategy
+  // This eliminates malloc/free overhead during decode by reusing memory pool
+  InferenceContext inference_ctx;
+
   void InitComputeBuffer() {
     if (!compute_buffer_initialized) {
       // Use 64-byte alignment for AVX-512 compatibility
@@ -364,17 +455,62 @@ struct EngineState {
     }
   }
 
-  void InitGraphCache() {
-    // Initialize persistent graph context (holds node definitions)
-    // 16MB should be enough for graph topology metadata
+  /**
+   * Calculate required context memory based on model parameters.
+   * Returns size in bytes.
+   */
+  static size_t CalculateGraphContextSize(const TransformerModel *model) {
+    if (!model) {
+      return 512ULL * 1024 * 1024; // 512MB default if no model
+    }
+
+    const auto &hp = model->hparams;
+
+    // Estimate memory per layer:
+    // - QKV projections: 3 × n_embd × batch × sizeof(float)
+    // - Attention scores: n_head × seq_len × seq_len × sizeof(float)
+    // - FFN intermediates: 4 × n_embd × batch × sizeof(float)
+    // Conservative estimate: ~32 tensors per layer averaging n_embd size
+    size_t per_layer_estimate =
+        32ULL * hp.n_embd * sizeof(float) * 128; // assume batch×seq≈128
+
+    // Total for all layers
+    size_t base_size = hp.n_layer * per_layer_estimate;
+
+    // Add overhead for graph metadata, KV cache tensors, embeddings
+    size_t overhead =
+        (size_t)hp.n_embd * hp.n_vocab * sizeof(float); // embedding table
+    overhead += (size_t)hp.n_layer * hp.n_ctx * hp.n_head_kv * 64 *
+                sizeof(float) * 2; // K+V worst case
+
+    // Total with 50% safety margin
+    size_t total = (size_t)((base_size + overhead) * 1.5);
+
+    // Clamp to reasonable bounds: [256MB, 4GB]
+    constexpr size_t MIN_SIZE = 256ULL * 1024 * 1024; // 256 MB
+    constexpr size_t MAX_SIZE =
+        2ULL * 1024 * 1024 * 1024; // 2 GB (Reduced for RAM efficiency)
+
+    if (total < MIN_SIZE)
+      total = MIN_SIZE;
+    if (total > MAX_SIZE)
+      total = MAX_SIZE;
+
+    return total;
+  }
+
+  void InitGraphCache(const TransformerModel *model = nullptr) {
+    // Calculate context size dynamically based on model
+    size_t mem_size = CalculateGraphContextSize(model);
+
     struct ggml_init_params params = {
-        .mem_size = 512 * 1024 * 1024, // 512 MB for complex graph caching
+        .mem_size = mem_size,
         .mem_buffer = nullptr,
         .no_alloc = false,
     };
     graph_ctx = ggml_init(params);
-    std::cerr << "[DenseCore] InitGraphCache: Context initialized with 512 MB"
-              << std::endl;
+    std::cerr << "[DenseCore] InitGraphCache: Context initialized with "
+              << (mem_size / (1024 * 1024)) << " MB" << std::endl;
   }
 
   void FreeGraphCache() {
@@ -490,9 +626,15 @@ struct EngineState {
     // Transition to STOPPED and notify worker
     status = EngineStatus::STOPPED;
     queue_cv.notify_all();
+    result_cv.notify_all(); // Wake up callback thread
 
     if (worker_thread.joinable()) {
       worker_thread.join();
+    }
+
+    // Join callback thread after draining result queue
+    if (callback_thread.joinable()) {
+      callback_thread.join();
     }
 
     // Cleanup all models - smart pointers handle automatic cleanup
@@ -515,7 +657,50 @@ struct EngineState {
   }
 };
 
-// Worker function declaration
+// Worker function declarations
 void EngineLoop(EngineState *state);
+void CallbackLoop(EngineState *state);
+
+// Helper to push result events to the callback queue
+inline void PushResultEvent(EngineState *state, int request_id,
+                            const std::string &token, bool finished, bool error,
+                            TokenCallback cb, void *user_data) {
+  ResultEvent event;
+  event.request_id = request_id;
+  event.token_str = token;
+  event.finished = finished;
+  event.error = error;
+  event.callback = cb;
+  event.user_data = user_data;
+  event.emb_callback = nullptr;
+  // embedding_data is default-constructed as empty vector (no assignment
+  // needed)
+
+  {
+    std::lock_guard<std::mutex> lock(state->result_mu);
+    state->result_queue.push_back(std::move(event));
+  }
+  state->result_cv.notify_one();
+}
+
+// Helper for embedding results (RAII-safe: takes ownership via std::move)
+inline void PushEmbeddingResultEvent(EngineState *state, int request_id,
+                                     std::vector<float> embedding_data,
+                                     EmbeddingCallback cb, void *user_data) {
+  ResultEvent event;
+  event.request_id = request_id;
+  event.finished = true;
+  event.error = false;
+  event.callback = nullptr;
+  event.emb_callback = cb;
+  event.user_data = user_data;
+  event.embedding_data = std::move(embedding_data); // RAII ownership transfer
+
+  {
+    std::lock_guard<std::mutex> lock(state->result_mu);
+    state->result_queue.push_back(std::move(event));
+  }
+  state->result_cv.notify_one();
+}
 
 #endif // DENSECORE_ENGINE_INTERNAL_H

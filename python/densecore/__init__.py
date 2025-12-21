@@ -33,6 +33,7 @@ Features:
 """
 
 from typing import TYPE_CHECKING
+print("[DEBUG] densecore package init start")
 
 # Core exports
 from .engine import DenseCore
