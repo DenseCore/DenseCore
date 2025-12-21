@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "densecore"
-version = "0.1.0"
-description = "High-Performance CPU Inference Engine for LLMs with HuggingFace Integration"
+version = "0.3.0"
+description = "High-Performance Heterogeneous Inference Engine (AVX-512/AMX/SVE) for LLMs"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">= 3.9"
@@ -22,6 +22,9 @@ keywords = [
     "machine-learning",
     "deep-learning",
     "ai",
+    "amx",
+    "sve",
+    "arm",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

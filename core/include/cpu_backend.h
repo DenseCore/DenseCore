@@ -74,7 +74,8 @@ public:
                           const Tensor &wk, const Tensor &wv, Tensor *q_out,
                           Tensor *k_out, Tensor *v_out) override;
   void FlashAttention(const Tensor &Q, const Tensor &K, const Tensor &V,
-                      Tensor *output, float scale, bool causal = true) override;
+                      Tensor *output, float scale, bool causal = true,
+                      int n_head_kv = -1) override;
   void Synchronize() override { /* No-op for CPU */ }
 
   // ===========================================================================

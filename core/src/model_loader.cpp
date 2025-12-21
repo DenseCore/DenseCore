@@ -299,6 +299,25 @@ TransformerModel *LoadGGUFModel(const char *path) {
     return t;
   };
 
+  // Helper with fallback: tries primary key, then fallback without ".weight"
+  // suffix
+  auto get_tensor_with_fallback =
+      [&](const std::string &primary) -> struct ggml_tensor * {
+    struct ggml_tensor *t = ggml_get_tensor(model->ctx_w, primary.c_str());
+    if (t)
+      return t;
+
+    // Fallback: strip ".weight" suffix if present and try again
+    const std::string suffix = ".weight";
+    if (primary.size() > suffix.size() &&
+        primary.compare(primary.size() - suffix.size(), suffix.size(),
+                        suffix) == 0) {
+      std::string fallback = primary.substr(0, primary.size() - suffix.size());
+      t = ggml_get_tensor(model->ctx_w, fallback.c_str());
+    }
+    return t;
+  };
+
   model->tok_embeddings = get_tensor("token_embd.weight");
   model->output_norm = get_tensor("output_norm.weight");
 
@@ -373,16 +392,21 @@ TransformerModel *LoadGGUFModel(const char *path) {
     model->layers[i].bv = get_tensor(layer_prefix + "attn_v.bias");
     model->layers[i].bo = get_tensor(layer_prefix + "attn_output.bias");
 
-    // QK-Norm (Qwen3)
+    // QK-Norm (Qwen3) - uses fallback for different GGUF naming conventions
     model->layers[i].attn_q_norm =
-        get_tensor(layer_prefix + "attn_q_norm.weight");
+        get_tensor_with_fallback(layer_prefix + "attn_q_norm.weight");
     model->layers[i].attn_k_norm =
-        get_tensor(layer_prefix + "attn_k_norm.weight");
+        get_tensor_with_fallback(layer_prefix + "attn_k_norm.weight");
 
     if (i == 0) {
       if (model->layers[i].attn_q_norm && model->layers[i].attn_k_norm) {
-        std::cout << "[DenseCore] QK-Norm tensors found (Qwen3 architecture)"
-                  << std::endl;
+        std::cout
+            << "[DenseCore] Qwen3 architecture detected: Q/K Norms enabled"
+            << std::endl;
+        std::cout << "[DenseCore]   attn_q_norm shape: ["
+                  << model->layers[i].attn_q_norm->ne[0] << "]" << std::endl;
+        std::cout << "[DenseCore]   attn_k_norm shape: ["
+                  << model->layers[i].attn_k_norm->ne[0] << "]" << std::endl;
       }
     }
 

@@ -364,18 +364,13 @@ class DenseCore:
         # Initialize engine
         model_path_bytes = model_path.encode("utf-8")
 
-        self._handle = self._lib.InitEngine(model_path_bytes, None, threads)
-        if not self._handle:
-            raise RuntimeError(f"Failed to initialize DenseCore engine with model: {model_path}")
-
-        self._closed = False
-        if self._verbose:
-            print(f"[DenseCore] Engine initialized successfully")
-
-        # Initialize tokenizer if repo_id provided
-        self.tokenizer = None
         if hf_repo_id:
             self._init_tokenizer(hf_repo_id)
+
+        # Initialize native engine (allocates large memory pools)
+        self._handle = self._lib.InitEngine(model_path_bytes, None, threads)
+        if not self._handle:
+            raise RuntimeError(f"Failed to initialize DenseCore engine for model: {model_path}")
 
         # Load LoRA adapter if provided
         if lora_adapter_path:
@@ -515,12 +510,18 @@ class DenseCore:
         """Initialize tokenizer from HuggingFace repo."""
         try:
             from transformers import AutoTokenizer
-
-            self.tokenizer = AutoTokenizer.from_pretrained(hf_repo_id)
-            if self._verbose:
-                print(f"[DenseCore] Loaded tokenizer from {hf_repo_id}")
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(hf_repo_id)
+                if self._verbose:
+                    print(f"[DenseCore] Loaded tokenizer from {hf_repo_id}")
+            except Exception as e:
+                # If verbose is not available (it's called verbose in __init__ but _verbose here? check context)
+                # Engine has self.verbose. Constructor sets self.verbose.
+                if getattr(self, 'verbose', False):
+                     print(f"[DenseCore] Warning: Failed to load tokenizer from {hf_repo_id}: {e}")
+                self.tokenizer = None
         except ImportError as e:
-            if self._verbose:
+            if getattr(self, '_verbose', False):
                 print(f"[DenseCore] transformers load failed: {e}")
                 print("[DenseCore] tokenizer disabled")
         except Exception as e:
@@ -553,18 +554,20 @@ class DenseCore:
         if not handler:
             return
 
-        # Decode token string
-        token_str = token.decode("utf-8") if token else ""
-
-        # Since C++ now sends decoded tokens, just clean BPE artifacts
-        token_str = self._clean_bpe_token(token_str)
-
-        finished = bool(is_finished)
-
         try:
+            # Decode token string
+            token_str = token.decode("utf-8", errors="replace") if token else ""
+
+            # Since C++ now sends decoded tokens, just clean BPE artifacts
+            token_str = self._clean_bpe_token(token_str)
+
+            finished = bool(is_finished)
             handler(token_str, finished)
         except Exception as e:
-            warnings.warn(f"Error in callback handler: {e}")
+            import traceback
+            error_msg = f"Error in callback handler for req {req_id}: {e}\n{traceback.format_exc()}"
+            print(f"[DenseCore] {error_msg}")
+            warnings.warn(error_msg)
 
         if finished:
             with self._lock:
@@ -916,7 +919,7 @@ class DenseCore:
 
     def stream(
         self,
-        prompt: str,
+        prompt: Union[str, List[int]],
         max_tokens: int = 256,
         config: Optional[GenerationConfig] = None,
         **kwargs,
@@ -925,7 +928,7 @@ class DenseCore:
         Stream generated tokens one at a time.
 
         Args:
-            prompt: Input text prompt
+            prompt: Input text prompt (str) or pre-tokenized token IDs (list[int])
             max_tokens: Maximum tokens to generate
             config: Optional GenerationConfig
             **kwargs: Additional generation parameters
@@ -935,6 +938,11 @@ class DenseCore:
 
         Example:
             >>> for token in model.stream("Tell me a story"):
+            ...     print(token, end="", flush=True)
+            
+            >>> # With pre-tokenized input
+            >>> token_ids = [1, 2, 3, 4, 5]
+            >>> for token in model.stream(token_ids, max_tokens=50):
             ...     print(token, end="", flush=True)
         """
         if config is not None:
@@ -947,15 +955,40 @@ class DenseCore:
 
         req_id = self._register_request(handler)
 
-        ret = self._submit_request(prompt, max_tokens, req_id)
+        # Determine if prompt is already tokenized (list[int]) or text (str)
+        if isinstance(prompt, list):
+            # Pre-tokenized input: use SubmitRequestIds directly
+            prompt_tokens = [int(x) for x in prompt]
+
+            tokens_array = (ctypes.c_int * len(prompt_tokens))(*prompt_tokens)
+            # CRITICAL: Keep ctypes array reference alive until C++ is done!
+            with self._lock:
+                self._active_ctypes_refs[req_id] = [tokens_array]
+            ret = self._lib.SubmitRequestIds(
+                self._handle,
+                tokens_array,
+                len(prompt_tokens),
+                max_tokens,
+                ctypes.cast(self._c_callback, ctypes.c_void_p),
+                ctypes.c_void_p(req_id),
+            )
+
+        else:
+            # Text prompt: use tokenizer via _submit_request
+
+            ret = self._submit_request(prompt, max_tokens, req_id)
+
 
         if ret < 0:
             with self._lock:
                 self._requests.pop(req_id, None)
+                self._active_ctypes_refs.pop(req_id, None)
             raise RuntimeError(f"Failed to submit request: error code {ret}")
+
 
         while True:
             token, finished = result_queue.get()
+
             if token:
                 yield token
             if finished:

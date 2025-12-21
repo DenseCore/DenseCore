@@ -264,21 +264,25 @@ public:
                                   Tensor *v_out) = 0;
 
   /**
-   * @brief Flash Attention
+   * @brief Flash Attention with GQA Support
    *
    * Memory-efficient attention implementation that tiles computation
    * to fit in L2 cache. Essential for long sequence support.
    *
+   * Supports Grouped Query Attention (GQA) where n_head_kv < n_head.
+   * For MHA models, n_head_kv == n_head (or pass -1 for auto-detect).
+   *
    * @param Q Query [batch, n_head, seq_q, head_dim]
-   * @param K Key [batch, n_head, seq_kv, head_dim]
-   * @param V Value [batch, n_head, seq_kv, head_dim]
+   * @param K Key [batch, n_head_kv, seq_kv, head_dim]
+   * @param V Value [batch, n_head_kv, seq_kv, head_dim]
    * @param output Output [batch, n_head, seq_q, head_dim]
    * @param scale Attention scale factor (typically 1/sqrt(head_dim))
    * @param causal Whether to apply causal masking
+   * @param n_head_kv Number of KV heads (-1 = same as n_head, MHA mode)
    */
   virtual void FlashAttention(const Tensor &Q, const Tensor &K, const Tensor &V,
-                              Tensor *output, float scale,
-                              bool causal = true) = 0;
+                              Tensor *output, float scale, bool causal = true,
+                              int n_head_kv = -1) = 0;
 
   // ===========================================================================
   // Synchronization

@@ -98,6 +98,7 @@ set(SOURCES
     src/optimization_bridge.cpp
     src/save_model.cpp
     src/version.cpp
+    src/scheduler.cpp
     # Backend abstraction
     src/cpu_backend.cpp
     src/backend_registry.cpp
@@ -113,6 +114,7 @@ set(SOURCES
     # Pruning module
     src/pruner.cpp
     src/tensor_utils.cpp
+    src/simd_ops.cpp  # Quantized dot product dispatcher
     src/pruning/depth_pruner.cpp
     src/pruning/width_pruner.cpp
     src/pruning/attention_pruner.cpp

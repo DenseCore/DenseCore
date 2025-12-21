@@ -108,6 +108,23 @@ DENSECORE_API DenseCoreHandle InitEngine(const char *model_path,
                                          int threads) {
   try {
     // =========================================================================
+    // INITIALIZATION DELAY CONFIGURATION (Large Model Support)
+    // =========================================================================
+    // Qwen3-4B and larger models have large graphs that take longer to build.
+    // In WSL2 environments, I/O latency can be significant.
+    // Set DENSECORE_INIT_DELAY_MS to add tolerance (default: 0ms).
+    // =========================================================================
+    int init_delay_ms = 0;
+    if (const char *env_val = std::getenv("DENSECORE_INIT_DELAY_MS")) {
+      init_delay_ms = std::atoi(env_val);
+      if (init_delay_ms > 0) {
+        std::cout << "[DenseCore] Init delay: " << init_delay_ms
+                  << "ms (large model tolerance)" << std::endl;
+        std::this_thread::sleep_for(std::chrono::milliseconds(init_delay_ms));
+      }
+    }
+
+    // =========================================================================
     // THREAD CONFIGURATION (Pure std::thread + GGML thread pool)
     // =========================================================================
     // Auto-detect optimal thread count if not specified
@@ -271,10 +288,7 @@ int SubmitRequest(DenseCoreHandle handle, const char *prompt, int max_tokens,
   req->user_data = user_data;
 
   // Tokenize immediately (outside hot path)
-  std::cout << "[DEBUG] Tokenizing prompt..." << std::endl;
   req->tokens = Tokenizer::Tokenize(model_entry->model.get(), prompt, true);
-  std::cout << "[DEBUG] Tokenized: " << req->tokens.size() << " tokens"
-            << std::endl;
 
   // Record arrival time for metrics
   req->arrival_time = std::chrono::steady_clock::now();
@@ -292,7 +306,6 @@ int SubmitRequest(DenseCoreHandle handle, const char *prompt, int max_tokens,
 
   // Lock-free enqueue: no mutex needed
   state->pending_requests.Push(req, req->tier);
-  std::cout << "[DEBUG] Enqueued request " << req->id << std::endl;
   {
     std::lock_guard<std::mutex> lock(state->cv_mu);
     state->queue_cv.notify_one();
@@ -333,6 +346,9 @@ int SubmitRequestIds(DenseCoreHandle handle, const int *tokens, int n_tokens,
 
   // Lock-free enqueue
   state->pending_requests.Push(req, req->tier);
+
+  // Note: The mutex lock provides sufficient memory ordering.
+  // notify_one() under cv_mu ensures the worker sees the pushed request.
   {
     std::lock_guard<std::mutex> lock(state->cv_mu);
     state->queue_cv.notify_one();

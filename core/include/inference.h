@@ -36,6 +36,43 @@ struct InferenceConfig {
   }
 };
 
+// ============================================================================
+// Persistent Compute Context for "Rebuild Graph, Reuse Memory" Strategy
+// ============================================================================
+// Solves the conflict between Graph Caching and Paged KV Cache:
+//   - n_past changes every token, invalidating cached graphs
+//   - Patching graphs is complex and error-prone
+//   - Solution: Rebuild graph every token, but reuse memory pool
+//
+// This eliminates malloc/free syscalls during the decode loop while
+// ensuring correct tensor shapes and RoPE positions for each token.
+// ============================================================================
+
+struct InferenceContext {
+  struct ggml_context *ctx_compute = nullptr; // Persistent GGML context
+  std::vector<uint8_t> compute_buffer; // Static memory pool (64-byte aligned)
+  bool initialized = false;
+
+  // Initialize with fixed buffer size (called once at engine startup)
+  // @param buffer_size Size in bytes (recommended: 512MB - 2GB based on model)
+  void Init(size_t buffer_size);
+
+  // Reset allocator offset to 0 (called at start of each BuildTransformerGraph)
+  // This is an O(1) operation that reuses the existing memory buffer.
+  // GGML doesn't have a public reset API, so we free and re-init with same
+  // buffer.
+  void Reset();
+
+  // Cleanup (called at engine shutdown)
+  void Free();
+
+  // Get the compute context for graph building
+  struct ggml_context *GetContext() const { return ctx_compute; }
+
+  // Check if initialized
+  bool IsInitialized() const { return initialized; }
+};
+
 struct ggml_tensor *BuildTransformerGraph(
     TransformerModel *model, PagedKVCache *cache, struct ggml_context *ctx_c,
     const BatchSpec &batch, bool embedding_mode = false,
@@ -44,6 +81,13 @@ struct ggml_tensor *BuildTransformerGraph(
 
 // Initialize pre-computed RoPE cos/sin table for optimized inference
 void InitRoPETable(TransformerModel *model);
+
+// Set current batch context for KV cache callbacks
+// CRITICAL: Must be called BEFORE ggml_backend_graph_compute() when using
+// cached graphs with KV cache. The KV cache callbacks use GetCurrentBatch()
+// to access the batch, enabling graph caching while still using fresh batch
+// data.
+void SetCurrentBatch(const BatchSpec *batch);
 
 // Grammar constraint for structured output (e.g., JSON mode)
 enum class JSONState {

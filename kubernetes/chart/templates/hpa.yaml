@@ -1,4 +1,4 @@
-{{- if and .Values.autoscaling.enabled (eq .Values.autoscaling.type "hpa") }}
+{{- if and .Values.autoscaling.enabled (eq .Values.autoscaling.type "hpa") (not .Values.autoscaling.keda.enabled) }}
 # =============================================================================
 # HorizontalPodAutoscaler - Standard CPU/Memory-based Scaling
 # =============================================================================

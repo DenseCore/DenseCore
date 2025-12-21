@@ -3,7 +3,6 @@
 #include "hardware_topology.h"
 #include "optimization_bridge.h" // Runtime SIMD dispatch
 #include "simd_ops.h"
-#include <atomic>
 #include <cstring>
 #include <ggml-cpu.h>
 #include <iostream>
@@ -102,64 +101,67 @@ void EngineLoop(EngineState *state) {
       // for this thread. Only compute worker threads should be pinned.
     }
 
-    // Setup compute thread affinity mapping for GGML workers
-    // This pre-computes core assignments so GGML threads can self-pin on
-    // first use
+    // Setup compute thread affinity for GGML workers
+    // Use SCATTER policy to spread threads across physical cores
     {
       auto &topo = densecore::HardwareTopology::GetInstance();
       int target_node = (state->numa_node_id >= 0) ? state->numa_node_id : 0;
-      // Use configured thread count from engine initialization
-      if (n_threads > 0) {
-        // =========================================================================
-        // Thread affinity DISABLED to prevent deadlock on consumer hardware.
-        // Aggressive CPU pinning was causing hangs on first token inference.
-        // The orchestration thread and GGML's Thread 0 would contend for Core
-        // 0.
-        // =========================================================================
-        // densecore::PinningPolicy policy =
-        //     (state->pinning_policy == 1) ? densecore::PinningPolicy::COMPACT
-        //                                  : densecore::PinningPolicy::SCATTER;
-        // topo.SetupComputeThreadAffinity(target_node, n_threads, policy);
+      int physical_cores = topo.GetPhysicalCoreCount(target_node);
+
+      if (n_threads > 0 && physical_cores > 0) {
+        // Use simple SCATTER policy - spread threads across all physical cores
+        topo.SetupComputeThreadAffinity(target_node, n_threads,
+                                        densecore::PinningPolicy::SCATTER);
       }
     }
 
     // Initialize persistent compute buffer (eliminates malloc/free per
     // iteration)
     state->InitComputeBuffer();
-    state->InitGraphCache();
+    state->InitGraphCache(current_model);
 
     // Mapping: scheduler seq_id -> Request*
     std::unordered_map<int, Request *> seq_to_request;
 
     while (state->status != EngineStatus::STOPPED) {
       // 1. Fetch new requests and register with scheduler
+      // =========================================================================
+      // WAIT FOR WORK (Condition Variable - Lost Wakeup Safe)
+      // =========================================================================
+      // Use CV wait with predicate to atomically check conditions while
+      // holding the lock. This prevents the "lost wakeup" race where a
+      // producer pushes after our check but before we sleep.
+      // =========================================================================
       {
-        // Check exit conditions (lock-free check on pending queue)
-        bool pending_empty = state->pending_requests.Empty();
-        bool active_empty;
-        {
-          std::lock_guard<std::mutex> lock(state->active_mu);
-          active_empty = state->active_requests.empty();
-        }
-
-        if (active_empty && pending_empty) {
-          if (state->status == EngineStatus::DRAINING) {
-            break; // Exit: draining complete, no more work
+        std::unique_lock<std::mutex> lock(state->cv_mu);
+        state->queue_cv.wait(lock, [state]() {
+          // Check if there's work to do OR we should exit
+          bool pending_empty = state->pending_requests.Empty();
+          bool active_empty;
+          {
+            std::lock_guard<std::mutex> active_lock(state->active_mu);
+            active_empty = state->active_requests.empty();
           }
-          // Wait for new requests with predicate to handle spurious wakeups.
-          // The predicate checks if there's new work OR if we should stop.
-          std::unique_lock<std::mutex> lock(state->cv_mu);
-          state->queue_cv.wait_for(
-              lock, std::chrono::milliseconds(50), [&state]() {
-                // Wake if: (1) pending work, (2) status changed, or (3) timeout
-                return !state->pending_requests.Empty() ||
-                       state->status != EngineStatus::RUNNING;
-              });
-          continue;
-        }
+          // Wake up if: there's pending work, OR there's active work,
+          // OR we're no longer running (DRAINING/STOPPED)
+          return !pending_empty || !active_empty ||
+                 state->status != EngineStatus::RUNNING;
+        });
+      }
 
-        // Move pending to active and register with scheduler
-        // Skip if DRAINING - don't accept new requests, only drain active
+      // Check if draining and all work is done
+      if (state->status == EngineStatus::DRAINING) {
+        std::lock_guard<std::mutex> active_lock(state->active_mu);
+        if (state->active_requests.empty() && state->pending_requests.Empty()) {
+          break; // Exit: draining complete, no more work
+        }
+      }
+
+      {
+        // Note: std::mutex lock/unlock provides sufficient memory ordering.
+        // No atomic fence needed - cv.wait() holding cv_mu provides acquire
+        // semantics.
+
         while (state->status == EngineStatus::RUNNING) {
           Request *req = state->pending_requests.Pop();
           if (!req)
@@ -211,6 +213,9 @@ void EngineLoop(EngineState *state) {
             continue;
           }
 
+          // Store seq_id in request for O(1) cleanup lookup
+          req->seq_id = seq_id;
+
           // Store mapping and add to active list
           seq_to_request[seq_id] = req;
           state->active_requests.push_back(req);
@@ -244,13 +249,10 @@ void EngineLoop(EngineState *state) {
             if (req->callback) {
               req->callback("Error: Request cancelled", 1, req->user_data);
             }
-            // Remove from scheduler
-            for (auto &kv : seq_to_request) {
-              if (kv.second == req) {
-                state->scheduler->RemoveRequest(kv.first, false);
-                seq_to_request.erase(kv.first);
-                break;
-              }
+            // Remove from scheduler using stored seq_id (O(1) instead of O(n))
+            if (req->seq_id >= 0) {
+              state->scheduler->RemoveRequest(req->seq_id, false);
+              seq_to_request.erase(req->seq_id);
             }
             // Free blocks if allocated
             current_kv_cache->block_manager->Free(req->block_table);
@@ -305,12 +307,45 @@ void EngineLoop(EngineState *state) {
         }
       }
 
-      // 7. If scheduler returned empty batch, yield to avoid busy-wait.
-      // Using yield() instead of sleep() allows faster response when work
-      // arrives while still being cooperative with other threads.
+      // =========================================================================
+      // 7. Handle Empty Scheduler Output (Latency-Aware Timed Wait)
+      // =========================================================================
+      // If scheduler returned empty batch but active_requests exist:
+      //   - Memory fragmentation may prevent scheduling
+      //   - Wait with SHORT timeout (100us) for fast response to freed memory
+      //
+      // Using wait_for with 100us timeout instead of yield():
+      //   - Prevents 100% CPU usage from busy-looping
+      //   - Enables sub-millisecond latency when work arrives
+      //   - Balances power efficiency with responsiveness
+      // =========================================================================
       if (sched_output.IsEmpty()) {
-        std::this_thread::yield(); // Cooperative scheduling backoff
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        bool has_active;
+        {
+          std::lock_guard<std::mutex> lock(state->active_mu);
+          has_active = !state->active_requests.empty();
+        }
+
+        if (has_active) {
+          // Active requests exist but scheduler couldn't schedule them
+          // Wait with VERY short timeout for latency-sensitive operation
+          std::unique_lock<std::mutex> lock(state->cv_mu);
+          state->queue_cv.wait_for(
+              lock, std::chrono::microseconds(100), [state]() {
+                // Wake up if: new pending requests OR engine stopping
+                return !state->pending_requests.Empty() ||
+                       state->status != EngineStatus::RUNNING;
+              });
+        } else {
+          // No active requests and scheduler empty - truly nothing to do
+          // Use slightly longer wait to save power
+          std::unique_lock<std::mutex> lock(state->cv_mu);
+          state->queue_cv.wait_for(
+              lock, std::chrono::milliseconds(1), [state]() {
+                return !state->pending_requests.Empty() ||
+                       state->status != EngineStatus::RUNNING;
+              });
+        }
         continue;
       }
 
@@ -389,72 +424,45 @@ void EngineLoop(EngineState *state) {
 
       batch.num_seqs = batch_requests.size();
 
-      // 9. Run Inference (using persistent compute buffer for efficiency)
-      // The compute buffer is reused across iterations to avoid malloc
-      // overhead Graph Caching Logic
+      // =========================================================================
+      // 9. Run Inference ("Rebuild Graph, Reuse Memory" Strategy)
+      // =========================================================================
+      // Graph caching is DISABLED because n_past changes every token, causing
+      // stale RoPE offsets and tensor shapes. Instead, we:
+      //   - Rebuild the graph every iteration (correct shapes for current
+      //   n_past)
+      //   - Reuse the memory pool (Reset() is O(1), no malloc/free syscalls)
+      // =========================================================================
       struct ggml_cgraph *gf = nullptr;
       struct ggml_tensor *output = nullptr;
       struct ggml_tensor *embd_inp = nullptr;
       struct ggml_tensor *pos = nullptr;
 
-      // Determine if cacheable: only strictly consistent batches (e.g.
-      // Decode with 1 token/seq) For MVP we cache by num_seqs. We verify if
-      // input size matches expected 1 token/seq for decode.
-      bool cacheable = (!is_embedding_batch &&
-                        batch.tokens.size() == (size_t)batch.num_seqs);
-
-      if (cacheable) {
-        std::lock_guard<std::mutex> lock(state->graph_mu);
-        if (state->graph_cache.count(batch.num_seqs)) {
-          auto &meta = state->graph_cache[batch.num_seqs];
-          gf = meta.gf;
-          embd_inp = meta.embd_inp;
-          pos = meta.pos;
-          output = meta.output;
-        }
+      // Initialize inference context if not already done
+      if (!state->inference_ctx.IsInitialized()) {
+        size_t ctx_size = EngineState::CalculateGraphContextSize(current_model);
+        state->inference_ctx.Init(ctx_size);
       }
 
-      // RAII guard for temporary context - declared here so it lives
-      // through compute For cached graphs: this stays nullptr (no-op) For
-      // non-cached graphs: holds the temp context until end of loop
-      // iteration
-      densecore::GGMLContextGuard ctx_temp_guard(nullptr);
+      // Reset persistent context (O(1) - reuses existing memory buffer)
+      // This prepares a fresh context for graph building without malloc/free
+      state->inference_ctx.Reset();
+      struct ggml_context *ctx_nodes = state->inference_ctx.GetContext();
 
-      if (!gf) {
-        // Build new graph
-        // For cached graphs: use persistent state->graph_ctx
-        // For non-cached graphs: allocate temporary context with RAII guard
-        struct ggml_context *ctx_nodes = state->graph_ctx;
-
-        if (!cacheable) {
-          // Temp context for one-off graphs (Prefill etc)
-          struct ggml_init_params params = {
-              .mem_size =
-                  512 * 1024 *
-                  1024, // Increased to 512MB to fix OOM with deep models
-              .mem_buffer = nullptr,
-              .no_alloc = false,
-          };
-          ctx_temp_guard = densecore::GGMLContextGuard(ggml_init(params));
-          std::cerr << "[DenseCore] Worker Graph Context initialized: 512 MB"
-                    << std::endl;
-          ctx_nodes = ctx_temp_guard.get();
-        }
-
-        gf = ggml_new_graph_custom(ctx_nodes, 32768, false);
-
-        // Build nodes in ctx_nodes
-        output = BuildTransformerGraph(current_model, current_kv_cache,
-                                       ctx_nodes, batch, is_embedding_batch, gf,
-                                       &embd_inp, &pos);
-
-        if (cacheable) {
-          std::lock_guard<std::mutex> lock(state->graph_mu);
-          state->graph_cache[batch.num_seqs] = {gf, embd_inp, pos, output};
-        }
+      if (!ctx_nodes) {
+        std::cerr << "[DenseCore] FATAL: InferenceContext not initialized!"
+                  << std::endl;
+        continue;
       }
-      // ctx_temp_guard destructor will call ggml_free() at end of loop
-      // iteration
+
+      // Always build fresh graph with correct n_past/positions
+      gf = ggml_new_graph_custom(ctx_nodes, 32768, false);
+
+      // Build nodes in ctx_nodes
+      output =
+          BuildTransformerGraph(current_model, current_kv_cache, ctx_nodes,
+                                batch, is_embedding_batch, gf, &embd_inp, &pos);
+      // Note: Graph caching removed - incompatible with dynamic n_past
 
       if (!output || !embd_inp || !pos) {
         std::cerr << "Fatal: Content creation failed or tensors missing"
@@ -499,9 +507,27 @@ void EngineLoop(EngineState *state) {
       // - Added unnecessary latency to every inference call
       // - Could fail under heavy load or on different CPU architectures
       // =======================================================================
-      std::atomic_thread_fence(std::memory_order_release);
+      SetCurrentBatch(&batch);
+
+      // Note: Memory ordering for GGML worker threads is handled internally
+      // by GGML's thread pool (uses CV/mutex). No explicit fence needed.
+
+      // =========================================================================
+      // DYNAMIC THREAD THROTTLING (Decode Latency Optimization)
+      // =========================================================================
+      // MAXIMUM THREADING: Use all available threads for both Prefill and
+      // Decode
+      // =========================================================================
+      // User requested maximum multi-threading performance.
+      // Previous 8-thread cap for decode removed - let hardware saturate.
+      // Modern CPUs with high core counts benefit from full parallelism.
+      // =========================================================================
+      ggml_backend_cpu_set_n_threads(current_model->backend, state->n_threads);
 
       ggml_backend_graph_compute(current_model->backend, gf);
+
+      // Note: GGML's thread pool join provides acquire semantics.
+      // No explicit fence needed to see results.
 
       // 10. Process Outputs
       int token_offset = 0;
@@ -557,12 +583,10 @@ void EngineLoop(EngineState *state) {
           // Cleanup and remove from scheduler
           current_kv_cache->block_manager->Free(req->block_table);
           req->block_table.clear();
-          for (auto &kv : seq_to_request) {
-            if (kv.second == req) {
-              state->scheduler->RemoveRequest(kv.first, true);
-              seq_to_request.erase(kv.first);
-              break;
-            }
+          // Cleanup using stored seq_id (O(1) instead of O(n))
+          if (req->seq_id >= 0) {
+            state->scheduler->RemoveRequest(req->seq_id, true);
+            seq_to_request.erase(req->seq_id);
           }
           {
             std::lock_guard<std::mutex> lk(req->mu);
@@ -595,8 +619,6 @@ void EngineLoop(EngineState *state) {
           req->tokens.push_back(best_token);
           req->generated_count++;
 
-          // Decode token for callback (using C++ tokenizer to avoid Python
-          // thread safety issues)
           std::string token_str =
               Tokenizer::Detokenize(current_model, best_token);
 
@@ -604,8 +626,43 @@ void EngineLoop(EngineState *state) {
             req->grammar.UpdateState(token_str);
           }
 
+          // =========================================================================
+          // CALLBACK INVOCATION (Exception-Safe - Zombie Leak Prevention)
+          // =========================================================================
+          // Track callback exceptions to force cleanup. Without this,
+          // exceptions would skip RemoveRequest(), leaving the request in
+          // scheduler forever.
+          // =========================================================================
+          bool callback_exception = false;
           if (req->callback) {
-            req->callback(token_str.c_str(), 0, req->user_data);
+            try {
+              req->callback(token_str.c_str(), 0, req->user_data);
+            } catch (...) {
+              std::cerr << "[DenseCore] ERROR: Exception in request callback ("
+                        << req->id << ")" << std::endl;
+              callback_exception = true;
+            }
+          }
+
+          // Force cleanup on callback exception (prevents zombie requests)
+          if (callback_exception) {
+            req->finished = true;
+            state->metrics.failed_requests++;
+            // Free blocks and remove from scheduler
+            current_kv_cache->block_manager->Free(req->block_table);
+            req->block_table.clear();
+            // Cleanup using stored seq_id (O(1) instead of O(n))
+            if (req->seq_id >= 0) {
+              state->scheduler->RemoveRequest(req->seq_id, false);
+              seq_to_request.erase(req->seq_id);
+            }
+            {
+              std::lock_guard<std::mutex> lk(req->mu);
+              req->cv.notify_all();
+            }
+            // Skip rest of generation logic for this request
+            token_offset += processed_count;
+            continue;
           }
 
           state->metrics.total_tokens_generated++;
@@ -660,23 +717,22 @@ void EngineLoop(EngineState *state) {
             // Free blocks and remove from scheduler
             current_kv_cache->block_manager->Free(req->block_table);
             req->block_table.clear();
-            for (auto &kv : seq_to_request) {
-              if (kv.second == req) {
-                state->scheduler->RemoveRequest(kv.first, true);
-                seq_to_request.erase(kv.first);
-                break;
-              }
+            // Cleanup using stored seq_id (O(1) instead of O(n))
+            if (req->seq_id >= 0) {
+              state->scheduler->RemoveRequest(req->seq_id, true);
+              seq_to_request.erase(req->seq_id);
             }
           }
         }
-
         token_offset += processed_count;
       }
 
       // RAII guard (ctx_temp_guard) automatically frees non-cached contexts
 
       // 11. Sync active_requests: remove finished requests
+      // Also signal queue_cv when requests finish (frees memory for scheduler)
       {
+        bool any_finished = false;
         std::lock_guard<std::mutex> lock(state->active_mu);
         auto it = state->active_requests.begin();
         while (it != state->active_requests.end()) {
@@ -685,9 +741,17 @@ void EngineLoop(EngineState *state) {
             it = state->active_requests.erase(it);
             state->metrics.active_requests--;
             state->request_pool.Release(req);
+            any_finished = true;
           } else {
             ++it;
           }
+        }
+
+        // Signal queue_cv when requests finish - wakes scheduler if it's
+        // waiting due to memory fragmentation (freed blocks now available)
+        if (any_finished) {
+          std::lock_guard<std::mutex> cv_lock(state->cv_mu);
+          state->queue_cv.notify_one();
         }
       }
     }

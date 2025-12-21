@@ -1,3 +1,9 @@
+# =============================================================================
+# DenseCore HorizontalPodAutoscaler (Standalone Manifest)
+# =============================================================================
+# WARNING: If using KEDA for autoscaling, comment out or delete this entire file
+# to prevent scaling conflicts between HPA and KEDA ScaledObject.
+# =============================================================================
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
