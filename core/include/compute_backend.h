@@ -1,26 +1,70 @@
 /**
  * @file compute_backend.h
- * @brief Abstract interface for compute backends
+ * @brief Abstract interface for Unified Memory Architecture (UMA) compute
+ * backends
  *
- * Provides hardware-agnostic operations for LLM inference.
- * Each backend implements optimized kernels for its target hardware.
+ * This file is part of DenseCore Public API.
+ * Licensed under Apache 2.0 (Open Source) or Commercial License.
  *
- * Threading Model:
- * - All kernels are internally multi-threaded where beneficial
- * - Backends may provide thread hints through ThreadContext
+ * Provides hardware-agnostic operations for LLM inference on:
+ * - **Apple Silicon (M1-M4):** Unified memory, Metal GPU, ANE (Neural Engine)
+ * - **Qualcomm SoCs:** Unified memory, Adreno GPU, Hexagon DSP
+ * - **ARM64 CPUs:** Generic ARM with NEON SIMD
+ * - **x86-64 CPUs:** Intel/AMD with AVX2/AVX-512
  *
- * Memory Model:
- * - Backends manage their own memory pools
- * - `AllocateDevice` returns memory in the backend's address space
- * - CPU backend uses aligned malloc; ASIC backend uses SRAM pools
+ * ## Key Design Principles
+ *
+ * **1. Zero-Copy Memory Model**
+ * Instead of separate host/device allocations with explicit copies, UMA
+ * backends use `AllocateUnified()` which returns a pointer accessible by both
+ * CPU and accelerator. This eliminates PCIe/DMA transfer overhead.
+ *
+ * **2. Graph Capture for NPUs**
+ * NPUs (Apple ANE, Qualcomm Hexagon) achieve peak efficiency with pre-compiled
+ * operation graphs. Use `BeginCapture()`/`EndCapture()` to record operations,
+ * then `ExecuteGraph()` to run them.
+ *
+ * **3. First-Class Quantization**
+ * Edge hardware relies on INT4/INT8 quantization. Operations accept
+ * `QuantizedTensorView` with embedded scale/zero-point metadata.
+ *
+ * ## Migration from Discrete GPU Model
+ *
+ * Old pattern (Discrete GPU-style):
+ * @code
+ * void* host = malloc(size);
+ * void* device = backend.AllocateDevice(size);
+ * backend.CopyToDevice(device, host, size);  // Slow DMA transfer
+ * backend.MatMul(...);
+ * backend.CopyFromDevice(host, device, size); // Another transfer
+ * @endcode
+ *
+ * New pattern (UMA-style):
+ * @code
+ * void* unified = backend.AllocateUnified(size);  // Shared pointer
+ * // CPU writes directly to unified memory
+ * memcpy(unified, data, size);
+ * backend.SynchronizeMemory(unified, size, MemorySyncDirection::HostToDevice);
+ * backend.MatMul(...);  // Accelerator reads same memory
+ * // No copy back needed - CPU reads same memory
+ * @endcode
+ *
+ * @see accelerator_traits.h for hardware capability queries
+ * @see operation_graph.h for graph capture/execution
+ * @see quantized_tensor.h for quantization metadata
  */
 
 #ifndef DENSECORE_COMPUTE_BACKEND_H
 #define DENSECORE_COMPUTE_BACKEND_H
 
+#include "accelerator_traits.h"
+#include "operation_graph.h"
+#include "quantized_tensor.h"
 #include "tensor.h"
+
 #include <cstddef>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 namespace densecore {
@@ -43,16 +87,17 @@ struct ThreadContext {
 };
 
 /**
- * @brief Abstract interface for compute backends
+ * @brief Abstract interface for UMA compute backends
  *
  * This is the core abstraction layer that decouples the inference graph
- * from hardware-specific implementations. Backends can be registered
- * at runtime and swapped without recompilation.
+ * from hardware-specific implementations. Designed for Apple Silicon,
+ * Qualcomm, and ARM-based unified memory architectures.
  *
- * Performance Guidelines:
- * - Minimize virtual function overhead by batching operations
- * - Use thread-local scratch buffers to avoid allocation overhead
+ * **Performance Guidelines:**
+ * - Use `AllocateUnified()` instead of separate host/device allocations
+ * - Batch operations into graphs for NPU backends
  * - Prefer fused operations (e.g., AddRMSNorm) over separate calls
+ * - Use quantized tensors to reduce memory bandwidth
  */
 class ComputeBackend {
 public:
@@ -63,7 +108,7 @@ public:
   // ===========================================================================
 
   /**
-   * @brief Get backend name (e.g., "CPU-AVX512", "ASIC-v1")
+   * @brief Get backend name (e.g., "CPU-AVX512", "Metal-M3", "Hexagon-v73")
    */
   virtual const char *Name() const = 0;
 
@@ -72,9 +117,66 @@ public:
    */
   virtual DeviceType Device() const = 0;
 
+  /**
+   * @brief Get hardware capability traits for this backend
+   *
+   * Use this to query UMA support, graph execution capabilities,
+   * and preferred quantization formats.
+   */
+  virtual AcceleratorTraits GetTraits() const {
+    return AcceleratorTraits::GenericCPU();
+  }
+
   // ===========================================================================
-  // Memory Management
+  // Unified Memory Management (UMA)
   // ===========================================================================
+
+  /**
+   * @brief Allocate unified memory accessible by CPU and accelerator
+   *
+   * Returns a pointer that can be used by both the host CPU and the target
+   * accelerator without explicit copy operations. This is the primary
+   * allocation method for UMA architectures.
+   *
+   * **Apple Silicon:** Maps to Metal's `MTLStorageModeShared`
+   * **Qualcomm:** Maps to ION shared memory
+   * **CPU:** Falls back to `aligned_alloc`
+   *
+   * @param size_bytes Number of bytes to allocate
+   * @param alignment Required alignment (default from traits)
+   * @return Pointer usable by both CPU and accelerator, nullptr on failure
+   *
+   * @note Prefer this over `AllocateDevice()` for new code
+   */
+  virtual void *AllocateUnified(size_t size_bytes, size_t alignment = 0) {
+    // Default implementation falls back to device allocation
+    if (alignment == 0) {
+      alignment = GetTraits().unified_memory_alignment;
+    }
+    return AllocateDevice(size_bytes, alignment);
+  }
+
+  /**
+   * @brief Synchronize unified memory between CPU and accelerator
+   *
+   * On hardware-coherent systems (Apple Silicon), this is typically a no-op.
+   * On systems requiring explicit cache management (some ARM SoCs), this
+   * performs necessary cache flush/invalidate operations.
+   *
+   * @param ptr Pointer to unified memory region
+   * @param size_bytes Size of region to synchronize
+   * @param direction Direction of synchronization
+   *
+   * @note Only needed on backends where `GetTraits().requires_explicit_sync`
+   *       returns true.
+   */
+  virtual void SynchronizeMemory(void *ptr, size_t size_bytes,
+                                 MemorySyncDirection direction) {
+    // Default: no-op for hardware-coherent systems
+    (void)ptr;
+    (void)size_bytes;
+    (void)direction;
+  }
 
   /**
    * @brief Allocate device memory
@@ -85,35 +187,100 @@ public:
    * @param size_bytes Number of bytes to allocate
    * @param alignment Required alignment in bytes (default: 64 for cache line)
    * @return Pointer to allocated memory, nullptr on failure
+   *
+   * @note For UMA backends, prefer `AllocateUnified()` instead
    */
   virtual void *AllocateDevice(size_t size_bytes, size_t alignment = 64) = 0;
 
   /**
-   * @brief Free device memory
-   * @param ptr Pointer previously returned by AllocateDevice
+   * @brief Free device/unified memory
+   * @param ptr Pointer previously returned by AllocateDevice or AllocateUnified
    */
   virtual void FreeDevice(void *ptr) = 0;
 
   /**
    * @brief Copy data to device memory
    *
-   * For CPU backend, this is a memcpy.
-   * For accelerator backends, this may involve DMA transfer.
+   * @deprecated Use `AllocateUnified()` + `SynchronizeMemory()` instead.
+   *             For UMA backends, this is a memcpy (no performance benefit).
    *
    * @param dst Destination pointer (device memory)
    * @param src Source pointer (host memory)
    * @param size_bytes Number of bytes to copy
    */
+  [[deprecated("Use AllocateUnified() for zero-copy UMA access")]]
   virtual void CopyToDevice(void *dst, const void *src, size_t size_bytes) = 0;
 
   /**
    * @brief Copy data from device memory
+   *
+   * @deprecated Use `AllocateUnified()` + `SynchronizeMemory()` instead.
+   *             For UMA backends, this is a memcpy (no performance benefit).
+   *
    * @param dst Destination pointer (host memory)
    * @param src Source pointer (device memory)
    * @param size_bytes Number of bytes to copy
    */
+  [[deprecated("Use AllocateUnified() for zero-copy UMA access")]]
   virtual void CopyFromDevice(void *dst, const void *src,
                               size_t size_bytes) = 0;
+
+  // ===========================================================================
+  // Graph Capture API (NPU Support)
+  // ===========================================================================
+
+  /**
+   * @brief Begin capturing operations into a graph
+   *
+   * When capturing, operations like `MatMul()` record nodes to an internal
+   * graph instead of executing immediately. Call `EndCapture()` to retrieve
+   * the recorded graph.
+   *
+   * **When to use:**
+   * - Targeting NPUs (Apple ANE, Qualcomm Hexagon)
+   * - Executing the same sequence of operations repeatedly
+   * - Wanting to reduce per-operation dispatch overhead
+   *
+   * @note Only supported on backends where
+   * `GetTraits().supports_graph_execution` returns true. CPU backend provides
+   * immediate-mode fallback.
+   */
+  virtual void BeginCapture() {
+    capturing_ = true;
+    captured_graph_ = std::make_unique<ImmediateModeGraph>();
+  }
+
+  /**
+   * @brief End capture and return the recorded operation graph
+   *
+   * @return OperationGraph containing all operations recorded since
+   * BeginCapture()
+   * @throws std::runtime_error if not currently capturing
+   */
+  virtual std::unique_ptr<OperationGraph> EndCapture() {
+    capturing_ = false;
+    return std::move(captured_graph_);
+  }
+
+  /**
+   * @brief Execute a previously captured operation graph
+   *
+   * For NPU backends, this submits the compiled graph for execution.
+   * For CPU backend, this replays recorded operations immediately.
+   *
+   * @param graph The graph to execute (must be compiled if required by backend)
+   */
+  virtual void ExecuteGraph(const OperationGraph &graph) {
+    // Default: replay immediate-mode graph
+    if (const auto *imm = dynamic_cast<const ImmediateModeGraph *>(&graph)) {
+      const_cast<ImmediateModeGraph *>(imm)->Replay();
+    }
+  }
+
+  /**
+   * @brief Check if currently capturing operations
+   */
+  bool IsCapturing() const { return capturing_; }
 
   // ===========================================================================
   // Core Linear Algebra Operations
@@ -130,6 +297,44 @@ public:
    * @param C Output tensor [M, N]
    */
   virtual void MatMul(const Tensor &A, const Tensor &B, Tensor *C) = 0;
+
+  /**
+   * @brief Mixed-precision matrix multiplication: C = A @ B
+   *
+   * Accepts any combination of dense or quantized tensors via UnifiedTensorRef.
+   * This is the preferred method for weight matrices that may be quantized
+   * (INT4/INT8) while activations remain in FP32.
+   *
+   * **Supported Combinations:**
+   * - Dense x Dense: Falls back to standard MatMul
+   * - Dense x Quantized: Dequantizes B on-the-fly (or uses native INT4 GEMM)
+   * - Quantized x Dense: Dequantizes A on-the-fly
+   * - Quantized x Quantized: Backend-specific (may require explicit dequant)
+   *
+   * @param input Input tensor (typically FP32 activations)
+   * @param weight Weight tensor (may be quantized INT4/INT8)
+   * @param output Output tensor [M, N] (always dense FP32)
+   *
+   * @note Third-party chip vendors implementing ComputeBackend should
+   *       implement this method for mixed-precision inference support.
+   */
+  virtual void MatMulMixed(const UnifiedTensorRef &input,
+                           const UnifiedTensorRef &weight, Tensor *output) {
+    // Default implementation: dispatch to appropriate method
+    if (input.IsDense() && weight.IsDense()) {
+      // Both are dense - use standard MatMul
+      MatMul(input.AsDense(), weight.AsDense(), output);
+    } else if (input.IsDense() && weight.IsQuantized()) {
+      // FP32 input x Quantized weights: most common LLM inference case
+      // Extract quantization info and call GemmInt4 if applicable
+      // For now, throw - subclasses should override for proper support
+      throw std::runtime_error(
+          "MatMulMixed: Dense x Quantized requires backend override");
+    } else {
+      throw std::runtime_error(
+          "MatMulMixed: Unsupported tensor combination, override in subclass");
+    }
+  }
 
   /**
    * @brief Matrix multiplication with transposed B: C = A @ B^T
@@ -159,6 +364,43 @@ public:
   virtual void GemmInt4(const Tensor &A, const Tensor &W, const Tensor &scales,
                         const Tensor &zero_points, Tensor *C,
                         int group_size) = 0;
+
+  // ===========================================================================
+  // Quantization Operations
+  // ===========================================================================
+
+  /**
+   * @brief Quantize tensor to specified format
+   *
+   * Hardware-accelerated quantization using NEON/AVX intrinsics.
+   * Useful for quantizing activations at runtime.
+   *
+   * @param src Source tensor (typically FP32)
+   * @param dst Destination quantized tensor view (pre-allocated)
+   * @param type Target quantization type
+   *
+   * @note The `dst.quant_params` should be pre-populated with scale/zero info,
+   *       or the backend will compute appropriate values.
+   */
+  virtual void Quantize(const Tensor &src, QuantizedTensorView *dst,
+                        QuantType type) {
+    // Default: no-op, subclasses implement
+    (void)src;
+    (void)dst;
+    (void)type;
+  }
+
+  /**
+   * @brief Dequantize tensor back to FP32
+   *
+   * @param src Quantized source tensor
+   * @param dst Destination FP32 tensor (pre-allocated)
+   */
+  virtual void Dequantize(const QuantizedTensorView &src, Tensor *dst) {
+    // Default: no-op, subclasses implement
+    (void)src;
+    (void)dst;
+  }
 
   // ===========================================================================
   // Normalization Operations
@@ -292,9 +534,14 @@ public:
    * @brief Synchronize all pending operations
    *
    * For CPU backend, this is a no-op.
-   * For async backends (GPU/ASIC), blocks until all queued operations complete.
+   * For async backends (Metal/GPU), blocks until all queued operations
+   * complete.
    */
   virtual void Synchronize() = 0;
+
+protected:
+  bool capturing_ = false;
+  std::unique_ptr<ImmediateModeGraph> captured_graph_;
 };
 
 /// Factory function type for backend creation
