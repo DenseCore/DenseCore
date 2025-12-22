@@ -221,29 +221,8 @@ struct Tensor {
   }
 
   // ===========================================================================
-  // Accessors
+  // Accessors (Tensor-specific, uses inherited TensorBase methods for shape)
   // ===========================================================================
-
-  /**
-   * @brief Total number of elements in tensor
-   */
-  int64_t NumElements() const {
-    int64_t n = 1;
-    for (int i = 0; i < ndim; ++i) {
-      n *= shape[i];
-    }
-    return n;
-  }
-
-  /**
-   * @brief Size in bytes (accounting for packed types)
-   */
-  size_t SizeBytes() const {
-    if (dtype == DType::INT4) {
-      return (NumElements() + 1) / 2; // 2 elements per byte
-    }
-    return static_cast<size_t>(NumElements()) * DTypeSizeBytes(dtype);
-  }
 
   /**
    * @brief Type-safe data access
@@ -255,33 +234,11 @@ struct Tensor {
   }
 
   /**
-   * @brief Check if tensor is contiguous in memory (row-major order)
-   */
-  bool IsContiguous() const {
-    if (ndim == 0)
-      return true;
-    int64_t expected_stride = 1;
-    for (int i = ndim - 1; i >= 0; --i) {
-      if (stride[i] != expected_stride)
-        return false;
-      expected_stride *= shape[i];
-    }
-    return true;
-  }
-
-  /**
    * @brief Check if tensor is valid (has data and dimensions)
+   *
+   * Extends TensorBase::HasValidShape() to also check data pointer.
    */
-  bool IsValid() const { return data != nullptr && ndim > 0 && shape[0] > 0; }
-
-  /**
-   * @brief Get dimension at index (with bounds checking)
-   */
-  int64_t Dim(int index) const {
-    if (index < 0 || index >= ndim)
-      return 0;
-    return shape[index];
-  }
+  bool IsValid() const { return data != nullptr && HasValidShape(); }
 };
 
 // =============================================================================
