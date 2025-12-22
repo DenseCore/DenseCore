@@ -1,0 +1,361 @@
+/**
+ * @file ane_backend.h
+ * @brief Apple Neural Engine (ANE) backend via CoreML
+ *
+ * The Neural Engine is a fixed-function accelerator on Apple Silicon that
+ * provides exceptional performance for matrix operations. On M4, it delivers
+ * up to 38 TOPS (Trillion Operations Per Second).
+ *
+ * ANE Characteristics:
+ * - Fixed function: Not programmable like GPU, operations must be supported
+ * - High throughput: 11-38 TOPS depending on chip generation
+ * - Low power: More efficient than GPU for supported workloads
+ * - Latency: ~1-2ms model loading overhead per inference
+ *
+ * Supported Operations (via CoreML):
+ * - Matrix multiplication (with some restrictions)
+ * - Convolutions
+ * - Common activations (ReLU, GeLU, SiLU)
+ * - Normalization layers
+ *
+ * Strategy:
+ * 1. Pre-compile LLM layers to CoreML format at model load time
+ * 2. Cache compiled models for instant execution
+ * 3. Use ANE for attention/FFN layers that fit constraints
+ * 4. Fallback to Metal GPU for unsupported operations
+ *
+ * Constraints:
+ * - Model size < 1GB for optimal ANE placement
+ * - No dynamic shapes (fixed sequence length required)
+ * - Limited quantization support (INT8, FP16)
+ *
+ * Usage:
+ * @code
+ *   if (ANEBackend::IsAvailable()) {
+ *     auto ane = std::make_unique<ANEBackend>();
+ *     ane->CompileMatMul("layer0_qkv", hidden_dim, 3 * hidden_dim, weights);
+ *     ane->ExecuteMatMul("layer0_qkv", input, output);
+ *   }
+ * @endcode
+ *
+ * @see metal_backend.h for GPU acceleration
+ * @see HybridScheduler for CPU+GPU+ANE coordination
+ *
+ * Copyright (c) 2024 DenseCore Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef DENSECORE_ANE_BACKEND_H
+#define DENSECORE_ANE_BACKEND_H
+
+#ifdef __APPLE__
+
+#include "compute_backend.h"
+#include <memory>
+#include <string>
+#include <unordered_map>
+
+namespace densecore {
+
+// =============================================================================
+// Forward Declarations
+// =============================================================================
+
+// CoreML types (opaque to C++)
+#ifdef __OBJC__
+@class MLModel;
+@class MLMultiArray;
+@class MLModelConfiguration;
+#else
+typedef void *MLModel;
+typedef void *MLMultiArray;
+typedef void *MLModelConfiguration;
+#endif
+
+// =============================================================================
+// ANE Operation Types
+// =============================================================================
+
+/**
+ * @brief Types of operations that can be compiled to ANE
+ */
+enum class ANEOpType {
+  MatMul,     ///< Matrix multiplication
+  MatMulBias, ///< MatMul with fused bias addition
+  RMSNorm,    ///< RMS Normalization
+  LayerNorm,  ///< Layer Normalization
+  SiLU,       ///< SiLU activation (x * sigmoid(x))
+  GeLU,       ///< Gaussian Error Linear Unit
+  Softmax,    ///< Softmax activation
+  Attention,  ///< Full attention block (experimental)
+  FFN,        ///< Feed-forward network block (experimental)
+};
+
+/**
+ * @brief Status of an ANE compiled operation
+ */
+enum class ANEOpStatus {
+  NotCompiled, ///< Operation not yet compiled
+  Compiling,   ///< Compilation in progress
+  Ready,       ///< Ready for execution
+  Failed,      ///< Compilation failed
+  Unsupported, ///< Operation not supported on ANE
+};
+
+/**
+ * @brief Statistics for an ANE operation
+ */
+struct ANEOpStats {
+  uint64_t total_executions; ///< Number of times executed
+  double total_time_ms;      ///< Total execution time in ms
+  double avg_time_ms;        ///< Average execution time
+  double min_time_ms;        ///< Minimum execution time
+  double max_time_ms;        ///< Maximum execution time
+  bool uses_ane; ///< True if actually running on ANE (vs CPU fallback)
+};
+
+// =============================================================================
+// ANE Backend Class
+// =============================================================================
+
+/**
+ * @brief Apple Neural Engine backend via CoreML
+ *
+ * This backend compiles operations to CoreML format and executes them on
+ * the Neural Engine when possible. It provides a ComputeBackend interface
+ * for integration with DenseCore's HAL.
+ *
+ * Thread Safety:
+ * - Compilation is thread-safe (uses internal locking)
+ * - Execution is thread-safe for different operations
+ * - Same operation should not be executed concurrently
+ *
+ * Memory Model:
+ * - Uses MLMultiArray for data transfer
+ * - Shared memory with CPU (no explicit copies needed)
+ * - CoreML handles ANE memory management internally
+ */
+class ANEBackend : public ComputeBackend {
+public:
+  // ===========================================================================
+  // Static Methods
+  // ===========================================================================
+
+  /**
+   * @brief Check if Neural Engine is available
+   *
+   * Checks for:
+   * 1. Apple Silicon (M1 or later)
+   * 2. CoreML availability
+   * 3. Neural Engine compute unit access
+   *
+   * @return true if ANE can be used for inference
+   */
+  static bool IsAvailable();
+
+  /**
+   * @brief Get Neural Engine compute power
+   * @return TOPS (Trillion Operations Per Second)
+   */
+  static int GetTOPS();
+
+  /**
+   * @brief Get CoreML version
+   * @return Version string (e.g., "7.0")
+   */
+  static const char *GetCoreMLVersion();
+
+  // ===========================================================================
+  // Constructor / Destructor
+  // ===========================================================================
+
+  /**
+   * @brief Initialize ANE backend
+   *
+   * Performs:
+   * 1. CoreML framework initialization
+   * 2. MLModelConfiguration setup for ANE-only execution
+   * 3. Cache directory setup for compiled models
+   *
+   * @throws std::runtime_error if CoreML initialization fails
+   */
+  ANEBackend();
+  ~ANEBackend() override;
+
+  // Non-copyable
+  ANEBackend(const ANEBackend &) = delete;
+  ANEBackend &operator=(const ANEBackend &) = delete;
+
+  // ===========================================================================
+  // ComputeBackend Interface
+  // ===========================================================================
+
+  const char *Name() const override { return "Apple-ANE"; }
+  DeviceType Device() const override { return DeviceType::ASIC; }
+
+  void *AllocateDevice(size_t size_bytes, size_t alignment = 64) override;
+  void FreeDevice(void *ptr) override;
+  void CopyToDevice(void *dst, const void *src, size_t size_bytes) override;
+  void CopyFromDevice(void *dst, const void *src, size_t size_bytes) override;
+
+  // Core operations (use pre-compiled CoreML models)
+  void MatMul(const Tensor &A, const Tensor &B, Tensor *C) override;
+  void MatMulTransB(const Tensor &A, const Tensor &B, Tensor *C) override;
+
+  // Not supported on ANE - throws or falls back
+  void GemmInt4(const Tensor &A, const Tensor &W, const Tensor &scales,
+                const Tensor &zero_points, Tensor *C, int group_size) override;
+  void RMSNorm(const Tensor &input, const Tensor &weight, Tensor *output,
+               float eps = 1e-5f) override;
+  void AddRMSNorm(const Tensor &input, const Tensor &residual,
+                  const Tensor &weight, Tensor *output,
+                  float eps = 1e-5f) override;
+  void Softmax(const Tensor &input, Tensor *output) override;
+  void SoftmaxInplace(Tensor *data) override;
+  void RoPE(const Tensor &input, const Tensor &cos_sin, const int *positions,
+            Tensor *output, int rope_dim = -1) override;
+  void FusedQKVProjection(const Tensor &input, const Tensor &wq,
+                          const Tensor &wk, const Tensor &wv, Tensor *q_out,
+                          Tensor *k_out, Tensor *v_out) override;
+  void FlashAttention(const Tensor &Q, const Tensor &K, const Tensor &V,
+                      Tensor *output, float scale, bool causal = true,
+                      int n_head_kv = -1) override;
+
+  void Synchronize() override;
+
+  // ===========================================================================
+  // ANE-Specific APIs
+  // ===========================================================================
+
+  /**
+   * @brief Compile a MatMul operation for ANE execution
+   *
+   * Creates a CoreML model that represents: output = input @ weight^T + bias
+   * The model is compiled with ANE-only compute units for maximum performance.
+   *
+   * @param name Unique identifier for this operation (e.g., "layer0_wq")
+   * @param M Output dimension (rows of weight)
+   * @param K Input dimension (columns of weight)
+   * @param weight_data Pre-loaded weight tensor [M, K] row-major
+   * @param bias_data Optional bias [M], nullptr for no bias
+   * @return true if compilation succeeded
+   */
+  bool CompileMatMul(const std::string &name, int M, int K,
+                     const float *weight_data,
+                     const float *bias_data = nullptr);
+
+  /**
+   * @brief Compile a FP16 MatMul for better ANE performance
+   *
+   * ANE performs best with FP16 operations. This method quantizes weights
+   * to FP16 and creates an optimized CoreML model.
+   *
+   * @param name Unique identifier
+   * @param M Output dimension
+   * @param K Input dimension
+   * @param weight_fp32 FP32 weights (will be converted to FP16)
+   * @param bias_fp32 Optional FP32 bias
+   * @return true if compilation succeeded
+   */
+  bool CompileMatMulFP16(const std::string &name, int M, int K,
+                         const float *weight_fp32,
+                         const float *bias_fp32 = nullptr);
+
+  /**
+   * @brief Execute a pre-compiled MatMul
+   *
+   * @param name Operation identifier (must have been compiled)
+   * @param input Input vector [K]
+   * @param output Output vector [M]
+   * @return true if execution succeeded
+   */
+  bool ExecuteMatMul(const std::string &name, const float *input,
+                     float *output);
+
+  /**
+   * @brief Compile entire transformer layer
+   *
+   * For maximum efficiency, compiles attention + FFN as a single CoreML model.
+   * This reduces CoreML invocation overhead and allows ANE to optimize the
+   * entire computation graph.
+   *
+   * @param name Layer identifier (e.g., "layer_0")
+   * @param config Layer configuration
+   * @return true if compilation succeeded
+   */
+  struct TransformerLayerConfig {
+    int hidden_dim;
+    int intermediate_dim;
+    int n_heads;
+    int n_kv_heads;
+    int head_dim;
+    int max_seq_len;
+    float rms_norm_eps;
+    bool use_qk_norm;
+  };
+  bool CompileTransformerLayer(const std::string &name,
+                               const TransformerLayerConfig &config,
+                               const void *layer_weights);
+
+  /**
+   * @brief Get operation status
+   * @param name Operation identifier
+   * @return Current status of the operation
+   */
+  ANEOpStatus GetOpStatus(const std::string &name) const;
+
+  /**
+   * @brief Get operation statistics
+   * @param name Operation identifier
+   * @return Statistics for the operation
+   */
+  ANEOpStats GetOpStats(const std::string &name) const;
+
+  /**
+   * @brief Check if operation is using ANE (vs CPU fallback)
+   *
+   * CoreML may fall back to CPU if ANE doesn't support the operation
+   * or if ANE is busy with other work.
+   *
+   * @param name Operation identifier
+   * @return true if operation runs on ANE
+   */
+  bool IsRunningOnANE(const std::string &name) const;
+
+  /**
+   * @brief Set compute units preference
+   *
+   * @param ane_only If true, only use ANE (fail if unsupported)
+   *                 If false, allow CPU fallback
+   */
+  void SetANEOnlyMode(bool ane_only);
+
+  /**
+   * @brief Clear all compiled operations
+   *
+   * Useful for memory cleanup when switching models.
+   */
+  void ClearCompiledOps();
+
+  /**
+   * @brief Get cache directory for compiled models
+   * @return Path to cache directory
+   */
+  const char *GetCacheDirectory() const;
+
+  /**
+   * @brief Set cache directory
+   * @param path Path to cache directory (must exist)
+   */
+  void SetCacheDirectory(const char *path);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+} // namespace densecore
+
+#endif // __APPLE__
+
+#endif // DENSECORE_ANE_BACKEND_H

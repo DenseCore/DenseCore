@@ -4,11 +4,29 @@
  *
  * Provides global backend management with thread-safe registration
  * and default backend selection.
+ *
+ * Platform-Specific Backend Selection:
+ * - Apple Silicon (macOS arm64): Metal GPU > CPU (NEON/AMX)
+ * - Intel Mac: CPU (AVX2) only (Metal available but less optimal)
+ * - Linux/Windows: CPU (AVX2/AVX-512)
+ *
+ * The registry automatically selects the best available backend
+ * based on runtime hardware detection.
  */
 
-#include "backend_registry.h"
-#include "cpu_backend.h"
+#include "../include/backend_registry.h"
+#include "../include/cpu_backend.h"
 #include <iostream>
+
+// =============================================================================
+// Platform-Specific Metal Backend Support
+// =============================================================================
+// Metal backend is only available on Apple platforms.
+// We use conditional compilation to avoid linking errors on other platforms.
+// =============================================================================
+#ifdef __APPLE__
+#include "../include/metal_backend.h"
+#endif
 
 namespace densecore {
 
@@ -25,6 +43,22 @@ BackendRegistry &BackendRegistry::Instance() {
 // Registration
 // =============================================================================
 
+/**
+ * @brief Register the default CPU backend
+ *
+ * On Apple platforms, this function also attempts to register the Metal
+ * backend and sets it as the default if available. The Metal backend
+ * provides significant performance improvements for LLM inference on
+ * Apple Silicon due to:
+ *
+ * 1. High GPU memory bandwidth (100-400+ GB/s on M1-M4)
+ * 2. Unified Memory Architecture (zero-copy CPU↔GPU)
+ * 3. Optimized Metal Performance Shaders for matrix ops
+ *
+ * Fallback order:
+ * - Metal (Apple Silicon GPU) - preferred for large models
+ * - CPU (NEON/AMX on Apple, AVX on x86) - fallback
+ */
 void BackendRegistry::RegisterCpuBackend() {
   std::lock_guard<std::mutex> lock(mutex_);
 
@@ -33,14 +67,43 @@ void BackendRegistry::RegisterCpuBackend() {
     return;
   }
 
-  // Create and register CPU backend
+  // ===========================================================================
+  // Step 1: Register Metal backend on Apple platforms (if available)
+  // ===========================================================================
+#ifdef __APPLE__
+  if (MetalBackend::IsAvailable()) {
+    try {
+      auto metal_backend = std::make_unique<MetalBackend>();
+      std::cout << "[BackendRegistry] Registered Metal backend: "
+                << metal_backend->Name() << std::endl;
+
+      backends_[DeviceType::METAL] = std::move(metal_backend);
+      default_device_ = DeviceType::METAL; // Prefer Metal on Apple
+      initialized_ = true;
+
+      std::cout << "[BackendRegistry] Metal set as default (Apple Silicon GPU)"
+                << std::endl;
+    } catch (const std::exception &e) {
+      std::cerr << "[BackendRegistry] Metal backend init failed: " << e.what()
+                << ", falling back to CPU" << std::endl;
+    }
+  }
+#endif
+
+  // ===========================================================================
+  // Step 2: Always register CPU backend as fallback
+  // ===========================================================================
   auto cpu_backend = std::make_unique<CpuBackend>();
   std::cout << "[BackendRegistry] Registered CPU backend: "
             << cpu_backend->Name() << std::endl;
 
   backends_[DeviceType::CPU] = std::move(cpu_backend);
-  default_device_ = DeviceType::CPU;
-  initialized_ = true;
+
+  // If Metal wasn't registered, CPU becomes default
+  if (!initialized_) {
+    default_device_ = DeviceType::CPU;
+    initialized_ = true;
+  }
 }
 
 void BackendRegistry::Register(DeviceType device,
