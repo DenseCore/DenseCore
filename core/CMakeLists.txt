@@ -166,7 +166,33 @@ target_compile_options(densecore PRIVATE
 if(APPLE)
     message(STATUS "Configuring for Apple platform - Using Accelerate framework")
 
-    # Use Apple's Accelerate framework
+    # ==========================================================================
+    # Enable Objective-C++ for Metal backend
+    # ==========================================================================
+    enable_language(OBJCXX)
+    set(CMAKE_OBJCXX_STANDARD 17)
+    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+    
+    # Metal source files (Objective-C++)
+    set(METAL_SOURCES
+        src/metal_backend.mm
+        src/apple_silicon.mm
+        src/ane_backend.mm
+        src/hybrid_scheduler.mm
+    )
+    
+    # Add Metal sources to the main source list
+    list(APPEND SOURCES ${METAL_SOURCES})
+    
+    # Set Objective-C++ flags for .mm files
+    set_source_files_properties(${METAL_SOURCES} PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc"
+    )
+
+    # ==========================================================================
+    # Apple Frameworks
+    # ==========================================================================
+    # Accelerate (BLAS/LAPACK)
     find_library(ACCELERATE_FRAMEWORK Accelerate)
     if(ACCELERATE_FRAMEWORK)
         target_link_libraries(densecore PRIVATE ${ACCELERATE_FRAMEWORK})
@@ -176,14 +202,93 @@ if(APPLE)
         message(WARNING "Accelerate framework not found")
     endif()
 
-    # Apple Silicon optimizations
+    # Metal (GPU compute)
+    find_library(METAL_FRAMEWORK Metal)
+    find_library(METALPERFORMANCESHADERS_FRAMEWORK MetalPerformanceShaders)
+    find_library(FOUNDATION_FRAMEWORK Foundation)
+    find_library(COREML_FRAMEWORK CoreML)
+    find_library(IOKIT_FRAMEWORK IOKit)
+    
+    if(METAL_FRAMEWORK)
+        # Consolidate all Apple framework linking into a single call.
+        # find_library sets variables to ...-NOTFOUND if not found,
+        # and target_link_libraries ignores such values safely.
+        target_link_libraries(densecore PRIVATE 
+            ${METAL_FRAMEWORK}
+            ${FOUNDATION_FRAMEWORK}
+            ${METALPERFORMANCESHADERS_FRAMEWORK}
+            ${COREML_FRAMEWORK}
+            ${IOKIT_FRAMEWORK}
+        )
+        
+        target_compile_definitions(densecore PRIVATE 
+            DENSECORE_USE_METAL
+            DENSECORE_USE_ANE
+            GGML_USE_METAL
+        )
+        message(STATUS "Metal framework enabled for GPU acceleration")
+    else()
+        message(WARNING "Metal framework not found - GPU acceleration disabled")
+    endif()
+
+    # ==========================================================================
+    # Metal Shader Compilation
+    # ==========================================================================
+    set(METAL_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+    set(METAL_SHADERS
+        ${METAL_SHADER_DIR}/gemv.metal
+        ${METAL_SHADER_DIR}/flash_attention.metal
+        ${METAL_SHADER_DIR}/quantized_gemv.metal
+    )
+
+    
+    if(EXISTS ${METAL_SHADER_DIR})
+        # Compile Metal shaders to metallib
+        set(METALLIB_OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/densecore.metallib)
+        
+        add_custom_command(
+            OUTPUT ${METALLIB_OUTPUT}
+            COMMAND xcrun -sdk macosx metal 
+                    -c ${METAL_SHADERS}
+                    -o ${CMAKE_CURRENT_BINARY_DIR}/densecore.air
+            COMMAND xcrun -sdk macosx metallib
+                    ${CMAKE_CURRENT_BINARY_DIR}/densecore.air
+                    -o ${METALLIB_OUTPUT}
+            DEPENDS ${METAL_SHADERS}
+            COMMENT "Compiling Metal shaders to metallib"
+            VERBATIM
+        )
+        
+        add_custom_target(metal_shaders ALL DEPENDS ${METALLIB_OUTPUT})
+        add_dependencies(densecore metal_shaders)
+        
+        # Install metallib alongside the library
+        install(FILES ${METALLIB_OUTPUT} DESTINATION lib)
+        
+        message(STATUS "Metal shaders will be compiled from: ${METAL_SHADER_DIR}")
+    endif()
+
+    # ==========================================================================
+    # Apple Silicon Optimizations
+    # ==========================================================================
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
-        message(STATUS "Apple Silicon detected - enabling ARM NEON optimizations")
-        target_compile_options(densecore PRIVATE -mcpu=apple-m1)
-        target_compile_definitions(densecore PRIVATE GGML_USE_CPU GGML_USE_ACCELERATE)
+        message(STATUS "Apple Silicon detected - enabling ARM NEON and Metal optimizations")
+        target_compile_options(densecore PRIVATE 
+            -mcpu=apple-m1
+            -ffast-math
+            -ffp-contract=fast
+        )
+        target_compile_definitions(densecore PRIVATE 
+            DENSECORE_APPLE_SILICON
+            GGML_USE_CPU 
+            GGML_USE_ACCELERATE
+        )
     else()
         # Intel Mac
-        target_compile_definitions(densecore PRIVATE GGML_USE_CPU GGML_USE_ACCELERATE)
+        target_compile_definitions(densecore PRIVATE 
+            GGML_USE_CPU 
+            GGML_USE_ACCELERATE
+        )
     endif()
 
 else()
