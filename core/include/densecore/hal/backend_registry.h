@@ -64,6 +64,16 @@ public:
   void Register(DeviceType device, std::unique_ptr<ComputeBackend> backend);
 
   /**
+   * @brief Load external backend plugin (.so/.dylib)
+   *
+   * Dynamically loads a shared library containing a backend implementation.
+   * The library must export a "CreateBackend" factory function.
+   *
+   * @param path Path to shared library
+   */
+  void LoadPlugin(const std::string &path);
+
+  /**
    * @brief Get backend by device type
    *
    * @param device Device type to look up

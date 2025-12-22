@@ -1,639 +1,75 @@
-# DenseCore Architecture
+# Architecture
 
-A deep dive into DenseCore's system design, components, and performance optimizations.
+DenseCore is a hybrid C++/Python/Go system designed for high-efficiency LLM inference on CPU.
 
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Design Philosophy](#design-philosophy)
-- [System Components](#system-components)
-- [Request Lifecycle](#request-lifecycle)
-- [Memory Management](#memory-management)
-- [Performance Optimizations](#performance-optimizations)
-- [Extension Points](#extension-points)
-
----
-
-## Overview
-
-DenseCore is a **three-layer architecture** optimized for CPU-based LLM inference:
+## System Overview
 
 ```mermaid
 graph TB
-    subgraph "Layer 1: User Interface"
+    subgraph "Interface"
         PySDK[Python SDK]
         GoServer[Go REST Server]
-        CLI[CLI Tools]
     end
     
-    subgraph "Layer 2: Inference Engine (C++)"
-        Scheduler[Request Scheduler]
-        Worker[Inference Worker]
+    subgraph "Core Engine (C++)"
+        Scheduler[Scheduler]
+        Worker[Worker Threads]
         KVCache[Paged KV Cache]
-        ModelMgr[Model Manager]
+        Model[GGUF Model]
     end
     
-    subgraph "Layer 3: Compute Backend"
-        GGML[GGML Tensor Ops]
-        Quant[Quantization]
-        SIMD[SIMD Kernels AVX2/AVX-512]
+    subgraph "Backend"
+        AVX[AVX2/AVX-512]
+        Metal[Apple Metal]
+        GGML[Tensor Ops]
     end
     
-    PySDK --> |ctypes FFI| Scheduler
+    PySDK --> |ctypes| Scheduler
     GoServer --> |CGO| Scheduler
-    CLI --> |Direct Link| Scheduler
     
     Scheduler --> Worker
     Worker --> KVCache
-    Worker --> ModelMgr
+    Worker --> Model
     Worker --> GGML
     
-    GGML --> Quant
-    GGML --> SIMD
-    
-    style PySDK fill:#e1f5ff
-    style GoServer fill:#e1ffe1
-    style Worker fill:#fff4e1
-    style GGML fill:#ffe1f5
+    GGML --> AVX
+    GGML --> Metal
 ```
 
-**Key Design Decisions:**
-
-1. **C++ Core for Speed:** Critical path (tensor ops, memory management) in C++17
-2. **Python for UX:** Pythonic API via ctypes for minimal overhead
-3. **Go for Services:** High-concurrency REST server with built-in observability
-4. **GGML for Portability:** Broad CPU support (ARM, x86) without custom kernels
-
----
-
-## Design Philosophy
-
-### 1. **Python-First Developer Experience**
-
-Unlike llama.cpp (CLI-focused) or raw GGML (C-only), DenseCore prioritizes Python developers:
-
-```python
-# This should "just work" - no compilation, no configuration
-import densecore
-model = densecore.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct-GGUF")
-response = model.generate("Hello!")
-```
-
-**Implementation:**
-- ctypes FFI (no C extension compilation required)
-- Automatic model downloading from HuggingFace Hub
-- Async/await support for modern Python
-- Type hints and docstrings
-
-### 2. **Production-Ready by Default**
-
-Many inference libraries are research-oriented. DenseCore is **production-first**:
-
-- ✅ Health checks (`/health/live`, `/health/ready`, `/health/startup`)
-- ✅ Prometheus metrics (latency percentiles, throughput, cache hit rate)
-- ✅ Graceful shutdown with request draining
-- ✅ Request cancellation and timeouts
-- ✅ Structured logging (JSON output)
-
-### 3. **CPU as a First-Class Citizen**
-
-Most frameworks optimize for GPUs, with CPU as an afterthought. DenseCore inverts this:
-
-- Aggressive quantization (INT4, INT8, FP8) using standard implementations
-- Paged KV cache to minimize allocations
-- SIMD-optimized kernels (AVX2, AVX-512)
-- Graph Caching for reduced overhead
-
----
-
-## System Components
-
-### C++ Inference Engine
-
-**Location:** `core/src/`
-
-The heart of DenseCore. Written in C++17 for performance and control.
-
-#### Key Files
-
-| File | Purpose |
-|------|---------|
-| [`inference.cpp`](file:///mnt/c/Users/jwsong/PycharmProjects/DenseCore/core/src/inference.cpp) | Main inference loop, transformer graph building |
-| [`worker.cpp`](file:///mnt/c/Users/jwsong/PycharmProjects/DenseCore/core/src/worker.cpp) | Request scheduler, batch processing |
-| [`kv_cache.cpp`](file:///mnt/c/Users/jwsong/PycharmProjects/DenseCore/core/src/kv_cache.cpp) | Paged KV cache implementation |
-| [`model_loader.cpp`](file:///mnt/c/Users/jwsong/PycharmProjects/DenseCore/core/src/model_loader.cpp) | GGUF model parsing and loading |
-| [`densecore.h`](file:///mnt/c/Users/jwsong/PycharmProjects/DenseCore/core/include/densecore.h) | Public C API |
-
-#### Inference Engine Responsibilities
-
-1. **Model Loading:** Parse GGUF files, allocate tensors
-2. **Request Scheduling:** Queue incoming requests, batch when possible
-3. **Graph Execution:** Build computation graph, execute via GGML
-4. **KV Cache Management:** Allocate/free cache blocks, eviction policy
-5. **Token Sampling:** Top-K, Top-P, temperature, repetition penalty
-
-#### Memory Layout
-
-```
-┌─────────────────────────────────────┐
-│  Model Weights (Read-Only)          │  <-- mmap()'d from GGUF file
-│  - Quantized (INT4/INT8)            │
-│  - Embedded in GGUF file            │
-└─────────────────────────────────────┘
-┌─────────────────────────────────────┐
-│  KV Cache (Paged)                   │  <-- Dynamically allocated
-│  - 16KB blocks per page             │
-│  - LRU eviction                     │
-└─────────────────────────────────────┘
-┌─────────────────────────────────────┐
-│  Compute Scratch (Arena Allocator)  │  <-- Temporary for graph execution
-│  - Pre-allocated 8GB buffer         │
-│  - Reset after each request         │
-└─────────────────────────────────────┘
-```
-
-**Memory Efficiency:**
-- Model weights: mmap (zero-copy read from disk)
-- KV cache: Paged allocation (no upfront allocation)
-- Scratch space: Arena allocator (eliminates malloc overhead)
-
----
-
-### Python SDK
-
-**Location:** `python/densecore/`
-
-Pythonic wrapper around the C++ core.
-
-#### Architecture
-
-```python
-# High-level API
-from densecore import DenseCore, from_pretrained
-
-# Low-level bindings (ctypes)
-from densecore.bindings import libdensecore, DenseCoreHandle
-```
-
-**Key Components:**
-
-| Module | Purpose |
-|--------|---------|
-| `densecore/__init__.py` | Main `DenseCore` class, public API |
-| `densecore/bindings.py` | ctypes FFI to `libdensecore.so` |
-| `densecore/async_sdk.py` | Async/await support for streaming |
-| `densecore/config.py` | `GenerationConfig`, `ModelConfig` |
-| `densecore/exceptions.py` | Custom exception hierarchy |
-| `densecore/quantize/` | Quantization config and API |
-| `densecore/prune/` | Pruning config and API |
-
-#### Async Streaming Implementation
-
-```python
-# Internal implementation (simplified)
-class DenseCore:
-    async def stream_async(self, prompt: str, **kwargs):
-        queue = asyncio.Queue()
-        
-        def callback(token: str, is_finished: int, user_data):
-            asyncio.create_task(queue.put((token, is_finished)))
-        
-        # Submit to C++ engine (non-blocking)
-        request_id = libdensecore.SubmitRequest(
-            self._handle, prompt, callback, None
-        )
-        
-        # Yield tokens as they arrive
-        while True:
-            token, is_finished = await queue.get()
-            yield token
-            if is_finished:
-                break
-```
-
----
-
-### Go REST Server
-
-**Location:** `server/`
-
-Production HTTP/REST server with OpenAI-compatible API.
-
-#### Features
-
-- **OpenAI-Compatible API:** Drop-in replacement for OpenAI's `/v1/chat/completions`
-- **Streaming SSE:** Server-Sent Events for streaming responses
-- **Authentication:** API key-based auth with tier-based rate limiting
-- **Observability:**
-  - Prometheus metrics (`/metrics`)
-  - Health checks (`/health/*`)
-  - Structured JSON logging
-
-#### Request Flow
-
-```
-Client Request (HTTP)
-    ↓
-Go HTTP Handler (main.go)
-    ↓
-Authentication Middleware (auth.go)
-    ↓
-Rate Limiter (rate_limiter.go)
-    ↓
-C++ Engine (via CGO)
-    ↓
-Streaming Callback
-    ↓
-SSE Response to Client
-```
-
-#### Key Files
-
-| File | Purpose |
-|------|---------|
-| `main.go` | HTTP server setup, routing |
-| `internal/handlers/chat.go` | `/v1/chat/completions` endpoint |
-| `internal/handlers/embeddings.go` | `/v1/embeddings` endpoint |
-| `internal/middleware/auth.go` | API key authentication |
-| `internal/metrics/prometheus.go` | Metrics collection |
-
----
-
-## Request Lifecycle
-
-### 1. Request Submission
-
-```python
-# User code
-response = model.generate("Hello, world!", max_tokens=100)
-```
-
-```
-Python SDK
-    ↓
-ctypes → SubmitRequest(handle, prompt, max_tokens, callback, user_data)
-    ↓
-C++ RequestScheduler::AddRequest()
-    ↓
-Queue request in pending_requests_
-```
-
-### 2. Batching & Scheduling
-
-The scheduler attempts to batch compatible requests:
-
-```cpp
-// Pseudo-code from worker.cpp
-while (true) {
-    std::vector<Request*> batch;
-    
-    // Collect up to max_batch_size requests
-    while (batch.size() < max_batch_size && !pending_requests_.empty()) {
-        auto req = pending_requests_.front();
-        pending_requests_.pop();
-        batch.push_back(req);
-    }
-    
-    // Process batch
-    ProcessBatch(batch);
-}
-```
-
-**Batching Rules:**
-- Same model only
-- Compatible max_tokens
-- KV cache space available
-
-### 3. Prefill Phase (Prompt Processing)
-
-For a batch of N requests with prompts of length L₁, L₂, ..., Lₙ:
-
-```
-For each request i:
-    1. Tokenize prompt → token_ids[L_i]
-    2. Build transformer graph (attention, FFN, etc.)
-    3. Execute graph → logits[vocab_size]
-    4. Sample next token → next_token_id
-    5. Store KV cache for this sequence
-```
-
-**KV Cache Storage:**
-
-```
-seq_123 → [K_block_0, K_block_1, V_block_0, V_block_1]
-          ↑ Each block = 16KB = 16 tokens × hidden_size × sizeof(fp16)
-```
-
-### 4. Decode Phase (Token Generation)
-
-Iteratively generate tokens until `max_tokens` or `<eos>`:
-
-```
-Loop until stopping condition:
-    1. For each active request:
-        - Retrieve KV cache blocks
-        - Build graph for single-token inference
-        - Execute graph → logits
-        - Sample next token
-        - Append to KV cache
-    
-    2. Invoke callback with new token
-    
-    3. Check stopping:
-        - max_tokens reached?
-        - EOS token generated?
-        - User cancellation?
-```
-
-### 5. Completion & Cleanup
-
-```cpp
-// Callback to Python
-callback(final_token, /*is_finished=*/1, user_data);
-
-// Release KV cache blocks
-kv_cache_->ReleaseSequence(seq_id);
-
-// Remove from active requests
-active_requests_.erase(request_id);
-```
-
----
+## Key Components
+
+### 1. C++ Core (`core/src/`)
+The inference engine is written in C++17, handling:
+- **Model Loading**: Memory-mapped GGUF loading via `model_loader.cpp`.
+- **Scheduling**: Continuous batching of requests in `worker.cpp`.
+- **Memory Management**: Block-based Paged KV Cache (`kv_cache.cpp`) to minimize fragmentation.
+- **Compute**: Dispatches matrix operations to architecture-specific backends (AVX2/AVX-512 for x86, Metal for macOS).
+
+### 2. Python SDK (`python/densecore/`)
+A thin wrapper around the C++ library using `ctypes`.
+- Direct memory access to C++ structures where possible.
+- Async support via a dedicated background thread for callbacks.
+- Handles model downloading (HuggingFace Hub) and configuration.
+
+### 3. Go Server (`server/`)
+Provides an OpenAI-compatible REST API.
+- Uses CGO to link directly against `libdensecore`.
+- Capabilities: SSE streaming, tiered rate limiting, and Prometheus metrics.
 
 ## Memory Management
 
-### Paged KV Cache (Inspired by vLLM)
+### Paged KV Cache
+Inspired by vLLM, DenseCore uses non-contiguous memory blocks for the Key-Value cache.
+- **Blocks**: Each block holds tokens for a fixed size (e.g., 16 tokens).
+- **Allocation**: Blocks are allocated on-demand, reducing wasted memory for short sequences.
+- **Sharing**: Enables efficient memory sharing.
 
-Traditional KV cache pre-allocates contiguous memory for max sequence length:
-
-```
-❌ Traditional: [K][K][K]...[K][K][K]  (10,000 slots, 80% wasted)
-                 ↑ Used    ↑ Wasted
-```
-
-**DenseCore's Paged KV Cache:**
-
-```
-✅ Paged: [Block 0] → [Block 1] → [Block 2] → ...
-           16 tokens   16 tokens   16 tokens
-           
-Only allocate blocks as needed!
-```
-
-**Benefits:**
-- **95% memory savings** for short sequences
-- **Dynamic allocation:** No upfront commitment
-- **LRU eviction:** Reuse blocks for new requests
-
-**Implementation (`kv_cache.cpp`):**
-
-```cpp
-class PagedKVCache {
-    std::vector<KVBlock> free_blocks_;  // Available blocks
-    std::unordered_map<int, std::vector<int>> seq_to_blocks_;  // seq_id → block_ids
-    
-public:
-    std::vector<int> AllocateBlocks(int seq_id, int num_tokens) {
-        int num_blocks = (num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        std::vector<int> allocated;
-        
-        for (int i = 0; i < num_blocks; i++) {
-            if (free_blocks_.empty()) {
-                EvictLRU();  // Evict least recently used sequence
-            }
-            allocated.push_back(free_blocks_.back().id);
-            free_blocks_.pop_back();
-        }
-        
-        seq_to_blocks_[seq_id] = allocated;
-        return allocated;
-    }
-};
-```
-
-### Arena Allocator for Compute Graph
-
-GGML uses an arena allocator for temporary tensors during graph execution:
-
-```cpp
-// Allocate 8GB scratch space upfront
-ggml_context* ctx = ggml_init({
-    .mem_size = 8ULL * 1024 * 1024 * 1024,  // 8GB
-    .mem_buffer = nullptr,  // Auto-allocate
-    .no_alloc = false
-});
-
-// All ggml_new_tensor_*() calls use this arena (no malloc)
-struct ggml_tensor* tmp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, seq_len);
-
-// After graph execution, reset arena (instant "free")
-ggml_reset(ctx);
-```
-
-**Why this is fast:**
-- **Zero malloc overhead:** Single allocation
-- **Zero fragmentation:** Bump allocator
-- **Instant cleanup:** Reset pointer, no iteration
-
----
+### Arena Allocator
+Temporary tensor computations (activations) use a bump-pointer arena allocator, reset after each forward pass. This eliminates `malloc`/`free` overhead during generation.
 
 ## Performance Optimizations
 
-### 1. **Quantization (INT4/INT8)**
-
-Traditional LLMs store weights as FP32 (4 bytes per parameter):
-
-```
-7B model × 4 bytes = 28GB memory
-```
-
-DenseCore uses **block-wise quantization:**
-
-```cpp
-// INT4 quantization (32 weights → 1 scale + 16 bytes)
-struct Block {
-    float scale;       // 4 bytes
-    uint8_t data[16];  // 16 bytes (32 × 4-bit packed)
-};
-
-// Dequantize on-the-fly during matmul
-float dequantize_int4(uint8_t val, float scale) {
-    int8_t signed_val = (val & 0xF) - 8;  // Convert to [-8, 7]
-    return signed_val * scale;
-}
-```
-
-**Result:**
-- 7B model × 0.5 bytes (INT4) = **3.5GB**
-- 8x memory reduction!
-
-### 2. **SIMD Kernels (AVX2/AVX-512)**
-
-GGML automatically selects optimal kernels for your CPU:
-
-```cpp
-// Matrix multiplication with AVX2 (8 floats at once)
-void ggml_vec_dot_f32(int n, float* result, const float* a, const float* b) {
-    __m256 sum = _mm256_setzero_ps();
-    
-    for (int i = 0; i < n; i += 8) {
-        __m256 va = _mm256_loadu_ps(a + i);
-        __m256 vb = _mm256_loadu_ps(b + i);
-        sum = _mm256_fmadd_ps(va, vb, sum);  // Fused multiply-add
-    }
-    
-    // Horizontal sum
-    *result = _mm256_reduce_add_ps(sum);
-}
-```
-
-**Speedup:** 4-8x vs. scalar code on modern CPUs
-
-### 3. **Graph Caching**
-
-Rebuilding the computation graph for every token generation step is expensive on CPU. DenseCore implements **Graph Caching**:
-
-```cpp
-// First run: Build graph, allocate nodes, compute
-auto graph = BuildGraph(ctx, tokens);
-
-// Subsequent runs: Reuse structure, just update pointers
-graph->UpdateInput(new_token);
-graph->Compute();
-```
-
-**Benefit:** Reduces CPU overhead by 30-40% for small batches.
-
-### 4. **Smart Preemption**
-
-When the system is overloaded, the scheduler must decide which request to pause to free up memory (KV cache blocks).
-
-**Strategy:**
-1.  **Priority**: Lower priority requests are preempted first.
-2.  **Least Progress**: If priorities match, requests with the fewest generated tokens are preempted.
-
-This minimizes wasted computation compared to random or LIFO preemption.
-
-### 5. **Continuous Batching**
-
-Unlike traditional batching (wait for batch to fill), DenseCore uses **continuous batching**:
-
-```
-Traditional Batching:
-  Wait for 8 requests → Process batch → Wait for next 8
-
-Continuous Batching:
-  Process whatever requests are available
-  Requests can join/leave mid-generation
-```
-
-**Benefit:** Higher throughput, lower latency
-
----
-
-## Extension Points
-
-### Adding Custom Sampling Strategies
-
-Extend `token_sampler.cpp`:
-
-```cpp
-class CustomSampler : public TokenSampler {
-public:
-    int Sample(const float* logits, int vocab_size, SamplingConfig config) override {
-        // Your custom logic (e.g., nucleus sampling, mirostat)
-        return selected_token_id;
-    }
-};
-
-// Register in factory
-SamplerFactory::Register("custom", []() { return std::make_unique<CustomSampler>(); });
-```
-
-### Adding New Model Architectures
-
-Implement `TransformerBuilder` interface:
-
-```cpp
-class Qwen3Builder : public TransformerBuilder {
-public:
-    ggml_tensor* BuildAttention(ggml_context* ctx, ggml_tensor* input) override {
-        // Qwen3-specific: QK normalization
-        ggml_tensor* q = BuildQuery(ctx, input);
-        ggml_tensor* q_norm = ggml_norm(ctx, q);  // QK-Norm
-        // ... rest of attention
-    }
-};
-```
-
-### Adding Custom Metrics
-
-Extend Prometheus metrics:
-
-```go
-// In server/internal/metrics/custom.go
-var customMetric = prometheus.NewHistogram(prometheus.HistogramOpts{
-    Name: "densecore_custom_metric",
-    Help: "Your custom metric",
-})
-
-func RecordCustom(value float64) {
-    customMetric.Observe(value)
-}
-```
-
----
-
-## Performance Characteristics
-
-### Latency Profile
-
-Typical request latency breakdown (Qwen2.5-0.5B, 100 token generation):
-
-```
-┌─────────────────┬──────────────┐
-│ Phase           │ Time         │
-├─────────────────┼──────────────┤
-│ Queue Wait      │ 2ms          │
-│ Prefill (prompt)│ 50ms (10 tok)│
-│ Decode (gen)    │ 3000ms       │
-│   First Token   │ 50ms (TTFT)  │
-│   Subsequent    │ 30ms/token   │
-└─────────────────┴──────────────┘
-Total: ~3052ms for 100 tokens = 32.7 TPS
-```
-
-### Throughput Scaling
-
-```
-Batch Size = 1:  30 TPS
-Batch Size = 4:  24 TPS per request (96 total)
-Batch Size = 8:  20 TPS per request (160 total)
-```
-
-**Lesson:** Batching improves total throughput but increases per-request latency.
-
----
-
-## Comparison Table
-
-|Feature | DenseCore | llama.cpp | vLLM | Transformers |
-|---------|-----------|-----------|------|--------------|
-| **Quantization** | INT4/INT8/FP8 | INT4/INT8 | FP16/BF16 | FP32/FP16 |
-| **KV Cache** | Paged (vLLM-style) | Contiguous | Paged | Implicit |
-| **Batching** | Continuous | None | Continuous | Static |
-| **Graph Caching** | ✅ Yes | ❌ No | ✅ CUDA Graph | ❌ No |
-| **Python API** | ✅ Native | ⚠️ Bindings | ✅ Native | ✅ Native |
-| **Async Support** | ✅ Yes | ❌ No | ✅ Yes | ⚠️ Limited |
-| **Production** | ✅ K8s-ready | ❌ CLI-only | ✅ K8s-ready | ⚠️ Manual |
-
----
-
-## Next Steps
-
-- [Deploy to Production](DEPLOYMENT.md)
-- [Optimize Your Models](MODEL_OPTIMIZATION.md)
-- [API Reference](API_REFERENCE.md)
-- [Contributing Guide](../CONTRIBUTING.md)
+- **Intelligent Batching**: Requests are processed in batches when possible, maximizing SIMD throughput.
+- **Graph Caching**: Computation graphs are reused between tokens to reduce overhead.
+- **Quantization**: Native support for GGML quantization types (Q4_K_M, Q8_0).
+- **Hybrid Backend**: On macOS, heavy matrix multiplications offload to Metal GPU, while smaller ops run on CPU to minimize latency.

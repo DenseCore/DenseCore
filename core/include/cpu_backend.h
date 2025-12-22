@@ -23,7 +23,7 @@
 #ifndef DENSECORE_CPU_BACKEND_H
 #define DENSECORE_CPU_BACKEND_H
 
-#include "compute_backend.h"
+#include "densecore/hal/compute_backend.h"
 #include "simd_ops.h"
 #include "tensor_view.h"
 

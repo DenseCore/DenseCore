@@ -28,7 +28,7 @@
 #ifndef DENSECORE_METAL_BACKEND_H
 #define DENSECORE_METAL_BACKEND_H
 
-#include "compute_backend.h"
+#include "densecore/hal/compute_backend.h"
 #include <memory>
 
 // Only compile on Apple platforms

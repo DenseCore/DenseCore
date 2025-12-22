@@ -1,6 +1,23 @@
 cmake_minimum_required(VERSION 3.14)
 project(DenseCore VERSION 1.0.0 LANGUAGES C CXX)
 
+# ==========================================================================
+# Commercial / Open Source Toggle
+# ==========================================================================
+option(DENSECORE_COMMERCIAL "Enable commercial features (Graviton/Enterprise)" OFF)
+
+if(DENSECORE_COMMERCIAL)
+    message(STATUS "[DenseCore] Commercial build ENABLED")
+    add_compile_definitions(DENSECORE_COMMERCIAL)
+    
+    # Check for proprietary source directory
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/proprietary/CMakeLists.txt")
+        add_subdirectory(src/proprietary)
+    else()
+        message(WARNING "[DenseCore] Commercial flag ON but src/proprietary not found or empty.")
+    endif()
+endif()
+
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

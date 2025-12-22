@@ -52,7 +52,7 @@
 
 #ifdef __APPLE__
 
-#include "compute_backend.h"
+#include "densecore/hal/compute_backend.h"
 #include <functional>
 #include <memory>
 #include <string>

@@ -50,7 +50,7 @@
 
 #ifdef __APPLE__
 
-#include "compute_backend.h"
+#include "densecore/hal/compute_backend.h"
 #include <memory>
 #include <string>
 #include <unordered_map>
