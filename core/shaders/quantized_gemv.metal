@@ -1,6 +1,6 @@
 /**
- * @file quantized_gemm.metal
- * @brief Quantized INT4/INT8 GEMM kernels for Metal
+ * @file quantized_gemv.metal
+ * @brief Quantized INT4/INT8 GEMV kernels for Metal (decode phase)
  *
  * LLM inference is memory-bandwidth bound, especially during decode phase.
  * Quantizing weights from FP16/FP32 to INT4/INT8 reduces memory transfer

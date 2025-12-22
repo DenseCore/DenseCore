@@ -420,33 +420,11 @@ kernel void flash_attention_decode(
 }
 
 // =============================================================================
-// Grouped Query Attention (GQA) Helper
+// Note on Grouped Query Attention (GQA)
 // =============================================================================
-
-/**
- * @brief Attention with KV head repetition for GQA
- *
- * In GQA, multiple query heads share the same KV head.
- * This kernel handles the head index mapping automatically.
- */
-kernel void flash_attention_gqa(
-    device const float* Q [[buffer(0)]],
-    device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
-    device float* output [[buffer(3)]],
-    constant float& scale [[buffer(4)]],
-    constant uint& seq_q [[buffer(5)]],
-    constant uint& seq_kv [[buffer(6)]],
-    constant uint& head_dim [[buffer(7)]],
-    constant uint& n_heads [[buffer(8)]],
-    constant uint& n_kv_heads [[buffer(9)]],
-    constant uint& causal [[buffer(10)]],
-    uint3 gid [[thread_position_in_grid]],
-    uint3 tgid [[threadgroup_position_in_grid]])
-{
-    // GQA head mapping is handled by computing kv_head_idx = head_idx / n_rep
-    // where n_rep = n_heads / n_kv_heads
-    
-    // Same implementation as flash_attention_forward with GQA support
-    // (Implementation would be similar to above)
-}
+// GQA is natively supported in flash_attention_forward and flash_attention_decode
+// via the n_kv_heads parameter. The kernel computes:
+//   kv_head_idx = head_idx / (n_heads / n_kv_heads)
+// to map multiple query heads to the same KV head.
+// No separate kernel is needed.
+// =============================================================================

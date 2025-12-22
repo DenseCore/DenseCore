@@ -238,7 +238,7 @@ if(APPLE)
     set(METAL_SHADERS
         ${METAL_SHADER_DIR}/gemv.metal
         ${METAL_SHADER_DIR}/flash_attention.metal
-        ${METAL_SHADER_DIR}/quantized_gemm.metal
+        ${METAL_SHADER_DIR}/quantized_gemv.metal
     )
 
     

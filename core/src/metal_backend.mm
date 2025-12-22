@@ -52,6 +52,7 @@ struct MetalBackend::Impl {
   id<MTLComputePipelineState> gemvPipeline = nil;
   id<MTLComputePipelineState> softmaxPipeline = nil;
   id<MTLComputePipelineState> rmsNormPipeline = nil;
+  id<MTLComputePipelineState> flashAttentionDecodePipeline = nil;
 
   // GGML Metal backend (for graph execution)
   ggml_backend_t ggmlMetalBackend = nullptr;
@@ -85,6 +86,7 @@ struct MetalBackend::Impl {
     gemvPipeline = nil;
     softmaxPipeline = nil;
     rmsNormPipeline = nil;
+    flashAttentionDecodePipeline = nil;
 
     // Release shader library
     shaderLibrary = nil;
@@ -477,6 +479,31 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
       impl_->rmsNormPipeline =
           [impl_->device newComputePipelineStateWithFunction:rmsNormFunction
                                                        error:&error];
+    }
+
+    // FlashAttention decode kernel (from external metallib)
+    // Note: This requires the pre-compiled densecore.metallib
+    id<MTLLibrary> externalLibrary = nil;
+    NSString *metalLibPath =
+        [[NSBundle mainBundle] pathForResource:@"densecore" ofType:@"metallib"];
+    if (metalLibPath) {
+      NSURL *metalLibURL = [NSURL fileURLWithPath:metalLibPath];
+      externalLibrary = [impl_->device newLibraryWithURL:metalLibURL
+                                                   error:&error];
+    }
+    if (externalLibrary) {
+      id<MTLFunction> flashAttnDecodeFunction =
+          [externalLibrary newFunctionWithName:@"flash_attention_decode"];
+      if (flashAttnDecodeFunction) {
+        impl_->flashAttentionDecodePipeline = [impl_->device
+            newComputePipelineStateWithFunction:flashAttnDecodeFunction
+                                          error:&error];
+        if (impl_->flashAttentionDecodePipeline) {
+          std::cout << "[MetalBackend] FlashAttention decode kernel loaded "
+                       "from metallib"
+                    << std::endl;
+        }
+      }
     }
 
     // Initialize GGML Metal backend
