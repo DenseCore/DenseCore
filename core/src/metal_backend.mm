@@ -951,10 +951,6 @@ void MetalBackend::FusedQKVProjection(const Tensor &input, const Tensor &wq,
 void MetalBackend::FlashAttention(const Tensor &Q, const Tensor &K,
                                   const Tensor &V, Tensor *output, float scale,
                                   bool causal, int n_head_kv) {
-  // FlashAttention requires a complex Metal kernel
-  // For now, use naive implementation
-  // Production: implement tiled attention in Metal
-
   if (!Q.IsValid() || !K.IsValid() || !V.IsValid() || !output ||
       !output->IsValid()) {
     return;
@@ -969,15 +965,59 @@ void MetalBackend::FlashAttention(const Tensor &Q, const Tensor &K,
   if (n_head_kv <= 0)
     n_head_kv = static_cast<int>(K.shape[1]);
 
+  // ==========================================================================
+  // GPU Path: Use Metal FlashAttention for decode (seq_q == 1)
+  // ==========================================================================
+  if (seq_q == 1 && impl_->flashAttentionDecodePipeline) {
+    @autoreleasepool {
+      id<MTLCommandBuffer> commandBuffer = [impl_->commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> encoder =
+          [commandBuffer computeCommandEncoder];
+
+      [encoder setComputePipelineState:impl_->flashAttentionDecodePipeline];
+
+      // Set buffers - Q, K, V, output all use UMA pointers directly
+      [encoder setBytes:Q.data length:Q.SizeBytes() atIndex:0];
+      [encoder setBytes:K.data length:K.SizeBytes() atIndex:1];
+      [encoder setBytes:V.data length:V.SizeBytes() atIndex:2];
+      [encoder setBytes:output->data length:output->SizeBytes() atIndex:3];
+
+      // Set constants
+      [encoder setBytes:&scale length:sizeof(float) atIndex:4];
+      uint seq_kv_u = static_cast<uint>(seq_kv);
+      uint head_dim_u = static_cast<uint>(head_dim);
+      uint n_heads_u = static_cast<uint>(n_head);
+      uint n_kv_heads_u = static_cast<uint>(n_head_kv);
+      [encoder setBytes:&seq_kv_u length:sizeof(uint) atIndex:5];
+      [encoder setBytes:&head_dim_u length:sizeof(uint) atIndex:6];
+      [encoder setBytes:&n_heads_u length:sizeof(uint) atIndex:7];
+      [encoder setBytes:&n_kv_heads_u length:sizeof(uint) atIndex:8];
+
+      // Dispatch: one threadgroup per (batch, head) pair
+      // Threadgroup size: 256 threads (handles K/V sequence parallelism)
+      MTLSize threadgroupSize = MTLSizeMake(256, 1, 1);
+      MTLSize gridSize = MTLSizeMake(static_cast<NSUInteger>(n_head), 1,
+                                     static_cast<NSUInteger>(batch));
+
+      [encoder dispatchThreadgroups:gridSize
+              threadsPerThreadgroup:threadgroupSize];
+      [encoder endEncoding];
+
+      [commandBuffer commit];
+      [commandBuffer waitUntilCompleted];
+      return;
+    }
+  }
+
+  // ==========================================================================
+  // CPU Fallback: Naive O(N^2) attention for prefill or when GPU unavailable
+  // ==========================================================================
   const int n_rep = n_head / n_head_kv; // GQA repetition factor
 
   const float *q_data = Q.DataAs<float>();
   const float *k_data = K.DataAs<float>();
   const float *v_data = V.DataAs<float>();
   float *o_data = output->DataAs<float>();
-
-  // Naive attention (O(N^2) memory - not FlashAttention)
-  // Production code would use tiled Metal kernel
 
   // Allocate temporary scores
   std::vector<float> scores(seq_q * seq_kv);
