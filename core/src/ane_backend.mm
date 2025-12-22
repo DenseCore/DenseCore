@@ -23,6 +23,7 @@
  */
 
 #include "../include/ane_backend.h"
+#include "../include/apple_silicon.h"
 
 #ifdef __APPLE__
 
@@ -136,10 +137,8 @@ bool ANEBackend::IsAvailable() {
 }
 
 int ANEBackend::GetTOPS() {
-  // Get from apple_silicon utility
-  // Import not needed since we're in same namespace
-  extern int GetNeuralEngineTOPS();
-  return 16; // Default fallback, actual implementation in apple_silicon.mm
+  // Get ANE TOPS from apple_silicon utility
+  return densecore::apple::GetNeuralEngineTOPS();
 }
 
 const char *ANEBackend::GetCoreMLVersion() {

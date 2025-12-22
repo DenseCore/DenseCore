@@ -210,22 +210,16 @@ if(APPLE)
     find_library(IOKIT_FRAMEWORK IOKit)
     
     if(METAL_FRAMEWORK)
+        # Consolidate all Apple framework linking into a single call.
+        # find_library sets variables to ...-NOTFOUND if not found,
+        # and target_link_libraries ignores such values safely.
         target_link_libraries(densecore PRIVATE 
             ${METAL_FRAMEWORK}
             ${FOUNDATION_FRAMEWORK}
+            ${METALPERFORMANCESHADERS_FRAMEWORK}
+            ${COREML_FRAMEWORK}
+            ${IOKIT_FRAMEWORK}
         )
-        
-        if(METALPERFORMANCESHADERS_FRAMEWORK)
-            target_link_libraries(densecore PRIVATE ${METALPERFORMANCESHADERS_FRAMEWORK})
-        endif()
-        
-        if(COREML_FRAMEWORK)
-            target_link_libraries(densecore PRIVATE ${COREML_FRAMEWORK})
-        endif()
-        
-        if(IOKIT_FRAMEWORK)
-            target_link_libraries(densecore PRIVATE ${IOKIT_FRAMEWORK})
-        endif()
         
         target_compile_definitions(densecore PRIVATE 
             DENSECORE_USE_METAL

@@ -60,6 +60,10 @@ struct MetalBackend::Impl {
   std::atomic<size_t> currentMemoryUsage{0};
   std::atomic<size_t> peakMemoryUsage{0};
 
+  // Buffer registry: maps contents pointer -> MTLBuffer for proper deallocation
+  std::mutex bufferRegistryMutex;
+  std::unordered_map<void *, id<MTLBuffer>> bufferRegistry;
+
   // Buffer pool for small allocations
   std::mutex bufferPoolMutex;
   std::vector<id<MTLBuffer>> bufferPool;
@@ -84,6 +88,17 @@ struct MetalBackend::Impl {
 
     // Release shader library
     shaderLibrary = nil;
+
+    // Release all tracked buffers
+    {
+      std::lock_guard<std::mutex> lock(bufferRegistryMutex);
+      for (auto &[ptr, buffer] : bufferRegistry) {
+        if (buffer) {
+          CFRelease((__bridge CFTypeRef)buffer);
+        }
+      }
+      bufferRegistry.clear();
+    }
 
     // Clear buffer pool
     {
@@ -541,9 +556,14 @@ void *MetalBackend::AllocateDevice(size_t size_bytes, size_t alignment) {
     // for deallocation. We use the contents pointer as the key.
     void *ptr = [buffer contents];
 
-    // Store buffer reference (prevent ARC from releasing)
-    // In a production implementation, we'd use a proper buffer registry
+    // Retain buffer to prevent ARC from releasing
     CFRetain((__bridge CFTypeRef)buffer);
+
+    // Register pointer -> buffer mapping for deallocation
+    {
+      std::lock_guard<std::mutex> lock(impl_->bufferRegistryMutex);
+      impl_->bufferRegistry[ptr] = buffer;
+    }
 
     return ptr;
   }
@@ -554,11 +574,33 @@ void MetalBackend::FreeDevice(void *ptr) {
     return;
   }
 
-  // Note: In a production implementation, we'd look up the MTLBuffer
-  // associated with this pointer and release it. For now, we rely on
-  // the memory being part of the unified address space.
+  @autoreleasepool {
+    id<MTLBuffer> buffer = nil;
+    size_t bufferLength = 0;
 
-  // Memory tracking update would go here
+    // Look up the buffer associated with this pointer
+    {
+      std::lock_guard<std::mutex> lock(impl_->bufferRegistryMutex);
+      auto it = impl_->bufferRegistry.find(ptr);
+      if (it != impl_->bufferRegistry.end()) {
+        buffer = it->second;
+        bufferLength = [buffer length];
+        impl_->bufferRegistry.erase(it);
+      }
+    }
+
+    if (buffer) {
+      // Update memory tracking
+      impl_->currentMemoryUsage.fetch_sub(bufferLength);
+
+      // Release the CFRetain we did in AllocateDevice
+      CFRelease((__bridge CFTypeRef)buffer);
+    } else {
+      std::cerr << "[MetalBackend] Warning: FreeDevice called with untracked "
+                   "pointer: "
+                << ptr << std::endl;
+    }
+  }
 }
 
 void MetalBackend::CopyToDevice(void *dst, const void *src, size_t size_bytes) {

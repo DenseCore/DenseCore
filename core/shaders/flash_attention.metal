@@ -41,8 +41,23 @@ using namespace metal;
 
 constant uint BLOCK_Q = 16;          // Queries per block
 constant uint BLOCK_K = 16;          // Keys per block
-constant uint MAX_HEAD_DIM = 128;    // Maximum head dimension
 constant float NEG_INF = -1e9f;      // For masking
+
+// =============================================================================
+// Configurable Constants (Function Constants)
+// =============================================================================
+// MAX_HEAD_DIM can be configured at pipeline creation via MTLFunctionConstantValues.
+// This allows support for models with head_dim > 128 (e.g., Llama 3 uses 128,
+// but future models may use larger dimensions).
+//
+// Host code example:
+//   MTLFunctionConstantValues* constants = [[MTLFunctionConstantValues alloc] init];
+//   uint maxHeadDim = 256;
+//   [constants setConstantValue:&maxHeadDim type:MTLDataTypeUInt atIndex:0];
+//   id<MTLFunction> fn = [library newFunctionWithName:@"flash_attention_decode"
+//                                      constantValues:constants error:nil];
+// =============================================================================
+constant uint MAX_HEAD_DIM [[function_constant(0)]] = 128;
 
 // =============================================================================
 // Helper Structures
@@ -319,17 +334,10 @@ kernel void flash_attention_decode(
     }
     
     // Shared memory for reduction
+    // Note: For output reduction, we store per-thread scaled outputs then reduce
     threadgroup float shared_max[256];
     threadgroup float shared_sum[256];
-    threadgroup float shared_output[MAX_HEAD_DIM];
-    
-    // Initialize output
-    if (tid == 0) {
-        for (uint d = 0; d < head_dim; ++d) {
-            shared_output[d] = 0.0f;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float shared_output[256][MAX_HEAD_DIM];  // Per-thread output for reduction
     
     // Each thread handles a subset of keys
     float local_max = NEG_INF;
@@ -379,25 +387,34 @@ kernel void flash_attention_decode(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     
-    // Normalize and write output
+    // Normalize each thread's local output and store in shared memory
     float global_max = shared_max[0];
     float global_sum = shared_sum[0];
     float my_scale = exp(local_max - global_max) / global_sum;
     
-    // Accumulate to shared output
+    // Each thread stores its scaled local_output to its slot in shared memory
     for (uint d = 0; d < head_dim; ++d) {
-        float val = local_output[d] * my_scale;
-        // Atomic add would be ideal here, using sequential fallback
-        if (tid == 0) {
-            shared_output[d] += val;
-        }
+        shared_output[tid][d] = local_output[d] * my_scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     
-    // Write final output
+    // ===========================================================================
+    // Parallel reduction of local_output across all threads
+    // ===========================================================================
+    // Tree reduction: sum shared_output[tid][d] across all active threads
+    for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            for (uint d = 0; d < head_dim; ++d) {
+                shared_output[tid][d] += shared_output[tid + stride][d];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    // Write final output (result accumulated in shared_output[0] after reduction)
     if (tid == 0) {
         for (uint d = 0; d < head_dim; ++d) {
-            O_ptr[d] = shared_output[d];
+            O_ptr[d] = shared_output[0][d];
         }
     }
 }

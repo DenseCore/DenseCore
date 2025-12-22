@@ -250,16 +250,15 @@ kernel void gemv_int4(
             uint packed_idx = packed_start + i / 2;
             uint8_t packed_byte = weight_row[packed_idx];
             
-            // Extract two 4-bit weights with sign extension
-            int8_t w0 = int8_t(packed_byte & 0x0F);
-            int8_t w1 = int8_t((packed_byte >> 4) & 0x0F);
+            // Extract two 4-bit unsigned weights
+            // Q4_0 format: unsigned 4-bit ints [0-15] centered by subtracting 8
+            // This gives effective range [-8, +7] without sign extension
+            uint8_t w0 = packed_byte & 0x0F;
+            uint8_t w1 = (packed_byte >> 4) & 0x0F;
             
-            // Sign extend from 4-bit
-            if (w0 & 0x08) w0 |= 0xF0;
-            if (w1 & 0x08) w1 |= 0xF0;
-            
-            float f0 = float(w0) * scale;
-            float f1 = float(w1) * scale;
+            // Q4_0 centering: subtract 8 to convert [0,15] -> [-8,+7]
+            float f0 = (float(w0) - 8.0f) * scale;
+            float f1 = (float(w1) - 8.0f) * scale;
             
             group_sum = fma(f0, input[k_start + i], group_sum);
             if (k_start + i + 1 < K) {
