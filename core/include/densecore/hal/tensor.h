@@ -249,7 +249,12 @@ struct Tensor {
   /**
    * @brief Get total size in bytes
    */
-  size_t SizeBytes() const { return NumElements() * DTypeSizeBytes(dtype); }
+  size_t SizeBytes() const {
+    if (dtype == DType::INT4) {
+      return (NumElements() + 1) / 2;
+    }
+    return NumElements() * DTypeSizeBytes(dtype);
+  }
 
   /**
    * @brief Check if tensor shape is valid

@@ -1,6 +1,5 @@
 /**
  * @file macros.h
-<<<<<<< HEAD
  * @brief DenseCore API export macros for shared library builds
  *
  * This file is part of DenseCore Public API (HAL).
@@ -10,15 +9,11 @@
  * - Define DENSECORE_SHARED when building as a shared library
  * - Define DENSECORE_BUILDING when compiling the library itself
  * - Leave undefined when linking statically
-=======
- * @brief Common macros and definitions for DenseCore HAL
->>>>>>> 4b0d981 (feat: Introduce dynamic library loading for backends, reorganize core includes under `densecore/hal`, and update documentation.)
  */
 
 #ifndef DENSECORE_HAL_MACROS_H
 #define DENSECORE_HAL_MACROS_H
 
-<<<<<<< HEAD
 // =============================================================================
 // Platform Detection
 // =============================================================================
@@ -51,17 +46,14 @@
 #ifdef DENSECORE_SHARED
 #ifdef DENSECORE_PLATFORM_WINDOWS
 #ifdef DENSECORE_BUILDING
-=======
 // Symbol visibility
 #if defined(_WIN32)
 #if defined(DENSECORE_BUILD_SHARED)
->>>>>>> 4b0d981 (feat: Introduce dynamic library loading for backends, reorganize core includes under `densecore/hal`, and update documentation.)
 #define DENSECORE_API __declspec(dllexport)
 #else
 #define DENSECORE_API __declspec(dllimport)
 #endif
 #else
-<<<<<<< HEAD
 // GCC/Clang visibility
 #define DENSECORE_API __attribute__((visibility("default")))
 #endif
@@ -114,7 +106,6 @@
 #else
 #define DENSECORE_DEPRECATED(msg) __attribute__((deprecated(msg)))
 #endif
-=======
 #define DENSECORE_API __attribute__((visibility("default")))
 #endif
 
@@ -129,6 +120,5 @@
 
 // Interface helper
 #define DENSECORE_INTERFACE struct
->>>>>>> 4b0d981 (feat: Introduce dynamic library loading for backends, reorganize core includes under `densecore/hal`, and update documentation.)
 
 #endif // DENSECORE_HAL_MACROS_H
