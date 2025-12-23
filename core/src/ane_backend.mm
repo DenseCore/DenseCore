@@ -61,10 +61,14 @@ struct CompiledOp {
   NSString *inputName = nil;
   NSString *outputName = nil;
 
+  // Strides for zero-copy MLMultiArray
+  NSArray<NSNumber *> *inputStrides = nil;
+
   ~CompiledOp() {
     model = nil;
     inputName = nil;
     outputName = nil;
+    inputStrides = nil;
   }
 };
 
@@ -229,8 +233,8 @@ void ANEBackend::GemmInt4(const Tensor &A, const Tensor &W,
 
 void ANEBackend::RMSNorm(const Tensor &input, const Tensor &weight,
                          Tensor *output, float eps) {
-  // Could be compiled to ANE, but complex to implement dynamically
-  // For now, fall back to CPU implementation
+  // CPU fallback using Accelerate for vectorized operations
+  // ANE doesn't natively support RMSNorm without pre-compilation
 
   const int64_t dim = weight.shape[0];
   const int64_t n_tokens = input.NumElements() / dim;
@@ -243,15 +247,15 @@ void ANEBackend::RMSNorm(const Tensor &input, const Tensor &weight,
     const float *x_ptr = x + t * dim;
     float *out_ptr = out + t * dim;
 
+    // Use Accelerate vDSP for sum of squares
     float sum_sq = 0.0f;
-    for (int64_t i = 0; i < dim; ++i) {
-      sum_sq += x_ptr[i] * x_ptr[i];
-    }
+    vDSP_dotpr(x_ptr, 1, x_ptr, 1, &sum_sq, (vDSP_Length)dim);
+
     float rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(dim) + eps);
 
-    for (int64_t i = 0; i < dim; ++i) {
-      out_ptr[i] = x_ptr[i] * rms * w[i];
-    }
+    // Multiply input by rms, then by weight using vDSP
+    vDSP_vsmul(x_ptr, 1, &rms, out_ptr, 1, (vDSP_Length)dim);
+    vDSP_vmul(out_ptr, 1, w, 1, out_ptr, 1, (vDSP_Length)dim);
   }
 }
 
@@ -401,6 +405,7 @@ bool ANEBackend::CompileMatMul(const std::string &name, int M, int K,
     op->status = ANEOpStatus::Ready;
     op->inputName = @"input";
     op->outputName = @"output";
+    op->inputStrides = @[ @1 ]; // For zero-copy MLMultiArray
 
     std::cout << "[ANEBackend] Loaded cached CoreML model '" << name << "' ["
               << M << "x" << K << "]" << std::endl;
@@ -441,21 +446,40 @@ bool ANEBackend::ExecuteMatMul(const std::string &name, const float *input,
 
     auto start = std::chrono::high_resolution_clock::now();
 
-    // Create MLMultiArray for input
+    // =========================================================================
+    // ZERO-COPY MLMultiArray: Wrap external buffer directly
+    // =========================================================================
+    // Using initWithDataPointer: avoids memcpy overhead by directly wrapping
+    // the caller's buffer. The deallocator is nil since we don't own the
+    // memory. This is critical for production performance.
+    // =========================================================================
     NSArray<NSNumber *> *inputShape = @[ @(op->K) ];
+    NSArray<NSNumber *> *inputStrides = op->inputStrides ?: @[ @1 ];
     NSError *error = nil;
-    MLMultiArray *inputArray =
-        [[MLMultiArray alloc] initWithShape:inputShape
-                                   dataType:MLMultiArrayDataTypeFloat32
-                                      error:&error];
-    if (!inputArray) {
-      std::cerr << "[ANEBackend] Failed to create input array" << std::endl;
-      return false;
-    }
 
-    // Copy input data (zero-copy would require careful buffer management)
-    float *inputPtr = (float *)[inputArray dataPointer];
-    std::memcpy(inputPtr, input, op->K * sizeof(float));
+    MLMultiArray *inputArray = [[MLMultiArray alloc]
+        initWithDataPointer:(void *)input
+                      shape:inputShape
+                   dataType:MLMultiArrayDataTypeFloat32
+                    strides:inputStrides
+                deallocator:nil // External buffer, no dealloc needed
+                      error:&error];
+
+    if (!inputArray) {
+      // Fallback to copy-based approach if zero-copy fails
+      std::cerr << "[ANEBackend] Zero-copy failed, falling back to memcpy: " <<
+          [[error localizedDescription] UTF8String] << std::endl;
+      inputArray =
+          [[MLMultiArray alloc] initWithShape:inputShape
+                                     dataType:MLMultiArrayDataTypeFloat32
+                                        error:&error];
+      if (!inputArray) {
+        std::cerr << "[ANEBackend] Failed to create input array" << std::endl;
+        return false;
+      }
+      float *inputPtr = (float *)[inputArray dataPointer];
+      std::memcpy(inputPtr, input, op->K * sizeof(float));
+    }
 
     // Create feature provider
     NSDictionary<NSString *, id<MLFeatureValue>> *features = @{
@@ -514,16 +538,232 @@ bool ANEBackend::ExecuteMatMul(const std::string &name, const float *input,
 bool ANEBackend::CompileTransformerLayer(const std::string &name,
                                          const TransformerLayerConfig &config,
                                          const void *layer_weights) {
-  // Complex operation - compile entire attention + FFN block
-  std::cout << "[ANEBackend] CompileTransformerLayer '" << name << "'"
-            << std::endl;
-  std::cout << "  hidden_dim=" << config.hidden_dim
-            << " n_heads=" << config.n_heads << std::endl;
-  std::cout << "  Note: Full layer compilation requires coremltools"
-            << std::endl;
+  @autoreleasepool {
+    std::lock_guard<std::mutex> lock(impl_->opsMutex);
 
-  // Would compile: Attention -> RMSNorm -> FFN -> RMSNorm
-  return false; // Not implemented
+    // Check if already compiled
+    if (impl_->compiledOps.count(name) > 0 &&
+        impl_->compiledOps[name]->status == ANEOpStatus::Ready) {
+      return true;
+    }
+
+    // =========================================================================
+    // OFFLINE COMPILATION STRATEGY
+    // =========================================================================
+    // Runtime CoreML compilation is too slow (~100ms+) for on-the-fly use.
+    // Instead, we look for pre-compiled .mlmodelc files generated offline
+    // using:
+    //
+    // 1. coremltools (Python):
+    //    $ python scripts/compile_transformer_layer.py --hidden_dim=3072 ...
+    //    # Generates: layer_0.mlpackage
+    //
+    // 2. Xcode compiler:
+    //    $ xcrun coremlcompiler compile layer_0.mlpackage <cache_dir>/
+    //    # Generates: layer_0.mlmodelc/
+    //
+    // The .mlmodelc contains fused QKV + RoPE + Attention + FFN as single unit.
+    // =========================================================================
+
+    std::cout << "[ANEBackend] CompileTransformerLayer '" << name << "'"
+              << std::endl;
+    std::cout << "  hidden_dim=" << config.hidden_dim
+              << " n_heads=" << config.n_heads
+              << " n_kv_heads=" << config.n_kv_heads
+              << " max_seq_len=" << config.max_seq_len << std::endl;
+
+    // Check for cached compiled model
+    std::string model_path = impl_->cacheDirectory + "/" + name + ".mlmodelc";
+    NSString *modelPath = [NSString stringWithUTF8String:model_path.c_str()];
+    NSURL *modelURL = [NSURL fileURLWithPath:modelPath];
+
+    if (![[NSFileManager defaultManager] fileExistsAtPath:modelPath]) {
+      // No cached model - provide guidance for offline compilation
+      std::cout << "[ANEBackend] WARNING: No cached CoreML model for layer '"
+                << name << "'" << std::endl;
+      std::cout << "  Expected path: " << model_path << std::endl;
+      std::cout << "\n  To generate this model, use coremltools:" << std::endl;
+      std::cout << "    python scripts/compile_transformer_layer.py \\"
+                << std::endl;
+      std::cout << "      --name=" << name
+                << " --hidden_dim=" << config.hidden_dim << " \\" << std::endl;
+      std::cout << "      --n_heads=" << config.n_heads
+                << " --n_kv_heads=" << config.n_kv_heads << " \\" << std::endl;
+      std::cout << "      --max_seq_len=" << config.max_seq_len << " \\"
+                << std::endl;
+      std::cout << "      --output_dir=" << impl_->cacheDirectory << std::endl;
+      std::cout << "\n  Then compile with:" << std::endl;
+      std::cout << "    xcrun coremlcompiler compile " << name << ".mlpackage "
+                << impl_->cacheDirectory << "/" << std::endl;
+
+      auto op = std::make_unique<CompiledOp>();
+      op->type = ANEOpType::Attention; // Fused attention block
+      op->M = config.hidden_dim;
+      op->K = config.hidden_dim;
+      op->N = config.max_seq_len;
+      op->status = ANEOpStatus::Failed;
+      impl_->compiledOps[name] = std::move(op);
+      return false;
+    }
+
+    // Load cached CoreML model with ANE compute units preference
+    MLModelConfiguration *config_ml = impl_->config;
+    if (@available(macOS 12.0, iOS 15.0, *)) {
+      // Prefer ANE + GPU for transformer layers (allows GPU fallback for
+      // unsupported ops)
+      config_ml.computeUnits = MLComputeUnitsAll;
+    }
+
+    NSError *error = nil;
+    MLModel *model = [MLModel modelWithContentsOfURL:modelURL
+                                       configuration:config_ml
+                                               error:&error];
+    if (!model) {
+      std::cerr << "[ANEBackend] Failed to load transformer layer model: " <<
+          [[error localizedDescription] UTF8String] << std::endl;
+
+      auto op = std::make_unique<CompiledOp>();
+      op->status = ANEOpStatus::Failed;
+      impl_->compiledOps[name] = std::move(op);
+      return false;
+    }
+
+    // Success - store the model
+    auto op = std::make_unique<CompiledOp>();
+    op->type = ANEOpType::Attention; // Fused attention + FFN
+    op->M = config.hidden_dim;
+    op->K = config.hidden_dim;
+    op->N = config.max_seq_len;
+    op->model = model;
+    op->status = ANEOpStatus::Ready;
+    op->inputName = @"hidden_states";
+    op->outputName = @"output";
+    op->inputStrides = @[ @1 ];
+
+    std::cout << "[ANEBackend] Loaded fused transformer layer '" << name
+              << "' [" << config.hidden_dim << " x " << config.n_heads
+              << " heads, max_seq=" << config.max_seq_len << "]" << std::endl;
+
+    impl_->compiledOps[name] = std::move(op);
+    return true;
+  }
+}
+
+bool ANEBackend::ExecuteTransformerLayer(const std::string &name,
+                                         const float *input, float *output,
+                                         const int *positions, int seq_len) {
+  @autoreleasepool {
+    CompiledOp *op = nullptr;
+    int hidden_dim = 0;
+    {
+      std::lock_guard<std::mutex> lock(impl_->opsMutex);
+      auto it = impl_->compiledOps.find(name);
+      if (it == impl_->compiledOps.end()) {
+        std::cerr << "[ANEBackend] Layer '" << name << "' not compiled."
+                  << std::endl;
+        return false;
+      }
+      op = it->second.get();
+      hidden_dim = op->M; // hidden_dim stored in M
+    }
+
+    if (op->status != ANEOpStatus::Ready || op->model == nil) {
+      std::cerr << "[ANEBackend] Layer '" << name << "' not available on ANE."
+                << std::endl;
+      return false;
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // Create input arrays
+    const int64_t input_size = seq_len * hidden_dim;
+    NSArray<NSNumber *> *inputShape = @[ @(seq_len), @(hidden_dim) ];
+    NSArray<NSNumber *> *inputStrides = @[ @(hidden_dim), @1 ];
+    NSError *error = nil;
+
+    // Zero-copy input for hidden states
+    MLMultiArray *hiddenStates =
+        [[MLMultiArray alloc] initWithDataPointer:(void *)input
+                                            shape:inputShape
+                                         dataType:MLMultiArrayDataTypeFloat32
+                                          strides:inputStrides
+                                      deallocator:nil
+                                            error:&error];
+
+    if (!hiddenStates) {
+      std::cerr << "[ANEBackend] Failed to create hidden states array: " <<
+          [[error localizedDescription] UTF8String] << std::endl;
+      return false;
+    }
+
+    // Create positions array for RoPE
+    NSArray<NSNumber *> *posShape = @[ @(seq_len) ];
+    MLMultiArray *posArray =
+        [[MLMultiArray alloc] initWithShape:posShape
+                                   dataType:MLMultiArrayDataTypeInt32
+                                      error:&error];
+    if (!posArray) {
+      std::cerr << "[ANEBackend] Failed to create positions array" << std::endl;
+      return false;
+    }
+    int32_t *posPtr = (int32_t *)[posArray dataPointer];
+    for (int i = 0; i < seq_len; ++i) {
+      posPtr[i] = positions[i];
+    }
+
+    // Create feature provider
+    NSDictionary<NSString *, id<MLFeatureValue>> *features = @{
+      op->inputName : [MLFeatureValue featureValueWithMultiArray:hiddenStates],
+      @"positions" : [MLFeatureValue featureValueWithMultiArray:posArray]
+    };
+    MLDictionaryFeatureProvider *provider =
+        [[MLDictionaryFeatureProvider alloc] initWithDictionary:features
+                                                          error:&error];
+    if (!provider) {
+      std::cerr << "[ANEBackend] Failed to create feature provider"
+                << std::endl;
+      return false;
+    }
+
+    // Execute fused transformer layer on ANE
+    id<MLFeatureProvider> result = [op->model predictionFromFeatures:provider
+                                                               error:&error];
+    if (!result) {
+      std::cerr << "[ANEBackend] Transformer layer prediction failed: " <<
+          [[error localizedDescription] UTF8String] << std::endl;
+      return false;
+    }
+
+    // Extract output
+    MLFeatureValue *outputFeature = [result featureValueForName:op->outputName];
+    if (!outputFeature) {
+      std::cerr << "[ANEBackend] Output feature not found" << std::endl;
+      return false;
+    }
+
+    MLMultiArray *outputArray = [outputFeature multiArrayValue];
+    const float *outputPtr = (const float *)[outputArray dataPointer];
+    std::memcpy(output, outputPtr, input_size * sizeof(float));
+
+    auto end = std::chrono::high_resolution_clock::now();
+    double elapsed_ms =
+        std::chrono::duration<double, std::milli>(end - start).count();
+
+    // Update stats
+    op->stats.total_executions++;
+    op->stats.total_time_ms += elapsed_ms;
+    op->stats.uses_ane = true;
+    op->stats.avg_time_ms =
+        op->stats.total_time_ms / op->stats.total_executions;
+    if (op->stats.total_executions == 1 || elapsed_ms < op->stats.min_time_ms) {
+      op->stats.min_time_ms = elapsed_ms;
+    }
+    if (elapsed_ms > op->stats.max_time_ms) {
+      op->stats.max_time_ms = elapsed_ms;
+    }
+
+    return true;
+  }
 }
 
 // =============================================================================

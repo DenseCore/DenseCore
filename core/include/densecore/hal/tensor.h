@@ -2,10 +2,14 @@
  * @file tensor.h
  * @brief Lightweight tensor descriptor for backend-agnostic operations
  *
+ * This file is part of DenseCore Public API.
+ * Licensed under Apache 2.0 (Open Source) or Commercial License.
+ *
  * Design Goals:
  * - Zero-copy interop with GGML tensors
  * - Minimal overhead (no virtual functions, no heap allocation)
  * - Thread-safe read access, mutable data pointer
+ * - Mixed-precision support via UnifiedTensorRef
  *
  * Memory Model:
  * - Non-owning: `data` points to externally managed memory
@@ -31,11 +35,11 @@ enum class DType : uint8_t {
   UNKNOWN = 255
 };
 
-/// Device types for memory placement
+/// Device types for memory placement (UMA-focused)
 enum class DeviceType : uint8_t {
   CPU = 0,
   METAL = 1, // Apple Metal GPU
-  CUDA = 2,  // NVIDIA CUDA
+  NPU = 2,   // Neural Processing Unit (Apple ANE, Qualcomm Hexagon)
   ASIC = 3,  // Custom ASIC (future)
   UNKNOWN = 255
 };
@@ -91,8 +95,8 @@ inline const char *DeviceTypeName(DeviceType device) {
     return "CPU";
   case DeviceType::METAL:
     return "METAL";
-  case DeviceType::CUDA:
-    return "CUDA";
+  case DeviceType::NPU:
+    return "NPU";
   case DeviceType::ASIC:
     return "ASIC";
   default:
@@ -217,29 +221,8 @@ struct Tensor {
   }
 
   // ===========================================================================
-  // Accessors
+  // Accessors (Tensor-specific, uses inherited TensorBase methods for shape)
   // ===========================================================================
-
-  /**
-   * @brief Total number of elements in tensor
-   */
-  int64_t NumElements() const {
-    int64_t n = 1;
-    for (int i = 0; i < ndim; ++i) {
-      n *= shape[i];
-    }
-    return n;
-  }
-
-  /**
-   * @brief Size in bytes (accounting for packed types)
-   */
-  size_t SizeBytes() const {
-    if (dtype == DType::INT4) {
-      return (NumElements() + 1) / 2; // 2 elements per byte
-    }
-    return static_cast<size_t>(NumElements()) * DTypeSizeBytes(dtype);
-  }
 
   /**
    * @brief Type-safe data access
@@ -251,16 +234,37 @@ struct Tensor {
   }
 
   /**
-   * @brief Check if tensor is contiguous in memory (row-major order)
+   * @brief Get total number of elements
    */
-  bool IsContiguous() const {
-    if (ndim == 0)
-      return true;
-    int64_t expected_stride = 1;
-    for (int i = ndim - 1; i >= 0; --i) {
-      if (stride[i] != expected_stride)
+  int64_t NumElements() const {
+    if (ndim <= 0)
+      return 0;
+    int64_t n = 1;
+    for (int i = 0; i < ndim; ++i) {
+      n *= shape[i];
+    }
+    return n;
+  }
+
+  /**
+   * @brief Get total size in bytes
+   */
+  size_t SizeBytes() const {
+    if (dtype == DType::INT4) {
+      return (NumElements() + 1) / 2;
+    }
+    return NumElements() * DTypeSizeBytes(dtype);
+  }
+
+  /**
+   * @brief Check if tensor shape is valid
+   */
+  bool HasValidShape() const {
+    if (ndim <= 0 || ndim > 4)
+      return false;
+    for (int i = 0; i < ndim; ++i) {
+      if (shape[i] <= 0)
         return false;
-      expected_stride *= shape[i];
     }
     return true;
   }
@@ -268,15 +272,138 @@ struct Tensor {
   /**
    * @brief Check if tensor is valid (has data and dimensions)
    */
-  bool IsValid() const { return data != nullptr && ndim > 0 && shape[0] > 0; }
+  bool IsValid() const { return data != nullptr && HasValidShape(); }
+};
+
+// =============================================================================
+// Forward declarations for UnifiedTensorRef
+// =============================================================================
+
+// Forward declare QuantizedTensorView (defined in quantized_tensor.h)
+struct QuantizedTensorView;
+
+/**
+ * @brief Unified reference to either a dense Tensor or a QuantizedTensorView
+ *
+ * This struct enables mixed-precision operations where the input may be FP32
+ * and the weights may be INT4/INT8 quantized. Instead of separate method
+ * overloads for every combination, backends accept UnifiedTensorRef.
+ *
+ * **Use Case: Mixed-Precision MatMul**
+ * @code
+ * Tensor input = ...;          // FP32 activations
+ * QuantizedTensorView weights; // INT4 quantized weights
+ *
+ * UnifiedTensorRef a = UnifiedTensorRef::FromDense(&input);
+ * UnifiedTensorRef w = UnifiedTensorRef::FromQuantized(&weights);
+ * Tensor output;
+ *
+ * backend.MatMulMixed(a, w, &output);  // Handles dequant internally
+ * @endcode
+ *
+ * **Design Notes:**
+ * - Uses tagged union pattern (no virtual functions, no heap allocation)
+ * - sizeof(UnifiedTensorRef) == sizeof(void*) + 1 byte (kind tag)
+ * - Fabless chip vendors can implement backends without understanding
+ *   QuantizedTensorView internals if they only support FP32
+ */
+struct UnifiedTensorRef {
+  /**
+   * @brief Kind of tensor being referenced
+   */
+  enum class Kind : uint8_t {
+    Dense = 0,    ///< Standard Tensor (FP32, FP16, etc.)
+    Quantized = 1 ///< QuantizedTensorView with scale/zero metadata
+  };
+
+  Kind kind = Kind::Dense;
+
+  union {
+    const Tensor *dense;
+    const QuantizedTensorView *quantized;
+  };
+
+  /// Default constructor (null dense reference)
+  UnifiedTensorRef() : kind(Kind::Dense), dense(nullptr) {}
+
+  // ===========================================================================
+  // Factory Methods
+  // ===========================================================================
 
   /**
-   * @brief Get dimension at index (with bounds checking)
+   * @brief Create reference to a dense tensor
    */
-  int64_t Dim(int index) const {
-    if (index < 0 || index >= ndim)
-      return 0;
-    return shape[index];
+  static UnifiedTensorRef FromDense(const Tensor *t) {
+    UnifiedTensorRef ref;
+    ref.kind = Kind::Dense;
+    ref.dense = t;
+    return ref;
+  }
+
+  /**
+   * @brief Create reference to a quantized tensor
+   */
+  static UnifiedTensorRef FromQuantized(const QuantizedTensorView *q) {
+    UnifiedTensorRef ref;
+    ref.kind = Kind::Quantized;
+    ref.quantized = q;
+    return ref;
+  }
+
+  // ===========================================================================
+  // Accessors
+  // ===========================================================================
+
+  /**
+   * @brief Check if this is a dense tensor reference
+   */
+  bool IsDense() const { return kind == Kind::Dense; }
+
+  /**
+   * @brief Check if this is a quantized tensor reference
+   */
+  bool IsQuantized() const { return kind == Kind::Quantized; }
+
+  /**
+   * @brief Get as dense tensor (asserts kind == Dense)
+   */
+  const Tensor &AsDense() const { return *dense; }
+
+  /**
+   * @brief Get as quantized tensor (asserts kind == Quantized)
+   */
+  const QuantizedTensorView &AsQuantized() const { return *quantized; }
+
+  /**
+   * @brief Check if reference is valid (non-null)
+   */
+  bool IsValid() const {
+    if (kind == Kind::Dense) {
+      return dense != nullptr && dense->IsValid();
+    }
+    return quantized != nullptr;
+  }
+
+  /**
+   * @brief Get raw data pointer (works for both kinds)
+   */
+  const void *Data() const {
+    if (kind == Kind::Dense) {
+      return dense ? dense->data : nullptr;
+    }
+    // Note: QuantizedTensorView::data access requires full type
+    return nullptr; // Caller should use AsQuantized().data
+  }
+
+  /**
+   * @brief Get data type (FP32, INT4, etc.)
+   */
+  DType GetDType() const {
+    if (kind == Kind::Dense && dense) {
+      return dense->dtype;
+    }
+    // Quantized types return INT4/INT8 from QuantizedTensorView
+    return DType::UNKNOWN; // Caller should use AsQuantized().type
   }
 };
 

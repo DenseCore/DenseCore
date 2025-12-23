@@ -1,6 +1,23 @@
 cmake_minimum_required(VERSION 3.14)
 project(DenseCore VERSION 1.0.0 LANGUAGES C CXX)
 
+# ==========================================================================
+# Commercial / Open Source Toggle
+# ==========================================================================
+option(DENSECORE_COMMERCIAL "Enable commercial features (Graviton/Enterprise)" OFF)
+
+if(DENSECORE_COMMERCIAL)
+    message(STATUS "[DenseCore] Commercial build ENABLED")
+    add_compile_definitions(DENSECORE_COMMERCIAL)
+    
+    # Check for proprietary source directory
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/proprietary/CMakeLists.txt")
+        add_subdirectory(src/proprietary)
+    else()
+        message(WARNING "[DenseCore] Commercial flag ON but src/proprietary not found or empty.")
+    endif()
+endif()
+
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -105,6 +122,8 @@ set(SOURCES
     src/kernel_context.cpp
     src/async_cpu_backend.cpp
     src/cpu_backend_opt.cpp
+    # Kernels (optimized SIMD implementations)
+    src/kernels/cpu_int4.cpp
     # Quantization module
     src/quantizer.cpp
     src/quantization/max_quantizer.cpp
@@ -522,6 +541,7 @@ if(DENSECORE_BUILD_TESTS)
         tests/test_tensor_view.cpp
         tests/test_kernel_context.cpp
         tests/test_async_backend.cpp
+        tests/test_cpu_int4.cpp
     )
 
     # Create test executable

@@ -491,6 +491,51 @@ TransformerModel *LoadGGUFModel(const char *path) {
             << model->rope_cos_sin.size() << " values (" << model->hparams.n_ctx
             << " positions × " << model->rope_head_dim << " dims)" << std::endl;
 
+  // ==========================================================================
+  // NUMA Optimization: Interleaved Allocation for Multi-Socket Systems
+  // ==========================================================================
+  // For multi-socket servers, spread large weight tensors across all NUMA nodes
+  // using numa_alloc_interleaved. This maximizes aggregate memory bandwidth
+  // when multiple threads across different sockets access the weights.
+  //
+  // For single-socket/non-NUMA systems, use madvise(MADV_WILLNEED) to pre-fault
+  // pages into memory, reducing page fault latency during inference.
+  // ==========================================================================
+
+#if defined(__linux__)
+  // Get total weight memory size for reporting
+  size_t total_weight_bytes = 0;
+  struct ggml_tensor *t = ggml_get_first_tensor(model->ctx_w);
+  while (t) {
+    total_weight_bytes += ggml_nbytes(t);
+    t = ggml_get_next_tensor(model->ctx_w, t);
+  }
+
+  if (densecore::NumaAllocator::IsNumaAvailable()) {
+    std::cout << "[DenseCore] NUMA detected - weights will use interleaved "
+              << "allocation on next load via LoadGGUFModelNuma()" << std::endl;
+    std::cout << "[DenseCore] For optimal multi-socket performance, use "
+              << "LoadGGUFModelNuma(path, -1, false) for interleaved layout"
+              << std::endl;
+  } else {
+    // Non-NUMA: Pre-populate pages with MADV_WILLNEED
+    t = ggml_get_first_tensor(model->ctx_w);
+    size_t prefetched_bytes = 0;
+    while (t) {
+      if (t->data && ggml_nbytes(t) >= 1024 * 1024) { // Only for tensors >= 1MB
+        madvise(t->data, ggml_nbytes(t), MADV_WILLNEED);
+        prefetched_bytes += ggml_nbytes(t);
+      }
+      t = ggml_get_next_tensor(model->ctx_w, t);
+    }
+    if (prefetched_bytes > 0) {
+      std::cout << "[DenseCore] Pre-populated "
+                << (prefetched_bytes / 1024 / 1024)
+                << " MB of weight pages (MADV_WILLNEED)" << std::endl;
+    }
+  }
+#endif
+
   std::cout << "[DenseCore] Model loaded successfully" << std::endl;
   return model;
 }
@@ -563,9 +608,72 @@ int SaveModel(const TransformerModel *model, const char *path) {
 // ============================================================================
 
 /**
- * Rebind a single tensor's data to specified NUMA node.
- * Uses a dedicated thread pinned to the target NUMA node for copying,
- * which enforces first-touch memory policy allocation.
+ * Rebind a single tensor's data using NUMA-interleaved allocation.
+ *
+ * Uses numa_alloc_interleaved to spread memory pages across all NUMA nodes,
+ * maximizing aggregate memory bandwidth when multiple threads access the data.
+ *
+ * @param tensor Tensor to rebind (must have valid data pointer)
+ * @param model Model to track allocation for cleanup
+ * @param min_size_bytes Minimum tensor size threshold (skip smaller tensors)
+ * @return True if tensor was successfully rebound
+ */
+static bool RebindTensorNumaInterleaved(struct ggml_tensor *tensor,
+                                        TransformerModel *model,
+                                        size_t min_size_bytes = 1024 * 1024) {
+  if (!tensor || !tensor->data) {
+    return false;
+  }
+
+  const size_t tensor_size = ggml_nbytes(tensor);
+  if (tensor_size < min_size_bytes) {
+    return false; // Skip small tensors - overhead not worth it
+  }
+
+#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+  // Use numa_alloc_interleaved for true interleaved allocation
+  void *new_buffer = numa_alloc_interleaved(tensor_size);
+  if (!new_buffer) {
+    std::cerr << "[NUMA] numa_alloc_interleaved failed for "
+              << (tensor_size / 1024 / 1024) << " MB" << std::endl;
+    return false;
+  }
+
+  // Copy data to interleaved buffer
+  std::memcpy(new_buffer, tensor->data, tensor_size);
+
+  // Replace tensor data pointer
+  tensor->data = new_buffer;
+
+  // Track allocation for cleanup (use Numa type for numa_free)
+  model->numa_buffers.emplace_back(new_buffer, tensor_size);
+
+  return true;
+#else
+  // Fallback: use aligned allocation with page pre-population
+  void *new_buffer = nullptr;
+  if (posix_memalign(&new_buffer, 64, tensor_size) != 0 || !new_buffer) {
+    return false;
+  }
+
+  std::memcpy(new_buffer, tensor->data, tensor_size);
+
+#if defined(__linux__)
+  // Pre-populate pages to reduce page fault latency
+  madvise(new_buffer, tensor_size, MADV_WILLNEED);
+#endif
+
+  tensor->data = new_buffer;
+  model->numa_buffers.emplace_back(new_buffer, tensor_size);
+  return true;
+#endif
+}
+
+/**
+ * Rebind a single tensor's data to a specific NUMA node (round-robin mode).
+ *
+ * Uses dedicated thread pinned to target NUMA node to enforce first-touch
+ * policy for physical memory allocation on that node.
  *
  * @param tensor Tensor to rebind (must have valid data pointer)
  * @param numa_node Target NUMA node for allocation
@@ -628,13 +736,36 @@ static bool RebindTensorNuma(struct ggml_tensor *tensor, int numa_node,
 }
 
 /**
- * Load GGUF model with NUMA-aware memory placement.
+ * Get the number of available NUMA nodes for round-robin allocation.
+ */
+static int GetNumaNodeCount() {
+#if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
+  if (numa_available() >= 0) {
+    return numa_max_node() + 1;
+  }
+#endif
+  return 1; // Single node fallback
+}
+
+/**
+ * Load GGUF model with NUMA-interleaved memory placement.
  *
  * After initial mmap load, identifies large tensors (>1MB) and rebinds
- * their data to the specified NUMA node for optimized memory bandwidth.
+ * their data for optimized memory bandwidth using one of three strategies:
+ *
+ * 1. INTERLEAVED (numa_node == -1): Uses numa_alloc_interleaved to spread
+ *    pages across ALL NUMA nodes for maximum aggregate bandwidth.
+ *
+ * 2. ROUND-ROBIN (numa_node == -2): Alternates tensors between nodes
+ *    (Tensor 0 -> Node 0, Tensor 1 -> Node 1, etc.)
+ *
+ * 3. PINNED (numa_node >= 0): Pins all tensors to a specific node.
  *
  * @param path Path to GGUF file
- * @param numa_node Target NUMA node (-1 for local/auto)
+ * @param numa_node Allocation strategy:
+ *                  -1 = Interleaved (recommended for multi-socket)
+ *                  -2 = Round-robin across nodes
+ *                  >= 0 = Pin to specific node
  * @param use_huge_pages Whether to request huge pages (TBD)
  * @return Loaded model with NUMA-optimized memory layout
  */
@@ -646,76 +777,132 @@ TransformerModel *LoadGGUFModelNuma(const char *path, int numa_node,
     return nullptr;
   }
 
-  // Step 2: Check if NUMA rebinding is needed
-  if (numa_node < 0 && !densecore::NumaAllocator::IsNumaAvailable()) {
+  // Step 2: Check if NUMA rebinding is available
+  bool numa_available = densecore::NumaAllocator::IsNumaAvailable();
+  int num_nodes = GetNumaNodeCount();
+
+  if (!numa_available && numa_node < 0) {
     std::cout << "[DenseCore] NUMA not available, using standard memory layout"
               << std::endl;
     return model;
   }
 
-  // If numa_node is -1 (auto), default to node 0
-  // (for more sophisticated scheduling, the caller should specify explicitly)
-  if (numa_node < 0) {
-    numa_node = 0;
-    std::cout << "[DenseCore] Auto-selected NUMA node " << numa_node
-              << " for tensor rebinding" << std::endl;
-  }
-
   (void)use_huge_pages; // TODO: implement huge page allocation path
 
-  std::cout << "[DenseCore] Starting NUMA rebinding to node " << numa_node
-            << "..." << std::endl;
+  // Determine allocation mode
+  enum class NumaMode { INTERLEAVED, ROUND_ROBIN, PINNED };
+  NumaMode mode;
+  const char *mode_name;
 
-  // Step 3: Rebind large tensors to target NUMA node
-  size_t rebound_bytes = 0;
-  int rebound_count = 0;
+  if (numa_node == -1) {
+    mode = NumaMode::INTERLEAVED;
+    mode_name = "INTERLEAVED";
+    std::cout << "[DenseCore] Using NUMA INTERLEAVED allocation "
+              << "(spreading weights across " << num_nodes << " nodes)"
+              << std::endl;
+  } else if (numa_node == -2) {
+    mode = NumaMode::ROUND_ROBIN;
+    mode_name = "ROUND-ROBIN";
+    std::cout << "[DenseCore] Using NUMA ROUND-ROBIN allocation "
+              << "across " << num_nodes << " nodes" << std::endl;
+  } else {
+    mode = NumaMode::PINNED;
+    mode_name = "PINNED";
+    std::cout << "[DenseCore] PINNING all weights to NUMA node " << numa_node
+              << std::endl;
+  }
 
-  // Helper lambda to rebind and track
-  auto rebind = [&](struct ggml_tensor *t, const char *name) {
-    if (RebindTensorNuma(t, numa_node, model)) {
-      rebound_bytes += ggml_nbytes(t);
-      rebound_count++;
-      std::cout << "  [NUMA] Rebound " << name << " ("
-                << (ggml_nbytes(t) / 1024 / 1024) << " MB)" << std::endl;
+  // Step 3: Collect all large tensors to rebind
+  struct TensorInfo {
+    struct ggml_tensor *tensor;
+    std::string name;
+  };
+  std::vector<TensorInfo> tensors_to_rebind;
+
+  auto collect = [&](struct ggml_tensor *t, const char *name) {
+    if (t && t->data && ggml_nbytes(t) >= 1024 * 1024) {
+      tensors_to_rebind.push_back({t, name});
     }
   };
 
-  // Rebind critical weight tensors
-  rebind(model->tok_embeddings, "tok_embeddings");
-  rebind(model->output, "output");
-  rebind(model->output_norm, "output_norm");
+  // Collect critical weight tensors
+  collect(model->tok_embeddings, "tok_embeddings");
+  collect(model->output, "output");
+  collect(model->output_norm, "output_norm");
 
-  // Rebind layer weights (these are the bulk of model memory)
+  // Collect layer weights
   for (size_t i = 0; i < model->layers.size(); ++i) {
     auto &layer = model->layers[i];
     std::string prefix = "blk." + std::to_string(i) + ".";
 
-    // Attention weights (largest tensors per layer)
-    rebind(layer.wq, (prefix + "wq").c_str());
-    rebind(layer.wk, (prefix + "wk").c_str());
-    rebind(layer.wv, (prefix + "wv").c_str());
-    rebind(layer.wo, (prefix + "wo").c_str());
-
-    // FFN weights (also large)
-    rebind(layer.w1, (prefix + "w1").c_str());
-    rebind(layer.w2, (prefix + "w2").c_str());
-    rebind(layer.w3, (prefix + "w3").c_str());
-
-    // Norms (small, typically skipped by size threshold)
-    rebind(layer.attention_norm, (prefix + "attn_norm").c_str());
-    rebind(layer.ffn_norm, (prefix + "ffn_norm").c_str());
+    collect(layer.wq, (prefix + "wq").c_str());
+    collect(layer.wk, (prefix + "wk").c_str());
+    collect(layer.wv, (prefix + "wv").c_str());
+    collect(layer.wo, (prefix + "wo").c_str());
+    collect(layer.w1, (prefix + "w1").c_str());
+    collect(layer.w2, (prefix + "w2").c_str());
+    collect(layer.w3, (prefix + "w3").c_str());
+    collect(layer.attention_norm, (prefix + "attn_norm").c_str());
+    collect(layer.ffn_norm, (prefix + "ffn_norm").c_str());
   }
 
-  // Step 4: Print summary
-  std::cout << "[DenseCore] NUMA rebinding complete: " << rebound_count
-            << " tensors (" << (rebound_bytes / 1024 / 1024) << " MB) to Node "
-            << numa_node << std::endl;
+  // Step 4: Rebind tensors based on mode
+  size_t rebound_bytes = 0;
+  int rebound_count = 0;
+  std::vector<int> node_distribution(num_nodes, 0);
 
-  // Optional: Verify placement using MemoryDiagnostics
-  if (model->tok_embeddings && rebound_count > 0) {
+  for (size_t i = 0; i < tensors_to_rebind.size(); ++i) {
+    auto &info = tensors_to_rebind[i];
+    bool success = false;
+    int target_node = -1;
+
+    switch (mode) {
+    case NumaMode::INTERLEAVED:
+      success = RebindTensorNumaInterleaved(info.tensor, model);
+      break;
+
+    case NumaMode::ROUND_ROBIN:
+      target_node = static_cast<int>(i % num_nodes);
+      success = RebindTensorNuma(info.tensor, target_node, model);
+      if (success) {
+        node_distribution[target_node]++;
+      }
+      break;
+
+    case NumaMode::PINNED:
+      target_node = numa_node;
+      success = RebindTensorNuma(info.tensor, target_node, model);
+      break;
+    }
+
+    if (success) {
+      rebound_bytes += ggml_nbytes(info.tensor);
+      rebound_count++;
+    }
+  }
+
+  // Step 5: Print summary
+  std::cout << "[DenseCore] NUMA allocation complete (" << mode_name
+            << "): " << rebound_count << " tensors ("
+            << (rebound_bytes / 1024 / 1024) << " MB)";
+
+  if (mode == NumaMode::ROUND_ROBIN) {
+    std::cout << " [Distribution:";
+    for (int n = 0; n < num_nodes; ++n) {
+      std::cout << " N" << n << "=" << node_distribution[n];
+    }
+    std::cout << "]";
+  } else if (mode == NumaMode::PINNED) {
+    std::cout << " to Node " << numa_node;
+  }
+  std::cout << std::endl;
+
+  // Optional: Verify placement for interleaved mode
+  if (mode == NumaMode::INTERLEAVED && model->tok_embeddings &&
+      rebound_count > 0) {
     densecore::MemoryDiagnostics::PrintSystemTopologyReport(
-        model->tok_embeddings->data, ggml_nbytes(model->tok_embeddings),
-        numa_node, "tok_embeddings (sample)");
+        model->tok_embeddings->data, ggml_nbytes(model->tok_embeddings), -1,
+        "tok_embeddings (interleaved sample)");
   }
 
   return model;

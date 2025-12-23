@@ -10,7 +10,7 @@
 #ifndef DENSECORE_TENSOR_VIEW_H
 #define DENSECORE_TENSOR_VIEW_H
 
-#include "tensor.h"
+#include "densecore/hal/tensor.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>

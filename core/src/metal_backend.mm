@@ -54,6 +54,14 @@ struct MetalBackend::Impl {
   id<MTLComputePipelineState> rmsNormPipeline = nil;
   id<MTLComputePipelineState> flashAttentionDecodePipeline = nil;
 
+  // Quantized GEMV pipeline states
+  id<MTLComputePipelineState> gemvQ4_0Pipeline = nil;
+  id<MTLComputePipelineState> gemvQ4_1Pipeline = nil;
+  id<MTLComputePipelineState> gemvQ8_0Pipeline = nil;
+
+  // Fused QKV pipeline state
+  id<MTLComputePipelineState> fusedQKVPipeline = nil;
+
   // GGML Metal backend (for graph execution)
   ggml_backend_t ggmlMetalBackend = nullptr;
 
@@ -87,6 +95,10 @@ struct MetalBackend::Impl {
     softmaxPipeline = nil;
     rmsNormPipeline = nil;
     flashAttentionDecodePipeline = nil;
+    gemvQ4_0Pipeline = nil;
+    gemvQ4_1Pipeline = nil;
+    gemvQ8_0Pipeline = nil;
+    fusedQKVPipeline = nil;
 
     // Release shader library
     shaderLibrary = nil;
@@ -308,6 +320,379 @@ kernel void rms_norm_f32(
 }
 )METAL";
 
+/**
+ * @brief Quantized GEMV shader source for INT4/INT8 weights
+ *
+ * Kernels:
+ * - gemv_q4_0: Q4_0 format (scale only, 4-bit weights centered at 8)
+ * - gemv_q4_1: Q4_1 format (scale + min, unsigned 4-bit weights)
+ * - gemv_q8_0: Q8_0 format (scale, 8-bit weights)
+ */
+const char *kQuantizedGemvShaderSource = R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint QK4_0 = 32;
+constant uint QK4_1 = 32;
+constant uint QK8_0 = 32;
+constant uint THREADGROUP_SIZE = 256;
+
+struct block_q4_0 {
+    half scale;
+    uint8_t quants[QK4_0 / 2];
+};
+
+struct block_q4_1 {
+    half scale;
+    half min;
+    uint8_t quants[QK4_1 / 2];
+};
+
+struct block_q8_0 {
+    half scale;
+    int8_t quants[QK8_0];
+};
+
+inline int8_t extract_q4(uint8_t packed, uint idx) {
+    int8_t val = (idx == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+    return val - 8;
+}
+
+inline uint8_t extract_q4_unsigned(uint8_t packed, uint idx) {
+    return (idx == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+}
+
+kernel void gemv_q4_0(
+    device const float* input [[buffer(0)]],
+    device const block_q4_0* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    uint row = tgid;
+    if (row >= M) return;
+    
+    threadgroup float shared_sum[THREADGROUP_SIZE];
+    uint blocks_per_row = K / QK4_0;
+    float sum = 0.0f;
+    
+    for (uint block_idx = tid; block_idx < blocks_per_row; block_idx += tg_size) {
+        device const block_q4_0* block = &weight[row * blocks_per_row + block_idx];
+        float scale = float(block->scale);
+        uint k_start = block_idx * QK4_0;
+        
+        for (uint i = 0; i < QK4_0; i += 2) {
+            uint byte_idx = i / 2;
+            uint8_t packed = block->quants[byte_idx];
+            float w0 = float(extract_q4(packed, 0)) * scale;
+            float w1 = float(extract_q4(packed, 1)) * scale;
+            sum = fma(w0, input[k_start + i], sum);
+            sum = fma(w1, input[k_start + i + 1], sum);
+        }
+    }
+    
+    shared_sum[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    if (tid == 0) {
+        output[row] = shared_sum[0];
+    }
+}
+
+kernel void gemv_q4_1(
+    device const float* input [[buffer(0)]],
+    device const block_q4_1* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    uint row = tgid;
+    if (row >= M) return;
+    
+    threadgroup float shared_sum[THREADGROUP_SIZE];
+    uint blocks_per_row = K / QK4_1;
+    float sum = 0.0f;
+    
+    for (uint block_idx = tid; block_idx < blocks_per_row; block_idx += tg_size) {
+        device const block_q4_1* block = &weight[row * blocks_per_row + block_idx];
+        float scale = float(block->scale);
+        float min_val = float(block->min);
+        uint k_start = block_idx * QK4_1;
+        
+        for (uint i = 0; i < QK4_1; i += 2) {
+            uint byte_idx = i / 2;
+            uint8_t packed = block->quants[byte_idx];
+            float w0 = float(extract_q4_unsigned(packed, 0)) * scale + min_val;
+            float w1 = float(extract_q4_unsigned(packed, 1)) * scale + min_val;
+            sum = fma(w0, input[k_start + i], sum);
+            sum = fma(w1, input[k_start + i + 1], sum);
+        }
+    }
+    
+    shared_sum[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    if (tid == 0) {
+        output[row] = shared_sum[0];
+    }
+}
+
+kernel void gemv_q8_0(
+    device const float* input [[buffer(0)]],
+    device const block_q8_0* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    uint row = tgid;
+    if (row >= M) return;
+    
+    threadgroup float shared_sum[THREADGROUP_SIZE];
+    uint blocks_per_row = K / QK8_0;
+    float sum = 0.0f;
+    
+    for (uint block_idx = tid; block_idx < blocks_per_row; block_idx += tg_size) {
+        device const block_q8_0* block = &weight[row * blocks_per_row + block_idx];
+        float scale = float(block->scale);
+        uint k_start = block_idx * QK8_0;
+        
+        for (uint i = 0; i < QK8_0; ++i) {
+            float w = float(block->quants[i]) * scale;
+            sum = fma(w, input[k_start + i], sum);
+        }
+    }
+    
+    shared_sum[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    if (tid == 0) {
+        output[row] = shared_sum[0];
+    }
+}
+)METAL";
+
+/**
+ * @brief FlashAttention decode kernel for single-query attention
+ *
+ * Optimized for decode phase (seq_q = 1). One threadgroup per (batch, head).
+ */
+const char *kFlashAttentionShaderSource = R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+constant float NEG_INF = -1e9f;
+constant uint MAX_HEAD_DIM = 128;
+
+kernel void flash_attention_decode(
+    device const float* Q [[buffer(0)]],
+    device const float* K [[buffer(1)]],
+    device const float* V [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant float& scale [[buffer(4)]],
+    constant uint& seq_kv [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& n_heads [[buffer(7)]],
+    constant uint& n_kv_heads [[buffer(8)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    uint batch_idx = tgid.z;
+    uint head_idx = tgid.x;
+    uint kv_head_idx = head_idx / (n_heads / n_kv_heads);
+    
+    device const float* Q_ptr = Q + (batch_idx * n_heads + head_idx) * head_dim;
+    device const float* K_head = K + (batch_idx * n_kv_heads + kv_head_idx) * seq_kv * head_dim;
+    device const float* V_head = V + (batch_idx * n_kv_heads + kv_head_idx) * seq_kv * head_dim;
+    device float* O_ptr = output + (batch_idx * n_heads + head_idx) * head_dim;
+    
+    float q[MAX_HEAD_DIM];
+    for (uint d = 0; d < head_dim; ++d) {
+        q[d] = Q_ptr[d];
+    }
+    
+    threadgroup float shared_max[256];
+    threadgroup float shared_sum[256];
+    threadgroup float shared_output[256][MAX_HEAD_DIM];
+    
+    float local_max = NEG_INF;
+    float local_sum = 0.0f;
+    float local_output[MAX_HEAD_DIM] = {0.0f};
+    
+    for (uint k = tid; k < seq_kv; k += tg_size) {
+        float dot = 0.0f;
+        for (uint d = 0; d < head_dim; ++d) {
+            dot = fma(q[d], K_head[k * head_dim + d], dot);
+        }
+        float score = dot * scale;
+        
+        float old_max = local_max;
+        local_max = max(local_max, score);
+        float scale_factor = exp(old_max - local_max);
+        float exp_score = exp(score - local_max);
+        
+        local_sum = local_sum * scale_factor + exp_score;
+        for (uint d = 0; d < head_dim; ++d) {
+            local_output[d] = local_output[d] * scale_factor + 
+                              V_head[k * head_dim + d] * exp_score;
+        }
+    }
+    
+    shared_max[tid] = local_max;
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            float m1 = shared_max[tid];
+            float m2 = shared_max[tid + stride];
+            float new_max = max(m1, m2);
+            float s1 = shared_sum[tid] * exp(m1 - new_max);
+            float s2 = shared_sum[tid + stride] * exp(m2 - new_max);
+            shared_max[tid] = new_max;
+            shared_sum[tid] = s1 + s2;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    float global_max = shared_max[0];
+    float global_sum = shared_sum[0];
+    float my_scale = exp(local_max - global_max) / global_sum;
+    
+    for (uint d = 0; d < head_dim; ++d) {
+        shared_output[tid][d] = local_output[d] * my_scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            for (uint d = 0; d < head_dim; ++d) {
+                shared_output[tid][d] += shared_output[tid + stride][d];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    if (tid == 0) {
+        for (uint d = 0; d < head_dim; ++d) {
+            O_ptr[d] = shared_output[0][d];
+        }
+    }
+}
+)METAL";
+
+/**
+ * @brief Fused Q/K/V projection kernel for decode phase
+ *
+ * Computes Q, K, V projections in a single dispatch:
+ *   Q = input @ Wq^T, K = input @ Wk^T, V = input @ Wv^T
+ *
+ * For decode phase (batch=1), this reduces kernel launch overhead by 3x
+ * compared to three separate MatMulTransB calls.
+ *
+ * Grid layout: Each threadgroup handles one output row from Q, K, or V.
+ * - Rows 0..hidden_q-1: Q output
+ * - Rows hidden_q..hidden_q+hidden_kv-1: K output
+ * - Rows hidden_q+hidden_kv..total-1: V output
+ */
+const char *kFusedQKVShaderSource = R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint THREADGROUP_SIZE = 256;
+
+kernel void fused_qkv_gemv(
+    device const float* input [[buffer(0)]],     // [K]
+    device const float* wq [[buffer(1)]],        // [hidden_q, K]
+    device const float* wk [[buffer(2)]],        // [hidden_kv, K]
+    device const float* wv [[buffer(3)]],        // [hidden_kv, K]
+    device float* q_out [[buffer(4)]],           // [hidden_q]
+    device float* k_out [[buffer(5)]],           // [hidden_kv]
+    device float* v_out [[buffer(6)]],           // [hidden_kv]
+    constant uint& K [[buffer(7)]],              // Input dimension
+    constant uint& hidden_q [[buffer(8)]],       // Q output dimension
+    constant uint& hidden_kv [[buffer(9)]],      // K/V output dimension
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    // Determine which output tensor and row this threadgroup handles
+    // First hidden_q rows -> Q, next hidden_kv -> K, last hidden_kv -> V
+    uint row = tgid;
+    device const float* weight;
+    device float* output;
+    
+    if (row < hidden_q) {
+        // Q projection
+        weight = wq + row * K;
+        output = q_out + row;
+    } else if (row < hidden_q + hidden_kv) {
+        // K projection
+        uint kv_row = row - hidden_q;
+        weight = wk + kv_row * K;
+        output = k_out + kv_row;
+    } else {
+        // V projection
+        uint kv_row = row - hidden_q - hidden_kv;
+        weight = wv + kv_row * K;
+        output = v_out + kv_row;
+    }
+    
+    threadgroup float shared_sum[THREADGROUP_SIZE];
+    
+    // Compute dot product: weight_row @ input
+    float sum = 0.0f;
+    for (uint k = tid; k < K; k += tg_size) {
+        sum = fma(weight[k], input[k], sum);
+    }
+    
+    shared_sum[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Parallel reduction
+    for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    if (tid == 0) {
+        *output = shared_sum[0];
+    }
+}
+)METAL";
+
 } // anonymous namespace
 
 // ============================================================================
@@ -481,8 +866,8 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
                                                        error:&error];
     }
 
-    // FlashAttention decode kernel (from external metallib)
-    // Note: This requires the pre-compiled densecore.metallib
+    // FlashAttention decode kernel: try external metallib first, then runtime
+    // compile
     id<MTLLibrary> externalLibrary = nil;
     NSString *metalLibPath =
         [[NSBundle mainBundle] pathForResource:@"densecore" ofType:@"metallib"];
@@ -504,6 +889,107 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
                     << std::endl;
         }
       }
+    }
+
+    // Fallback: compile FlashAttention from embedded source if metallib failed
+    if (!impl_->flashAttentionDecodePipeline) {
+      std::cout
+          << "[MetalBackend] FlashAttention metallib not found or failed. "
+             "Falling back to runtime compilation."
+          << std::endl;
+      NSString *flashAttnSource =
+          [NSString stringWithUTF8String:kFlashAttentionShaderSource];
+      id<MTLLibrary> flashAttnLib =
+          [impl_->device newLibraryWithSource:flashAttnSource
+                                      options:options
+                                        error:&error];
+      if (flashAttnLib) {
+        id<MTLFunction> flashAttnDecodeFunction =
+            [flashAttnLib newFunctionWithName:@"flash_attention_decode"];
+        if (flashAttnDecodeFunction) {
+          impl_->flashAttentionDecodePipeline = [impl_->device
+              newComputePipelineStateWithFunction:flashAttnDecodeFunction
+                                            error:&error];
+          if (impl_->flashAttentionDecodePipeline) {
+            std::cout << "[MetalBackend] FlashAttention decode kernel compiled "
+                         "from source"
+                      << std::endl;
+          }
+        }
+      } else {
+        std::cerr << "[MetalBackend] Warning: Failed to compile FlashAttention "
+                     "shader: "
+                  << [[error localizedDescription] UTF8String] << std::endl;
+      }
+    }
+
+    // Compile quantized GEMV kernels (Q4_0, Q4_1, Q8_0)
+    NSString *quantizedGemvSource =
+        [NSString stringWithUTF8String:kQuantizedGemvShaderSource];
+    id<MTLLibrary> quantizedGemvLib =
+        [impl_->device newLibraryWithSource:quantizedGemvSource
+                                    options:options
+                                      error:&error];
+    if (quantizedGemvLib) {
+      id<MTLFunction> gemvQ4_0Function =
+          [quantizedGemvLib newFunctionWithName:@"gemv_q4_0"];
+      if (gemvQ4_0Function) {
+        impl_->gemvQ4_0Pipeline =
+            [impl_->device newComputePipelineStateWithFunction:gemvQ4_0Function
+                                                         error:&error];
+      }
+
+      id<MTLFunction> gemvQ4_1Function =
+          [quantizedGemvLib newFunctionWithName:@"gemv_q4_1"];
+      if (gemvQ4_1Function) {
+        impl_->gemvQ4_1Pipeline =
+            [impl_->device newComputePipelineStateWithFunction:gemvQ4_1Function
+                                                         error:&error];
+      }
+
+      id<MTLFunction> gemvQ8_0Function =
+          [quantizedGemvLib newFunctionWithName:@"gemv_q8_0"];
+      if (gemvQ8_0Function) {
+        impl_->gemvQ8_0Pipeline =
+            [impl_->device newComputePipelineStateWithFunction:gemvQ8_0Function
+                                                         error:&error];
+      }
+
+      if (impl_->gemvQ4_0Pipeline || impl_->gemvQ4_1Pipeline ||
+          impl_->gemvQ8_0Pipeline) {
+        std::cout << "[MetalBackend] Quantized GEMV kernels compiled: "
+                  << (impl_->gemvQ4_0Pipeline ? "Q4_0 " : "")
+                  << (impl_->gemvQ4_1Pipeline ? "Q4_1 " : "")
+                  << (impl_->gemvQ8_0Pipeline ? "Q8_0" : "") << std::endl;
+      }
+    } else {
+      std::cerr << "[MetalBackend] Warning: Failed to compile quantized GEMV "
+                   "shaders: "
+                << [[error localizedDescription] UTF8String] << std::endl;
+    }
+
+    // Compile Fused QKV kernel
+    NSString *fusedQKVSource =
+        [NSString stringWithUTF8String:kFusedQKVShaderSource];
+    id<MTLLibrary> fusedQKVLib =
+        [impl_->device newLibraryWithSource:fusedQKVSource
+                                    options:options
+                                      error:&error];
+    if (fusedQKVLib) {
+      id<MTLFunction> fusedQKVFunction =
+          [fusedQKVLib newFunctionWithName:@"fused_qkv_gemv"];
+      if (fusedQKVFunction) {
+        impl_->fusedQKVPipeline =
+            [impl_->device newComputePipelineStateWithFunction:fusedQKVFunction
+                                                         error:&error];
+        if (impl_->fusedQKVPipeline) {
+          std::cout << "[MetalBackend] Fused QKV kernel compiled" << std::endl;
+        }
+      }
+    } else {
+      std::cerr << "[MetalBackend] Warning: Failed to compile Fused QKV "
+                   "shader: "
+                << [[error localizedDescription] UTF8String] << std::endl;
     }
 
     // Initialize GGML Metal backend
@@ -681,7 +1167,7 @@ void MetalBackend::MatMul(const Tensor &A, const Tensor &B, Tensor *C) {
       [encoder endEncoding];
 
       [commandBuffer commit];
-      [commandBuffer waitUntilCompleted];
+      // [commandBuffer waitUntilCompleted]; // Removed for pipelining
     } else {
       // GEMM path: Use Metal Performance Shaders
       // Note: For quantized weights, we'd use custom kernels instead
@@ -714,18 +1200,100 @@ void MetalBackend::MatMulTransB(const Tensor &A, const Tensor &B, Tensor *C) {
 void MetalBackend::GemmInt4(const Tensor &A, const Tensor &W,
                             const Tensor &scales, const Tensor &zero_points,
                             Tensor *C, int group_size) {
-  // INT4 GEMM requires custom Metal kernel
-  // For now, delegate to GGML Metal if available
-
-  if (impl_->ggmlMetalBackend) {
-    // Would create GGML tensors and use ggml_backend_graph_compute
-    // This is a placeholder for the full implementation
+  if (!A.IsValid() || !W.IsValid() || !scales.IsValid() || !C ||
+      !C->IsValid()) {
+    return;
   }
 
-  // Fallback: CPU implementation
-  std::cerr
-      << "[MetalBackend] GemmInt4 not yet implemented, falling back to CPU"
-      << std::endl;
+  const int M = static_cast<int>(A.shape[0]);
+  const int N = static_cast<int>(C->shape[C->ndim - 1]);
+  const int K = static_cast<int>(A.shape[A.ndim - 1]);
+
+  // Decode phase (M == 1): Use custom quantized GEMV kernel on GPU
+  if (M == 1) {
+    @autoreleasepool {
+      // Determine quantization format based on zero_points presence
+      // Q4_0: scale only (zero_points empty or all zeros)
+      // Q4_1: scale + min (zero_points has actual min values)
+      const bool use_q4_1 =
+          zero_points.IsValid() && zero_points.NumElements() > 0;
+
+      id<MTLComputePipelineState> pipeline =
+          use_q4_1 ? impl_->gemvQ4_1Pipeline : impl_->gemvQ4_0Pipeline;
+
+      if (pipeline) {
+        id<MTLCommandBuffer> commandBuffer =
+            [impl_->commandQueue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder =
+            [commandBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:pipeline];
+
+        // Buffer 0: input activations [K]
+        [encoder setBytes:A.data length:A.SizeBytes() atIndex:0];
+        // Buffer 1: packed weights (block_q4_0 or block_q4_1 structs)
+        [encoder setBytes:W.data length:W.SizeBytes() atIndex:1];
+        // Buffer 2: output [N]
+        [encoder setBytes:C->data length:C->SizeBytes() atIndex:2];
+        // Buffer 3: M (output rows)
+        uint M_u = static_cast<uint>(N); // For GEMV, N is the output dim
+        [encoder setBytes:&M_u length:sizeof(uint) atIndex:3];
+        // Buffer 4: K (input dimension)
+        uint K_u = static_cast<uint>(K);
+        [encoder setBytes:&K_u length:sizeof(uint) atIndex:4];
+
+        // Dispatch: one threadgroup per output element
+        MTLSize threadgroupSize = MTLSizeMake(256, 1, 1);
+        MTLSize gridSize = MTLSizeMake(static_cast<NSUInteger>(N), 1, 1);
+
+        [encoder dispatchThreadgroups:gridSize
+                threadsPerThreadgroup:threadgroupSize];
+        [encoder endEncoding];
+
+        [commandBuffer commit];
+        // [commandBuffer waitUntilCompleted]; // Removed for pipelining
+        return;
+      }
+    }
+  }
+
+  // Prefill (M > 1) or no GPU pipeline: CPU fallback with dequantization
+  // This is less critical since prefill is compute-bound, not memory-bound
+  std::cerr << "[MetalBackend] GemmInt4: Using CPU fallback for M=" << M
+            << " (GPU kernel requires M=1 for decode phase)" << std::endl;
+
+  // CPU implementation: dequantize and compute
+  const float *a_data = A.DataAs<float>();
+  const uint8_t *w_data = static_cast<const uint8_t *>(W.data);
+  const float *scale_data = scales.DataAs<float>();
+  float *c_data = C->DataAs<float>();
+
+  const int block_size = 32; // QK4_0 = QK4_1 = 32
+  const int blocks_per_row = K / block_size;
+
+  for (int m = 0; m < M; ++m) {
+    const float *a_row = a_data + m * K;
+    float *c_row = c_data + m * N;
+
+    for (int n = 0; n < N; ++n) {
+      float sum = 0.0f;
+      for (int blk = 0; blk < blocks_per_row; ++blk) {
+        float scale = scale_data[n * blocks_per_row + blk];
+        int k_start = blk * block_size;
+        const uint8_t *block_quants =
+            w_data + (n * blocks_per_row + blk) * (2 + block_size / 2) + 2;
+
+        for (int i = 0; i < block_size; i += 2) {
+          uint8_t packed = block_quants[i / 2];
+          int8_t q0 = static_cast<int8_t>((packed & 0x0F)) - 8;
+          int8_t q1 = static_cast<int8_t>((packed >> 4) & 0x0F) - 8;
+          sum += (static_cast<float>(q0) * scale) * a_row[k_start + i];
+          sum += (static_cast<float>(q1) * scale) * a_row[k_start + i + 1];
+        }
+      }
+      c_row[n] = sum;
+    }
+  }
 }
 
 // ============================================================================
@@ -764,7 +1332,7 @@ void MetalBackend::RMSNorm(const Tensor &input, const Tensor &weight,
       [encoder endEncoding];
 
       [commandBuffer commit];
-      [commandBuffer waitUntilCompleted];
+      // [commandBuffer waitUntilCompleted]; // Removed for pipelining
     } else {
       // CPU fallback
       const float *x = input.DataAs<float>();
@@ -849,7 +1417,7 @@ void MetalBackend::SoftmaxInplace(Tensor *data) {
       [encoder endEncoding];
 
       [commandBuffer commit];
-      [commandBuffer waitUntilCompleted];
+      // [commandBuffer waitUntilCompleted]; // Removed for pipelining
     } else {
       // CPU fallback for batched softmax
       float *ptr = data->DataAs<float>();
@@ -942,7 +1510,58 @@ void MetalBackend::FusedQKVProjection(const Tensor &input, const Tensor &wq,
                                       const Tensor &wk, const Tensor &wv,
                                       Tensor *q_out, Tensor *k_out,
                                       Tensor *v_out) {
-  // Execute three MatMuls - could be fused in Metal for better performance
+  if (!input.IsValid() || !wq.IsValid() || !wk.IsValid() || !wv.IsValid() ||
+      !q_out || !k_out || !v_out) {
+    return;
+  }
+
+  const int M = static_cast<int>(input.shape[0]);
+  const int K = static_cast<int>(input.shape[input.ndim - 1]);
+  const int hidden_q = static_cast<int>(wq.shape[0]);
+  const int hidden_kv = static_cast<int>(wk.shape[0]);
+
+  // Decode phase (M == 1): Use fused kernel for single dispatch
+  if (M == 1 && impl_->fusedQKVPipeline) {
+    @autoreleasepool {
+      id<MTLCommandBuffer> commandBuffer = [impl_->commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> encoder =
+          [commandBuffer computeCommandEncoder];
+
+      [encoder setComputePipelineState:impl_->fusedQKVPipeline];
+
+      // Set buffers
+      [encoder setBytes:input.data length:input.SizeBytes() atIndex:0];
+      [encoder setBytes:wq.data length:wq.SizeBytes() atIndex:1];
+      [encoder setBytes:wk.data length:wk.SizeBytes() atIndex:2];
+      [encoder setBytes:wv.data length:wv.SizeBytes() atIndex:3];
+      [encoder setBytes:q_out->data length:q_out->SizeBytes() atIndex:4];
+      [encoder setBytes:k_out->data length:k_out->SizeBytes() atIndex:5];
+      [encoder setBytes:v_out->data length:v_out->SizeBytes() atIndex:6];
+
+      // Set constants
+      uint K_u = static_cast<uint>(K);
+      uint hidden_q_u = static_cast<uint>(hidden_q);
+      uint hidden_kv_u = static_cast<uint>(hidden_kv);
+      [encoder setBytes:&K_u length:sizeof(uint) atIndex:7];
+      [encoder setBytes:&hidden_q_u length:sizeof(uint) atIndex:8];
+      [encoder setBytes:&hidden_kv_u length:sizeof(uint) atIndex:9];
+
+      // Total rows: hidden_q (Q) + hidden_kv (K) + hidden_kv (V)
+      uint total_rows = hidden_q + 2 * hidden_kv;
+      MTLSize threadgroupSize = MTLSizeMake(256, 1, 1);
+      MTLSize gridSize = MTLSizeMake(static_cast<NSUInteger>(total_rows), 1, 1);
+
+      [encoder dispatchThreadgroups:gridSize
+              threadsPerThreadgroup:threadgroupSize];
+      [encoder endEncoding];
+
+      [commandBuffer commit];
+      // [commandBuffer waitUntilCompleted]; // Removed for pipelining
+      return;
+    }
+  }
+
+  // Prefill (M > 1) or no GPU pipeline: Fallback to three separate MatMuls
   MatMulTransB(input, wq, q_out);
   MatMulTransB(input, wk, k_out);
   MatMulTransB(input, wv, v_out);
@@ -1004,7 +1623,7 @@ void MetalBackend::FlashAttention(const Tensor &Q, const Tensor &K,
       [encoder endEncoding];
 
       [commandBuffer commit];
-      [commandBuffer waitUntilCompleted];
+      // [commandBuffer waitUntilCompleted]; // Removed for pipelining
       return;
     }
   }

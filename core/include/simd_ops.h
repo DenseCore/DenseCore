@@ -78,6 +78,44 @@ namespace simd {
 /// AVX-512 cache line size (64 bytes)
 constexpr size_t SIMD_ALIGNMENT = 64;
 
+// =============================================================================
+// Tunable Prefetch Distance for Runtime Optimization
+// =============================================================================
+// These can be adjusted at runtime for optimal performance on different
+// hardware. Default values are tuned for Intel Skylake-X / Ice Lake.
+// =============================================================================
+
+/// Prefetch distance for AVX-512 kernels (bytes ahead)
+inline int g_prefetch_dist_avx512 = 128;
+
+/// Prefetch distance for AVX2 kernels (bytes ahead)
+inline int g_prefetch_dist_avx2 = 64;
+
+/**
+ * @brief Set prefetch distances for SIMD kernels
+ *
+ * Tune these based on hardware characteristics:
+ * - Larger values for high-latency memory (server DIMMs)
+ * - Smaller values for low-latency (L3 resident data)
+ *
+ * @param dist_avx512 Prefetch distance for AVX-512 in bytes (default: 128)
+ * @param dist_avx2 Prefetch distance for AVX2 in bytes (default: 64)
+ */
+inline void SetPrefetchDistance(int dist_avx512, int dist_avx2) {
+  g_prefetch_dist_avx512 = dist_avx512;
+  g_prefetch_dist_avx2 = dist_avx2;
+}
+
+/**
+ * @brief Get current AVX-512 prefetch distance
+ */
+inline int GetPrefetchDistanceAVX512() { return g_prefetch_dist_avx512; }
+
+/**
+ * @brief Get current AVX2 prefetch distance
+ */
+inline int GetPrefetchDistanceAVX2() { return g_prefetch_dist_avx2; }
+
 /**
  * @brief Check if pointer is aligned to given boundary
  *

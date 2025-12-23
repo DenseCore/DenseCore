@@ -14,9 +14,15 @@
  * based on runtime hardware detection.
  */
 
-#include "../include/backend_registry.h"
+#include "../include/densecore/hal/backend_registry.h"
 #include "../include/cpu_backend.h"
 #include <iostream>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 // =============================================================================
 // Platform-Specific Metal Backend Support
@@ -120,10 +126,51 @@ void BackendRegistry::Register(DeviceType device,
   backends_[device] = std::move(backend);
 
   // If this is the first backend, set it as default
-  if (!initialized_) {
-    default_device_ = device;
-    initialized_ = true;
+}
+
+void BackendRegistry::LoadPlugin(const std::string &path) {
+  std::cout << "[BackendRegistry] Loading plugin: " << path << std::endl;
+
+  void *handle = nullptr;
+  BackendFactory factory = nullptr;
+
+#if defined(_WIN32)
+  handle = LoadLibraryA(path.c_str());
+  if (!handle) {
+    std::cerr << "[BackendRegistry] Failed to load plugin: " << GetLastError()
+              << std::endl;
+    return;
   }
+  factory = (BackendFactory)GetProcAddress((HMODULE)handle, "CreateBackend");
+#else
+  handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+  if (!handle) {
+    std::cerr << "[BackendRegistry] Failed to load plugin: " << dlerror()
+              << std::endl;
+    return;
+  }
+  // Clear any existing error
+  dlerror();
+  factory = (BackendFactory)dlsym(handle, "CreateBackend");
+#endif
+
+  if (!factory) {
+    std::cerr << "[BackendRegistry] Plugin does not export 'CreateBackend'"
+              << std::endl;
+#if !defined(_WIN32)
+    dlclose(handle);
+#endif
+    return;
+  }
+
+  // Create backend instance
+  std::unique_ptr<ComputeBackend> backend(factory());
+  if (!backend) {
+    std::cerr << "[BackendRegistry] Factory returned nullptr" << std::endl;
+    return;
+  }
+
+  Register(backend->Device(), std::move(backend));
 }
 
 // =============================================================================

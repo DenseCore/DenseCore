@@ -50,7 +50,7 @@
 
 #ifdef __APPLE__
 
-#include "compute_backend.h"
+#include "densecore/hal/compute_backend.h"
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -224,6 +224,39 @@ public:
   void Synchronize() override;
 
   // ===========================================================================
+  // Operation Support Query
+  // ===========================================================================
+
+  /**
+   * @brief Check if an operation is natively supported on ANE
+   *
+   * Operations NOT natively supported will use CPU fallback (Accelerate).
+   * Currently supported: MatMul (with pre-compiled .mlmodelc)
+   * CPU fallback: RMSNorm, Softmax, RoPE, FlashAttention, GemmInt4
+   *
+   * @param op Operation type to check
+   * @return true if operation runs natively on ANE
+   */
+  static bool SupportsOperation(ANEOpType op) {
+    switch (op) {
+    case ANEOpType::MatMul:
+    case ANEOpType::MatMulBias:
+      return true; // Requires pre-compiled .mlmodelc
+    case ANEOpType::RMSNorm:
+    case ANEOpType::LayerNorm:
+    case ANEOpType::SiLU:
+    case ANEOpType::GeLU:
+    case ANEOpType::Softmax:
+      return false; // CPU fallback (Accelerate vDSP)
+    case ANEOpType::Attention:
+    case ANEOpType::FFN:
+      return false; // Requires complex model compilation
+    default:
+      return false;
+    }
+  }
+
+  // ===========================================================================
   // ANE-Specific APIs
   // ===========================================================================
 
@@ -296,6 +329,23 @@ public:
   bool CompileTransformerLayer(const std::string &name,
                                const TransformerLayerConfig &config,
                                const void *layer_weights);
+
+  /**
+   * @brief Execute a pre-compiled transformer layer
+   *
+   * Performs fused attention + FFN in a single ANE dispatch.
+   * Significantly reduces CPU-ANE context switching overhead.
+   *
+   * @param name Layer identifier (must have been compiled)
+   * @param input Hidden states [seq_len, hidden_dim]
+   * @param output Output hidden states [seq_len, hidden_dim]
+   * @param positions Token positions for RoPE [seq_len]
+   * @param seq_len Current sequence length
+   * @return true if execution succeeded
+   */
+  bool ExecuteTransformerLayer(const std::string &name, const float *input,
+                               float *output, const int *positions,
+                               int seq_len);
 
   /**
    * @brief Get operation status

@@ -1,4 +1,4 @@
-#include "backend_registry.h" // Backend abstraction layer
+#include "densecore/hal/backend_registry.h" // Backend abstraction layer
 #include "densecore.h"
 #include "embedding.h"
 #include "engine_internal.h"
