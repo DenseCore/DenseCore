@@ -34,7 +34,7 @@
 #define DENSECORE_OPERATION_GRAPH_H
 
 #include "accelerator_traits.h"
-#include "tensor.h"
+#include "densecore/hal/tensor.h"
 
 #include <cstddef>
 #include <cstdint>

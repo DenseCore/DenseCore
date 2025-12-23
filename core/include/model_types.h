@@ -86,8 +86,21 @@ struct TransformerLayer {
   struct ggml_tensor *w3; // up
 };
 
-// KV Cache Structure
-struct KVCache {
+// ============================================================================
+// KVCache (DEPRECATED)
+// ============================================================================
+// This legacy struct uses contiguous std::vector-backed storage which causes
+// memory fragmentation and reallocation overhead. Use PagedKVCache instead
+// for production workloads - it provides:
+//   - Zero-fragmentation block-based memory pool
+//   - O(1) allocation/deallocation via LIFO free list
+//   - Copy-on-Write support for beam search/parallel sampling
+//   - Prefix caching for repeated prompt reuse
+//   - NUMA-aware allocation for multi-socket servers
+//
+// @deprecated Use PagedKVCache from kv_cache.h instead
+// ============================================================================
+struct [[deprecated("Use PagedKVCache from kv_cache.h instead")]] KVCache {
   struct ggml_context *ctx = nullptr;
   struct ggml_tensor *k = nullptr; // [head_dim, n_head_kv, n_ctx, n_layer]
   struct ggml_tensor *v = nullptr; // [head_dim, n_head_kv, n_ctx, n_layer]
@@ -151,10 +164,11 @@ struct TransformerModel {
   ~TransformerModel();
 };
 
-// Engine handle (opaque pointer)
-struct DenseCoreHandle_t {
+// Engine handle (DEPRECATED - use TransformerModel + PagedKVCache directly)
+struct [[deprecated("Use TransformerModel with PagedKVCache directly")]]
+DenseCoreHandle_t {
   TransformerModel *model;
-  KVCache *kv_cache;
+  KVCache *kv_cache; // Uses deprecated KVCache
 };
 
 #endif // DENSECORE_MODEL_TYPES_H

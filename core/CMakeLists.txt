@@ -122,6 +122,8 @@ set(SOURCES
     src/kernel_context.cpp
     src/async_cpu_backend.cpp
     src/cpu_backend_opt.cpp
+    # Kernels (optimized SIMD implementations)
+    src/kernels/cpu_int4.cpp
     # Quantization module
     src/quantizer.cpp
     src/quantization/max_quantizer.cpp
@@ -539,6 +541,7 @@ if(DENSECORE_BUILD_TESTS)
         tests/test_tensor_view.cpp
         tests/test_kernel_context.cpp
         tests/test_async_backend.cpp
+        tests/test_cpu_int4.cpp
     )
 
     # Create test executable

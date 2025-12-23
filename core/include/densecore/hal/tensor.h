@@ -234,9 +234,38 @@ struct Tensor {
   }
 
   /**
+   * @brief Get total number of elements
+   */
+  int64_t NumElements() const {
+    if (ndim <= 0)
+      return 0;
+    int64_t n = 1;
+    for (int i = 0; i < ndim; ++i) {
+      n *= shape[i];
+    }
+    return n;
+  }
+
+  /**
+   * @brief Get total size in bytes
+   */
+  size_t SizeBytes() const { return NumElements() * DTypeSizeBytes(dtype); }
+
+  /**
+   * @brief Check if tensor shape is valid
+   */
+  bool HasValidShape() const {
+    if (ndim <= 0 || ndim > 4)
+      return false;
+    for (int i = 0; i < ndim; ++i) {
+      if (shape[i] <= 0)
+        return false;
+    }
+    return true;
+  }
+
+  /**
    * @brief Check if tensor is valid (has data and dimensions)
-   *
-   * Extends TensorBase::HasValidShape() to also check data pointer.
    */
   bool IsValid() const { return data != nullptr && HasValidShape(); }
 };

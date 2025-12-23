@@ -21,7 +21,7 @@
 #define DENSECORE_QUANTIZED_TENSOR_H
 
 #include "accelerator_traits.h"
-#include "tensor.h"
+#include "densecore/hal/tensor.h"
 
 #include <array>
 #include <cstddef>
