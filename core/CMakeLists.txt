@@ -124,6 +124,8 @@ set(SOURCES
     src/cpu_backend_opt.cpp
     # Kernels (optimized SIMD implementations)
     src/kernels/cpu_int4.cpp
+    src/kernels/cpu_int4_avx512.cpp
+    src/kernels/cpu_amx.cpp
     # Quantization module
     src/quantizer.cpp
     src/quantization/max_quantizer.cpp
@@ -372,10 +374,21 @@ else()
         endif()
     endif()
 
+    # AMX Detection
+    check_cxx_compiler_flag("-mamx-tile -mamx-int8 -mamx-bf16" COMPILER_SUPPORTS_AMX)
+    if(COMPILER_SUPPORTS_AMX)
+        message(STATUS "Enabling AMX optimizations support")
+        set(AMX_FLAGS "-mamx-tile" "-mamx-int8" "-mamx-bf16")
+    endif()
+
     # Apply optimizations based on detection
     if(CPU_HAS_AVX512 AND COMPILER_SUPPORTS_AVX512)
         message(STATUS "Enabling AVX-512 optimizations (compiler and CPU)")
         target_compile_options(densecore PRIVATE ${AVX512_FLAG})
+        if(COMPILER_SUPPORTS_AMX)
+             target_compile_options(densecore PRIVATE ${AMX_FLAGS})
+             target_compile_definitions(densecore PRIVATE __AMX_TILE__ __AMX_INT8__ __AMX_BF16__)
+        endif()
         target_compile_definitions(densecore PRIVATE USE_AVX512 GGML_USE_CPU GGML_USE_AVX512)
         set(USING_AVX512 TRUE)
     elseif(COMPILER_SUPPORTS_AVX2)

@@ -1137,6 +1137,18 @@ inline float CosineSimilarity(const float *a, const float *b, size_t n) {
 }
 
 // =============================================================================
+// INT4 GEMM Kernels (declarations)
+// =============================================================================
+
+void GemmInt4Fp32_AVX512(float *C, const float *A, const uint8_t *W,
+                         const float *scales, const float *zeros, int M, int N,
+                         int K, int group_size);
+
+void GemmInt4Fp32_AVX2(float *C, const float *A, const uint8_t *W,
+                       const float *scales, const float *zeros, int M, int N,
+                       int K, int group_size);
+
+// =============================================================================
 // Rotary Positional Embedding (RoPE) - HIGHLY OPTIMIZED
 // =============================================================================
 
