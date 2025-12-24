@@ -624,20 +624,23 @@ kernel void dequantize_q4_0(
 {
     uint block_idx = tid.x;
     uint row = tid.y;
-    uint blocks_per_row = K / QK4_0;
+    uint blocks_per_row = (K + QK4_0 - 1) / QK4_0;  // Ceiling division
     
     if (block_idx >= blocks_per_row || row >= N) return;
     
     device const block_q4_0* block = &input[row * blocks_per_row + block_idx];
     float scale = float(block->scale);
     uint k_start = block_idx * QK4_0;
+    uint k_end = min(k_start + QK4_0, K);  // Handle partial last block
     
     device float* out_row = output + row * K + k_start;
     
-    for (uint i = 0; i < QK4_0; i += 2) {
+    for (uint i = 0; i < k_end - k_start; i += 2) {
         uint8_t packed = block->quants[i / 2];
         out_row[i] = float(extract_q4(packed, 0)) * scale;
-        out_row[i + 1] = float(extract_q4(packed, 1)) * scale;
+        if (i + 1 < k_end - k_start) {
+            out_row[i + 1] = float(extract_q4(packed, 1)) * scale;
+        }
     }
 }
 )METAL";
@@ -652,7 +655,7 @@ const char *kFlashAttentionShaderSource = R"METAL(
 using namespace metal;
 
 constant float NEG_INF = -1e9f;
-constant uint MAX_HEAD_DIM = 128;
+constant uint MAX_HEAD_DIM [[function_constant(0)]];
 
 kernel void flash_attention_decode(
     device const float* Q [[buffer(0)]],
@@ -767,7 +770,7 @@ using namespace metal;
 constant float NEG_INF = -1e9f;
 constant uint SIMD_WIDTH = 32;
 constant uint KV_BLOCK_SIZE = 64;  // Process K/V in blocks of 64
-constant uint MAX_HEAD_DIM = 128;  // Max supported head dimension
+constant uint MAX_HEAD_DIM [[function_constant(0)]];  // Configurable via function constant
 
 kernel void flash_attention_prefill(
     device const float* Q [[buffer(0)]],         // [batch, n_head, seq_q, head_dim]
@@ -1714,7 +1717,8 @@ void MetalBackend::GemmInt4(const Tensor &A, const Tensor &W,
       [encoder setBytes:&K_u length:sizeof(uint) atIndex:3];
 
       const int block_size = 32;
-      uint blocks_per_row = static_cast<uint>(K / block_size);
+      uint blocks_per_row = static_cast<uint>((K + block_size - 1) /
+                                              block_size); // Ceiling division
       MTLSize gridSize =
           MTLSizeMake(blocks_per_row, static_cast<NSUInteger>(N), 1);
       MTLSize threadgroupSize = MTLSizeMake(1, 1, 1); // One thread per block
@@ -2007,26 +2011,11 @@ void MetalBackend::RoPE(const Tensor &input, const Tensor &cos_sin,
 
       [encoder setComputePipelineState:impl_->ropePipeline];
 
-      // Get or create buffers
-      id<MTLBuffer> dataBuffer = impl_->GetBufferForPointer(output->data);
-      id<MTLBuffer> cosSinBuffer =
-          impl_->GetBufferForPointer(const_cast<void *>(cos_sin.data));
-
-      // Create temporary buffers if not tracked
-      bool needDataCopy = false;
-      if (!dataBuffer) {
-        dataBuffer =
-            [impl_->device newBufferWithBytes:output->data
-                                       length:output->SizeBytes()
-                                      options:MTLResourceStorageModeShared];
-        needDataCopy = true;
-      }
-      if (!cosSinBuffer) {
-        cosSinBuffer =
-            [impl_->device newBufferWithBytes:cos_sin.data
-                                       length:cos_sin.SizeBytes()
-                                      options:MTLResourceStorageModeShared];
-      }
+      // Get or wrap buffers - prefer zero-copy via GetOrWrapBuffer
+      id<MTLBuffer> dataBuffer =
+          impl_->GetOrWrapBuffer(output->data, output->SizeBytes());
+      id<MTLBuffer> cosSinBuffer = impl_->GetOrWrapBuffer(
+          const_cast<void *>(cos_sin.data), cos_sin.SizeBytes());
 
       // Create buffer for positions
       size_t pos_size = n_tokens * sizeof(int);
@@ -2052,12 +2041,7 @@ void MetalBackend::RoPE(const Tensor &input, const Tensor &cos_sin,
       [encoder endEncoding];
 
       [commandBuffer commit];
-
-      // Copy result back if we created a temp buffer
-      if (needDataCopy) {
-        [commandBuffer waitUntilCompleted];
-        std::memcpy(output->data, [dataBuffer contents], output -> SizeBytes());
-      }
+      // Zero-copy via GetOrWrapBuffer - no copy-back needed
 
       return;
     }
@@ -2181,11 +2165,20 @@ void MetalBackend::FlashAttention(const Tensor &Q, const Tensor &K,
 
       [encoder setComputePipelineState:impl_->flashAttentionDecodePipeline];
 
-      // Set buffers - Q, K, V, output all use UMA pointers directly
-      [encoder setBytes:Q.data length:Q.SizeBytes() atIndex:0];
-      [encoder setBytes:K.data length:K.SizeBytes() atIndex:1];
-      [encoder setBytes:V.data length:V.SizeBytes() atIndex:2];
-      [encoder setBytes:output->data length:output->SizeBytes() atIndex:3];
+      // Set buffers - use zero-copy MTLBuffer for UMA efficiency
+      id<MTLBuffer> bufferQ =
+          impl_->GetOrWrapBuffer(const_cast<void *>(Q.data), Q.SizeBytes());
+      id<MTLBuffer> bufferK =
+          impl_->GetOrWrapBuffer(const_cast<void *>(K.data), K.SizeBytes());
+      id<MTLBuffer> bufferV =
+          impl_->GetOrWrapBuffer(const_cast<void *>(V.data), V.SizeBytes());
+      id<MTLBuffer> bufferOut =
+          impl_->GetOrWrapBuffer(output->data, output->SizeBytes());
+
+      [encoder setBuffer:bufferQ offset:0 atIndex:0];
+      [encoder setBuffer:bufferK offset:0 atIndex:1];
+      [encoder setBuffer:bufferV offset:0 atIndex:2];
+      [encoder setBuffer:bufferOut offset:0 atIndex:3];
 
       // Set constants
       [encoder setBytes:&scale length:sizeof(float) atIndex:4];
@@ -2225,11 +2218,20 @@ void MetalBackend::FlashAttention(const Tensor &Q, const Tensor &K,
 
       [encoder setComputePipelineState:impl_->flashAttentionPrefillPipeline];
 
-      // Set buffers - Q, K, V, output all use UMA pointers directly
-      [encoder setBytes:Q.data length:Q.SizeBytes() atIndex:0];
-      [encoder setBytes:K.data length:K.SizeBytes() atIndex:1];
-      [encoder setBytes:V.data length:V.SizeBytes() atIndex:2];
-      [encoder setBytes:output->data length:output->SizeBytes() atIndex:3];
+      // Set buffers - use zero-copy MTLBuffer for UMA efficiency
+      id<MTLBuffer> bufferQ =
+          impl_->GetOrWrapBuffer(const_cast<void *>(Q.data), Q.SizeBytes());
+      id<MTLBuffer> bufferK =
+          impl_->GetOrWrapBuffer(const_cast<void *>(K.data), K.SizeBytes());
+      id<MTLBuffer> bufferV =
+          impl_->GetOrWrapBuffer(const_cast<void *>(V.data), V.SizeBytes());
+      id<MTLBuffer> bufferOut =
+          impl_->GetOrWrapBuffer(output->data, output->SizeBytes());
+
+      [encoder setBuffer:bufferQ offset:0 atIndex:0];
+      [encoder setBuffer:bufferK offset:0 atIndex:1];
+      [encoder setBuffer:bufferV offset:0 atIndex:2];
+      [encoder setBuffer:bufferOut offset:0 atIndex:3];
 
       // Set constants
       [encoder setBytes:&scale length:sizeof(float) atIndex:4];

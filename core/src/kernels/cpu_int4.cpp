@@ -498,6 +498,15 @@ static inline float vaddvq_f32_compat(float32x4_t v) {
 #endif
 }
 
+// Helper: Dequantize int16x4_t to float32x4_t
+// Encapsulates the common pattern: vmovl_s16 -> vcvtq_f32_s32 -> scale*(w-zero)
+static inline float32x4_t
+dequant_s16x4_to_f32(int16x4_t w_s16, float32x4_t vscale, float32x4_t vzero) {
+  int32x4_t w_s32 = vmovl_s16(w_s16);
+  float32x4_t w_f32 = vcvtq_f32_s32(w_s32);
+  return vmulq_f32(vscale, vsubq_f32(w_f32, vzero));
+}
+
 void GemvInt4_NEON(float *output, const float *input, const uint8_t *weights,
                    const float *scales, const float *zeros, int K, int N,
                    int group_size, int n_start, int n_end) {
@@ -570,46 +579,23 @@ void GemvInt4_NEON(float *output, const float *input, const uint8_t *weights,
         int16x8_t w1_lo_s16 = vmovl_s8(vget_low_s8(w1_s8));  // Weights 16-23
         int16x8_t w1_hi_s16 = vmovl_s8(vget_high_s8(w1_s8)); // Weights 24-31
 
-        // Convert to float and dequantize: scale * (w - zero)
-        // Weights 0-3
-        int32x4_t w_0_3_s32 = vmovl_s16(vget_low_s16(w0_lo_s16));
-        float32x4_t w_0_3_f32 = vcvtq_f32_s32(w_0_3_s32);
-        w_0_3_f32 = vmulq_f32(vscale, vsubq_f32(w_0_3_f32, vzero));
-
-        // Weights 4-7
-        int32x4_t w_4_7_s32 = vmovl_s16(vget_high_s16(w0_lo_s16));
-        float32x4_t w_4_7_f32 = vcvtq_f32_s32(w_4_7_s32);
-        w_4_7_f32 = vmulq_f32(vscale, vsubq_f32(w_4_7_f32, vzero));
-
-        // Weights 8-11
-        int32x4_t w_8_11_s32 = vmovl_s16(vget_low_s16(w0_hi_s16));
-        float32x4_t w_8_11_f32 = vcvtq_f32_s32(w_8_11_s32);
-        w_8_11_f32 = vmulq_f32(vscale, vsubq_f32(w_8_11_f32, vzero));
-
-        // Weights 12-15
-        int32x4_t w_12_15_s32 = vmovl_s16(vget_high_s16(w0_hi_s16));
-        float32x4_t w_12_15_f32 = vcvtq_f32_s32(w_12_15_s32);
-        w_12_15_f32 = vmulq_f32(vscale, vsubq_f32(w_12_15_f32, vzero));
-
-        // Weights 16-19
-        int32x4_t w_16_19_s32 = vmovl_s16(vget_low_s16(w1_lo_s16));
-        float32x4_t w_16_19_f32 = vcvtq_f32_s32(w_16_19_s32);
-        w_16_19_f32 = vmulq_f32(vscale, vsubq_f32(w_16_19_f32, vzero));
-
-        // Weights 20-23
-        int32x4_t w_20_23_s32 = vmovl_s16(vget_high_s16(w1_lo_s16));
-        float32x4_t w_20_23_f32 = vcvtq_f32_s32(w_20_23_s32);
-        w_20_23_f32 = vmulq_f32(vscale, vsubq_f32(w_20_23_f32, vzero));
-
-        // Weights 24-27
-        int32x4_t w_24_27_s32 = vmovl_s16(vget_low_s16(w1_hi_s16));
-        float32x4_t w_24_27_f32 = vcvtq_f32_s32(w_24_27_s32);
-        w_24_27_f32 = vmulq_f32(vscale, vsubq_f32(w_24_27_f32, vzero));
-
-        // Weights 28-31
-        int32x4_t w_28_31_s32 = vmovl_s16(vget_high_s16(w1_hi_s16));
-        float32x4_t w_28_31_f32 = vcvtq_f32_s32(w_28_31_s32);
-        w_28_31_f32 = vmulq_f32(vscale, vsubq_f32(w_28_31_f32, vzero));
+        // Convert to float and dequantize using helper
+        float32x4_t w_0_3_f32 =
+            dequant_s16x4_to_f32(vget_low_s16(w0_lo_s16), vscale, vzero);
+        float32x4_t w_4_7_f32 =
+            dequant_s16x4_to_f32(vget_high_s16(w0_lo_s16), vscale, vzero);
+        float32x4_t w_8_11_f32 =
+            dequant_s16x4_to_f32(vget_low_s16(w0_hi_s16), vscale, vzero);
+        float32x4_t w_12_15_f32 =
+            dequant_s16x4_to_f32(vget_high_s16(w0_hi_s16), vscale, vzero);
+        float32x4_t w_16_19_f32 =
+            dequant_s16x4_to_f32(vget_low_s16(w1_lo_s16), vscale, vzero);
+        float32x4_t w_20_23_f32 =
+            dequant_s16x4_to_f32(vget_high_s16(w1_lo_s16), vscale, vzero);
+        float32x4_t w_24_27_f32 =
+            dequant_s16x4_to_f32(vget_low_s16(w1_hi_s16), vscale, vzero);
+        float32x4_t w_28_31_f32 =
+            dequant_s16x4_to_f32(vget_high_s16(w1_hi_s16), vscale, vzero);
 
         // Load input activations
         float32x4_t a_0_3 = vld1q_f32(a_ptr + k + 0);

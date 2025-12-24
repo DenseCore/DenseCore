@@ -11,9 +11,9 @@
  * - Palette: Configuration for tile dimensions.
  */
 
-#include "../../include/densecore/hal/compute_backend.h"
-#include "../../include/simd_ops.h"
-#include "cpu_kernels.h"
+#include "densecore/hal/compute_backend.h"
+#include "kernels/cpu_kernels.h"
+#include "simd_ops.h"
 
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -41,7 +41,7 @@ struct tile_config {
   uint8_t rows[16];
 };
 
-static void ConfigureAMXTiles(int M, int N, int K) {
+static void ConfigureAMXTiles() {
   // Setup tile configuration for 16x32x16 multiplication (BF16) or similar
   tile_config cfg = {};
   cfg.palette_id = 1;
@@ -77,7 +77,7 @@ static void ConfigureAMXTiles(int M, int N, int K) {
 
 static bool RequestAMXPermission() {
 #ifdef __linux__
-  unsigned long bitmask = 0;
+
   long rc = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA);
   return (rc == 0);
 #else
@@ -106,7 +106,7 @@ void MatMulAMX_BF16(const float *A, const float *B, float *C, int M, int K,
   }
 
   // 3. Configure Tiles
-  ConfigureAMXTiles(16, 16, 64);
+  ConfigureAMXTiles();
 
   // 4. Loop over blocks
   // _tile_loadd, _tile_dpbf16ps, _tile_stored
@@ -122,7 +122,13 @@ void MatMulAMX_BF16(const float *A, const float *B, float *C, int M, int K,
 namespace densecore {
 void MatMulAMX_BF16(const float *A, const float *B, float *C, int M, int K,
                     int N) {
-  // Fallback stub
+  // Fallback stub - suppress unused parameter warnings
+  (void)A;
+  (void)B;
+  (void)C;
+  (void)M;
+  (void)K;
+  (void)N;
 }
 } // namespace densecore
 
