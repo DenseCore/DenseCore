@@ -53,6 +53,7 @@ struct MetalBackend::Impl {
   id<MTLComputePipelineState> softmaxPipeline = nil;
   id<MTLComputePipelineState> rmsNormPipeline = nil;
   id<MTLComputePipelineState> flashAttentionDecodePipeline = nil;
+  id<MTLComputePipelineState> flashAttentionPrefillPipeline = nil;
 
   // Quantized GEMV pipeline states
   id<MTLComputePipelineState> gemvQ4_0Pipeline = nil;
@@ -61,6 +62,12 @@ struct MetalBackend::Impl {
 
   // Fused QKV pipeline state
   id<MTLComputePipelineState> fusedQKVPipeline = nil;
+
+  // RoPE pipeline state
+  id<MTLComputePipelineState> ropePipeline = nil;
+
+  // Dequantization pipeline for M>1 GEMM
+  id<MTLComputePipelineState> dequantizeQ4_0Pipeline = nil;
 
   // GGML Metal backend (for graph execution)
   ggml_backend_t ggmlMetalBackend = nullptr;
@@ -83,6 +90,63 @@ struct MetalBackend::Impl {
   // GPU capture state
   bool captureEnabled = false;
 
+  // Helper: Get MTLBuffer for a tracked pointer (for MPS zero-copy)
+  id<MTLBuffer> GetBufferForPointer(void *ptr) {
+    std::lock_guard<std::mutex> lock(bufferRegistryMutex);
+    auto it = bufferRegistry.find(ptr);
+    return (it != bufferRegistry.end()) ? it->second : nil;
+  }
+
+  // Helper: Wrap an untracked pointer with zero-copy MTLBuffer
+  // Uses newBufferWithBytesNoCopy for UMA zero-copy access
+  id<MTLBuffer> WrapPointerNoCopy(void *ptr, size_t size) {
+    if (!ptr || size == 0)
+      return nil;
+    // newBufferWithBytesNoCopy requires page-aligned memory on some systems
+    // For non-aligned, fall back to newBufferWithBytes
+    return [device newBufferWithBytesNoCopy:ptr
+                                     length:size
+                                    options:MTLResourceStorageModeShared
+                                deallocator:nil];
+  }
+
+  // Helper: Get or wrap buffer (prefers tracked, falls back to zero-copy wrap)
+  id<MTLBuffer> GetOrWrapBuffer(void *ptr, size_t size) {
+    id<MTLBuffer> buffer = GetBufferForPointer(ptr);
+    if (buffer)
+      return buffer;
+    // Try zero-copy wrap first
+    buffer = WrapPointerNoCopy(ptr, size);
+    if (buffer)
+      return buffer;
+    // Last resort: copy data (shouldn't happen on Apple Silicon)
+    return [device newBufferWithBytes:ptr
+                               length:size
+                              options:MTLResourceStorageModeShared];
+  }
+
+  // Scratch buffer cache for temporary allocations (reduces alloc overhead)
+  std::mutex scratchBufferMutex;
+  id<MTLBuffer> scratchBuffer = nil;
+  size_t scratchBufferSize = 0;
+
+  // Helper: Get a scratch buffer of at least the requested size
+  // Reuses existing buffer if large enough, otherwise reallocates
+  id<MTLBuffer> GetScratchBuffer(size_t size) {
+    std::lock_guard<std::mutex> lock(scratchBufferMutex);
+    if (scratchBuffer && scratchBufferSize >= size) {
+      return scratchBuffer;
+    }
+    // Allocate with some headroom to reduce reallocs
+    size_t allocSize = size + (size / 4); // 25% headroom
+    scratchBuffer = [device newBufferWithLength:allocSize
+                                        options:MTLResourceStorageModeShared];
+    if (scratchBuffer) {
+      scratchBufferSize = allocSize;
+    }
+    return scratchBuffer;
+  }
+
   ~Impl() {
     // Release GGML Metal backend
     if (ggmlMetalBackend) {
@@ -95,10 +159,17 @@ struct MetalBackend::Impl {
     softmaxPipeline = nil;
     rmsNormPipeline = nil;
     flashAttentionDecodePipeline = nil;
+    flashAttentionPrefillPipeline = nil;
     gemvQ4_0Pipeline = nil;
     gemvQ4_1Pipeline = nil;
     gemvQ8_0Pipeline = nil;
     fusedQKVPipeline = nil;
+    ropePipeline = nil;
+    dequantizeQ4_0Pipeline = nil;
+
+    // Release scratch buffer
+    scratchBuffer = nil;
+    scratchBufferSize = 0;
 
     // Release shader library
     shaderLibrary = nil;
@@ -318,6 +389,44 @@ kernel void rms_norm_f32(
         output_row[i] = input_row[i] * rms * weight[i];
     }
 }
+
+// =============================================================================
+// RoPE (Rotary Positional Embedding) Kernel
+// =============================================================================
+// Layout: [n_heads, n_tokens, head_dim] or [batch*n_heads, seq_len, head_dim]
+// Each thread handles one pair of elements (2*d, 2*d+1)
+
+kernel void rope_f32(
+    device float* data [[buffer(0)]],              // In-place modification
+    device const float* cos_sin [[buffer(1)]],    // [max_seq, head_dim]
+    device const int* positions [[buffer(2)]],    // [n_tokens]
+    constant uint& n_heads [[buffer(3)]],
+    constant uint& n_tokens [[buffer(4)]],
+    constant uint& head_dim [[buffer(5)]],
+    constant uint& rope_dim [[buffer(6)]],
+    uint3 tid [[thread_position_in_grid]])        // (pair_idx, token, head)
+{
+    uint pair_idx = tid.x;  // Which pair (0 to rope_dim/2 - 1)
+    uint token = tid.y;
+    uint head = tid.z;
+    
+    if (pair_idx >= rope_dim / 2 || token >= n_tokens || head >= n_heads) return;
+    
+    int pos = positions[token];
+    device const float* pos_cs = cos_sin + pos * head_dim;
+    
+    float cos_theta = pos_cs[2 * pair_idx];
+    float sin_theta = pos_cs[2 * pair_idx + 1];
+    
+    // Index into data: [head, token, dim]
+    uint base_idx = (head * n_tokens + token) * head_dim + 2 * pair_idx;
+    
+    float x0 = data[base_idx];
+    float x1 = data[base_idx + 1];
+    
+    data[base_idx] = fma(x0, cos_theta, -x1 * sin_theta);
+    data[base_idx + 1] = fma(x0, sin_theta, x1 * cos_theta);
+}
 )METAL";
 
 /**
@@ -499,6 +608,41 @@ kernel void gemv_q8_0(
         output[row] = shared_sum[0];
     }
 }
+
+// =============================================================================
+// Q4_0 Block Dequantization Kernel (for M>1 GEMM)
+// =============================================================================
+// Converts packed Q4_0 weights to FP32 for MPSMatrixMultiplication
+// Grid: (blocks_per_row, N, 1), each thread handles one block
+
+kernel void dequantize_q4_0(
+    device const block_q4_0* input [[buffer(0)]],   // [N, blocks_per_row]
+    device float* output [[buffer(1)]],              // [N, K]
+    constant uint& N [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    uint2 tid [[thread_position_in_grid]])           // (block_idx, row_n)
+{
+    uint block_idx = tid.x;
+    uint row = tid.y;
+    uint blocks_per_row = (K + QK4_0 - 1) / QK4_0;  // Ceiling division
+    
+    if (block_idx >= blocks_per_row || row >= N) return;
+    
+    device const block_q4_0* block = &input[row * blocks_per_row + block_idx];
+    float scale = float(block->scale);
+    uint k_start = block_idx * QK4_0;
+    uint k_end = min(k_start + QK4_0, K);  // Handle partial last block
+    
+    device float* out_row = output + row * K + k_start;
+    
+    for (uint i = 0; i < k_end - k_start; i += 2) {
+        uint8_t packed = block->quants[i / 2];
+        out_row[i] = float(extract_q4(packed, 0)) * scale;
+        if (i + 1 < k_end - k_start) {
+            out_row[i + 1] = float(extract_q4(packed, 1)) * scale;
+        }
+    }
+}
 )METAL";
 
 /**
@@ -511,7 +655,7 @@ const char *kFlashAttentionShaderSource = R"METAL(
 using namespace metal;
 
 constant float NEG_INF = -1e9f;
-constant uint MAX_HEAD_DIM = 128;
+constant uint MAX_HEAD_DIM [[function_constant(0)]];
 
 kernel void flash_attention_decode(
     device const float* Q [[buffer(0)]],
@@ -607,6 +751,177 @@ kernel void flash_attention_decode(
         for (uint d = 0; d < head_dim; ++d) {
             O_ptr[d] = shared_output[0][d];
         }
+    }
+}
+)METAL";
+
+/**
+ * @brief FlashAttention prefill kernel for multi-query attention (seq_q > 1)
+ *
+ * Naive GPU implementation parallelizing over (batch, head, q_pos).
+ * Each threadgroup handles one query position, streaming over K/V.
+ * Uses online softmax for numerical stability.
+ */
+const char *kFlashAttentionPrefillSource = R"METAL(
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+constant float NEG_INF = -1e9f;
+constant uint SIMD_WIDTH = 32;
+constant uint KV_BLOCK_SIZE = 64;  // Process K/V in blocks of 64
+constant uint MAX_HEAD_DIM [[function_constant(0)]];  // Configurable via function constant
+
+kernel void flash_attention_prefill(
+    device const float* Q [[buffer(0)]],         // [batch, n_head, seq_q, head_dim]
+    device const float* K [[buffer(1)]],         // [batch, n_kv_head, seq_kv, head_dim]
+    device const float* V [[buffer(2)]],         // [batch, n_kv_head, seq_kv, head_dim]
+    device float* output [[buffer(3)]],          // [batch, n_head, seq_q, head_dim]
+    constant float& scale [[buffer(4)]],
+    constant uint& seq_q [[buffer(5)]],
+    constant uint& seq_kv [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& n_heads [[buffer(8)]],
+    constant uint& n_kv_heads [[buffer(9)]],
+    constant uint& causal [[buffer(10)]],
+    uint3 tgid [[threadgroup_position_in_grid]],    // (head, q_pos, batch)
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    uint head_idx = tgid.x;
+    uint q_pos = tgid.y;
+    uint batch_idx = tgid.z;
+    
+    // Guard: ensure head_dim doesn't exceed MAX_HEAD_DIM
+    uint safe_head_dim = min(head_dim, MAX_HEAD_DIM);
+    
+    // GQA: map Q head to KV head
+    uint n_rep = n_heads / n_kv_heads;
+    uint kv_head_idx = head_idx / n_rep;
+    
+    // Pointers to current Q row and output row
+    device const float* Q_ptr = Q + ((batch_idx * n_heads + head_idx) * seq_q + q_pos) * head_dim;
+    device const float* K_head = K + (batch_idx * n_kv_heads + kv_head_idx) * seq_kv * head_dim;
+    device const float* V_head = V + (batch_idx * n_kv_heads + kv_head_idx) * seq_kv * head_dim;
+    device float* O_ptr = output + ((batch_idx * n_heads + head_idx) * seq_q + q_pos) * head_dim;
+    
+    // Causal mask boundary: for causal attention with different seq_q/seq_kv,
+    // we mask positions where kv_pos > q_pos + (seq_kv - seq_q)
+    uint causal_limit = causal ? (q_pos + (seq_kv - seq_q) + 1) : seq_kv;
+    
+    // Threadgroup memory for partial results
+    threadgroup float shared_max[8];      // Per-simdgroup max
+    threadgroup float shared_sum[8];      // Per-simdgroup sum
+    
+    uint num_simdgroups = (tg_size + SIMD_WIDTH - 1) / SIMD_WIDTH;
+    
+    // Online softmax state per thread
+    float local_max = NEG_INF;
+    float local_sum = 0.0f;
+    float local_output[MAX_HEAD_DIM] = {0.0f};
+    
+    // Load Q into registers (guarded by safe_head_dim)
+    float q_reg[MAX_HEAD_DIM];
+    for (uint d = 0; d < safe_head_dim; ++d) {
+        q_reg[d] = Q_ptr[d];
+    }
+    
+    // Iterate over K/V positions in blocks
+    for (uint kv_start = 0; kv_start < causal_limit; kv_start += KV_BLOCK_SIZE) {
+        uint kv_end = min(kv_start + KV_BLOCK_SIZE, causal_limit);
+        
+        // Each thread processes a subset of K/V positions in this block
+        for (uint kv_pos = kv_start + tid; kv_pos < kv_end; kv_pos += tg_size) {
+            // Compute Q @ K^T for this position
+            float dot = 0.0f;
+            device const float* K_ptr = K_head + kv_pos * head_dim;
+            for (uint d = 0; d < safe_head_dim; ++d) {
+                dot = fma(q_reg[d], K_ptr[d], dot);
+            }
+            float score = dot * scale;
+            
+            // Online softmax update
+            float old_max = local_max;
+            local_max = max(local_max, score);
+            float scale_factor = exp(old_max - local_max);
+            float exp_score = exp(score - local_max);
+            
+            // Rescale running sum and output
+            local_sum = local_sum * scale_factor + exp_score;
+            
+            // Accumulate weighted V
+            device const float* V_ptr = V_head + kv_pos * head_dim;
+            for (uint d = 0; d < safe_head_dim; ++d) {
+                local_output[d] = local_output[d] * scale_factor + V_ptr[d] * exp_score;
+            }
+        }
+    }
+    
+    // === Cross-thread reduction ===
+    
+    // Step 1: SIMD reduction within simdgroup
+    float simd_max = simd_max(local_max);
+    
+    // Rescale local state to simdgroup max
+    float rescale = exp(local_max - simd_max);
+    local_sum *= rescale;
+    for (uint d = 0; d < safe_head_dim; ++d) {
+        local_output[d] *= rescale;
+    }
+    local_max = simd_max;
+    
+    // Sum within simdgroup
+    float simd_sum_val = simd_sum(local_sum);
+    
+    // Step 2: Write simdgroup results to shared memory
+    if (simd_lane == 0 && simd_group < num_simdgroups) {
+        shared_max[simd_group] = local_max;
+        shared_sum[simd_group] = simd_sum_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Step 3: First thread computes global max/sum
+    float global_max = shared_max[0];
+    for (uint i = 1; i < num_simdgroups; ++i) {
+        global_max = max(global_max, shared_max[i]);
+    }
+    
+    float global_sum = 0.0f;
+    for (uint i = 0; i < num_simdgroups; ++i) {
+        global_sum += shared_sum[i] * exp(shared_max[i] - global_max);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Step 4: Each thread rescales its output contribution
+    float final_scale = exp(local_max - global_max) / global_sum;
+    for (uint d = 0; d < safe_head_dim; ++d) {
+        local_output[d] *= final_scale;
+    }
+    
+    // Step 5: Reduce output across threads using atomics (simple approach)
+    // For better performance, use explicit reduction, but this works for now
+    for (uint d = tid; d < safe_head_dim; d += tg_size) {
+        float sum = 0.0f;
+        // Collect from all threads - use simd shuffle for threads in same simdgroup
+        sum = simd_sum(local_output[d]);
+        
+        // First lane of each simdgroup writes partial result
+        if (simd_lane == 0) {
+            shared_max[simd_group] = sum;  // Reuse shared memory
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        
+        // First thread aggregates
+        if (tid == 0) {
+            float final_val = 0.0f;
+            for (uint sg = 0; sg < num_simdgroups; ++sg) {
+                final_val += shared_max[sg];
+            }
+            O_ptr[d] = final_val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 )METAL";
@@ -866,6 +1181,18 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
                                                        error:&error];
     }
 
+    // RoPE kernel
+    id<MTLFunction> ropeFunction =
+        [impl_->shaderLibrary newFunctionWithName:@"rope_f32"];
+    if (ropeFunction) {
+      impl_->ropePipeline =
+          [impl_->device newComputePipelineStateWithFunction:ropeFunction
+                                                       error:&error];
+      if (impl_->ropePipeline) {
+        std::cout << "[MetalBackend] RoPE kernel compiled" << std::endl;
+      }
+    }
+
     // FlashAttention decode kernel: try external metallib first, then runtime
     // compile
     id<MTLLibrary> externalLibrary = nil;
@@ -923,6 +1250,35 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
       }
     }
 
+    // Compile FlashAttention prefill kernel from embedded source
+    {
+      NSString *flashAttnPrefillSource =
+          [NSString stringWithUTF8String:kFlashAttentionPrefillSource];
+      id<MTLLibrary> flashAttnPrefillLib =
+          [impl_->device newLibraryWithSource:flashAttnPrefillSource
+                                      options:options
+                                        error:&error];
+      if (flashAttnPrefillLib) {
+        id<MTLFunction> flashAttnPrefillFunction = [flashAttnPrefillLib
+            newFunctionWithName:@"flash_attention_prefill"];
+        if (flashAttnPrefillFunction) {
+          impl_->flashAttentionPrefillPipeline = [impl_->device
+              newComputePipelineStateWithFunction:flashAttnPrefillFunction
+                                            error:&error];
+          if (impl_->flashAttentionPrefillPipeline) {
+            std::cout
+                << "[MetalBackend] FlashAttention prefill kernel compiled "
+                   "from source"
+                << std::endl;
+          }
+        }
+      } else {
+        std::cerr << "[MetalBackend] Warning: Failed to compile FlashAttention "
+                     "prefill shader: "
+                  << [[error localizedDescription] UTF8String] << std::endl;
+      }
+    }
+
     // Compile quantized GEMV kernels (Q4_0, Q4_1, Q8_0)
     NSString *quantizedGemvSource =
         [NSString stringWithUTF8String:kQuantizedGemvShaderSource];
@@ -960,7 +1316,20 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
         std::cout << "[MetalBackend] Quantized GEMV kernels compiled: "
                   << (impl_->gemvQ4_0Pipeline ? "Q4_0 " : "")
                   << (impl_->gemvQ4_1Pipeline ? "Q4_1 " : "")
-                  << (impl_->gemvQ8_0Pipeline ? "Q8_0" : "") << std::endl;
+                  << (impl_->gemvQ8_0Pipeline ? "Q8_0 " : "") << std::endl;
+      }
+
+      // Compile dequantization kernel for M>1 GEMM path
+      id<MTLFunction> dequantQ4_0Function =
+          [quantizedGemvLib newFunctionWithName:@"dequantize_q4_0"];
+      if (dequantQ4_0Function) {
+        impl_->dequantizeQ4_0Pipeline = [impl_->device
+            newComputePipelineStateWithFunction:dequantQ4_0Function
+                                          error:&error];
+        if (impl_->dequantizeQ4_0Pipeline) {
+          std::cout << "[MetalBackend] Dequantize Q4_0 kernel compiled"
+                    << std::endl;
+        }
       }
     } else {
       std::cerr << "[MetalBackend] Warning: Failed to compile quantized GEMV "
@@ -1169,13 +1538,74 @@ void MetalBackend::MatMul(const Tensor &A, const Tensor &B, Tensor *C) {
       [commandBuffer commit];
       // [commandBuffer waitUntilCompleted]; // Removed for pipelining
     } else {
-      // GEMM path: Use Metal Performance Shaders
-      // Note: For quantized weights, we'd use custom kernels instead
+      // GEMM path (M > 1): Use Metal Performance Shaders
+      id<MTLCommandBuffer> commandBuffer = [impl_->commandQueue commandBuffer];
 
-      // For now, fall back to Accelerate.framework on CPU
-      // In production, use MPS MPSMatrixMultiplication
-      apple::GemmAccelerate(C->DataAs<float>(), A.DataAs<float>(),
-                            B.DataAs<float>(), M, N, K);
+      // Get or wrap MTLBuffer handles for the tensor data (zero-copy)
+      // Uses newBufferWithBytesNoCopy for untracked pointers (UMA zero-copy)
+      id<MTLBuffer> bufferA =
+          impl_->GetOrWrapBuffer(const_cast<void *>(A.data), A.SizeBytes());
+      id<MTLBuffer> bufferB =
+          impl_->GetOrWrapBuffer(const_cast<void *>(B.data), B.SizeBytes());
+      id<MTLBuffer> bufferC = impl_->GetOrWrapBuffer(C->data, C->SizeBytes());
+
+      if (!bufferA || !bufferB || !bufferC) {
+        // Should never happen on Apple Silicon, but safety fallback
+        std::cerr << "[MetalBackend] MatMul: Buffer creation failed, falling "
+                     "back to CPU"
+                  << std::endl;
+        apple::GemmAccelerate(C->DataAs<float>(), A.DataAs<float>(),
+                              B.DataAs<float>(), M, N, K);
+        return;
+      }
+
+      // Calculate row bytes (must be 4-byte aligned for MPS)
+      NSUInteger rowBytesA = static_cast<NSUInteger>(K) * sizeof(float);
+      NSUInteger rowBytesB = static_cast<NSUInteger>(N) * sizeof(float);
+      NSUInteger rowBytesC = static_cast<NSUInteger>(N) * sizeof(float);
+
+      // Create MPS matrix descriptors
+      MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
+          matrixDescriptorWithRows:static_cast<NSUInteger>(M)
+                           columns:static_cast<NSUInteger>(K)
+                          rowBytes:rowBytesA
+                          dataType:MPSDataTypeFloat32];
+      MPSMatrixDescriptor *descB = [MPSMatrixDescriptor
+          matrixDescriptorWithRows:static_cast<NSUInteger>(K)
+                           columns:static_cast<NSUInteger>(N)
+                          rowBytes:rowBytesB
+                          dataType:MPSDataTypeFloat32];
+      MPSMatrixDescriptor *descC = [MPSMatrixDescriptor
+          matrixDescriptorWithRows:static_cast<NSUInteger>(M)
+                           columns:static_cast<NSUInteger>(N)
+                          rowBytes:rowBytesC
+                          dataType:MPSDataTypeFloat32];
+
+      // Wrap buffers as MPSMatrix (zero-copy)
+      MPSMatrix *matrixA = [[MPSMatrix alloc] initWithBuffer:bufferA
+                                                  descriptor:descA];
+      MPSMatrix *matrixB = [[MPSMatrix alloc] initWithBuffer:bufferB
+                                                  descriptor:descB];
+      MPSMatrix *matrixC = [[MPSMatrix alloc] initWithBuffer:bufferC
+                                                  descriptor:descC];
+
+      // Create and encode MPS GEMM: C = A @ B
+      MPSMatrixMultiplication *gemm = [[MPSMatrixMultiplication alloc]
+           initWithDevice:impl_->device
+            transposeLeft:NO
+           transposeRight:NO
+               resultRows:static_cast<NSUInteger>(M)
+            resultColumns:static_cast<NSUInteger>(N)
+          interiorColumns:static_cast<NSUInteger>(K)
+                    alpha:1.0
+                     beta:0.0];
+
+      [gemm encodeToCommandBuffer:commandBuffer
+                       leftMatrix:matrixA
+                      rightMatrix:matrixB
+                     resultMatrix:matrixC];
+
+      [commandBuffer commit];
     }
   }
 }
@@ -1257,12 +1687,108 @@ void MetalBackend::GemmInt4(const Tensor &A, const Tensor &W,
     }
   }
 
-  // Prefill (M > 1) or no GPU pipeline: CPU fallback with dequantization
-  // This is less critical since prefill is compute-bound, not memory-bound
-  std::cerr << "[MetalBackend] GemmInt4: Using CPU fallback for M=" << M
-            << " (GPU kernel requires M=1 for decode phase)" << std::endl;
+  // Prefill (M > 1): Use GPU dequantization + MPS GEMM
+  @autoreleasepool {
+    id<MTLCommandBuffer> commandBuffer = [impl_->commandQueue commandBuffer];
 
-  // CPU implementation: dequantize and compute
+    // Step 1: Get scratch buffer for dequantized weights [N, K] (reuses pool)
+    const size_t deq_size = static_cast<size_t>(N) * K * sizeof(float);
+    id<MTLBuffer> dequantBuffer = impl_->GetScratchBuffer(deq_size);
+
+    if (!dequantBuffer) {
+      std::cerr << "[MetalBackend] GemmInt4: Failed to get scratch buffer"
+                << std::endl;
+      // Fall through to CPU fallback below
+    } else if (impl_->dequantizeQ4_0Pipeline) {
+      // Step 2: Dispatch dequantization kernel
+      id<MTLComputeCommandEncoder> encoder =
+          [commandBuffer computeCommandEncoder];
+      [encoder setComputePipelineState:impl_->dequantizeQ4_0Pipeline];
+
+      // Get or wrap buffer for packed weights (zero-copy)
+      id<MTLBuffer> weightBuffer =
+          impl_->GetOrWrapBuffer(const_cast<void *>(W.data), W.SizeBytes());
+
+      [encoder setBuffer:weightBuffer offset:0 atIndex:0];
+      [encoder setBuffer:dequantBuffer offset:0 atIndex:1];
+      uint N_u = static_cast<uint>(N);
+      uint K_u = static_cast<uint>(K);
+      [encoder setBytes:&N_u length:sizeof(uint) atIndex:2];
+      [encoder setBytes:&K_u length:sizeof(uint) atIndex:3];
+
+      const int block_size = 32;
+      uint blocks_per_row = static_cast<uint>((K + block_size - 1) /
+                                              block_size); // Ceiling division
+      MTLSize gridSize =
+          MTLSizeMake(blocks_per_row, static_cast<NSUInteger>(N), 1);
+      MTLSize threadgroupSize = MTLSizeMake(1, 1, 1); // One thread per block
+      [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+      [encoder endEncoding];
+
+      // Step 3: MPS MatMul on dequantized weights
+      // Use GetOrWrapBuffer for zero-copy access
+      id<MTLBuffer> bufferA =
+          impl_->GetOrWrapBuffer(const_cast<void *>(A.data), A.SizeBytes());
+      id<MTLBuffer> bufferC = impl_->GetOrWrapBuffer(C->data, C->SizeBytes());
+
+      if (bufferA && bufferC) {
+        // A is [M, K], dequantized B is [N, K], we want C = A @ B^T = [M, N]
+        NSUInteger rowBytesA = static_cast<NSUInteger>(K) * sizeof(float);
+        NSUInteger rowBytesB = static_cast<NSUInteger>(K) * sizeof(float);
+        NSUInteger rowBytesC = static_cast<NSUInteger>(N) * sizeof(float);
+
+        MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:static_cast<NSUInteger>(M)
+                             columns:static_cast<NSUInteger>(K)
+                            rowBytes:rowBytesA
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descB = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:static_cast<NSUInteger>(N)
+                             columns:static_cast<NSUInteger>(K)
+                            rowBytes:rowBytesB
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descC = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:static_cast<NSUInteger>(M)
+                             columns:static_cast<NSUInteger>(N)
+                            rowBytes:rowBytesC
+                            dataType:MPSDataTypeFloat32];
+
+        MPSMatrix *matrixA = [[MPSMatrix alloc] initWithBuffer:bufferA
+                                                    descriptor:descA];
+        MPSMatrix *matrixB = [[MPSMatrix alloc] initWithBuffer:dequantBuffer
+                                                    descriptor:descB];
+        MPSMatrix *matrixC = [[MPSMatrix alloc] initWithBuffer:bufferC
+                                                    descriptor:descC];
+
+        // C = A @ B^T: [M,K] @ [N,K]^T = [M,N]
+        MPSMatrixMultiplication *gemm = [[MPSMatrixMultiplication alloc]
+             initWithDevice:impl_->device
+              transposeLeft:NO
+             transposeRight:YES
+                 resultRows:static_cast<NSUInteger>(M)
+              resultColumns:static_cast<NSUInteger>(N)
+            interiorColumns:static_cast<NSUInteger>(K)
+                      alpha:1.0
+                       beta:0.0];
+
+        [gemm encodeToCommandBuffer:commandBuffer
+                         leftMatrix:matrixA
+                        rightMatrix:matrixB
+                       resultMatrix:matrixC];
+
+        [commandBuffer commit];
+        // Note: With zero-copy wrapping via newBufferWithBytesNoCopy,
+        // results are written directly to C->data, no copy needed
+
+        return; // Success - exit early
+      }
+    }
+  }
+
+  // CPU fallback only if GPU path failed
+  std::cerr << "[MetalBackend] GemmInt4: GPU path failed, using CPU fallback"
+            << std::endl;
+
   const float *a_data = A.DataAs<float>();
   const uint8_t *w_data = static_cast<const uint8_t *>(W.data);
   const float *scale_data = scales.DataAs<float>();
@@ -1454,41 +1980,85 @@ void MetalBackend::SoftmaxInplace(Tensor *data) {
 
 void MetalBackend::RoPE(const Tensor &input, const Tensor &cos_sin,
                         const int *positions, Tensor *output, int rope_dim) {
-  // RoPE on Metal - use CPU for now, Metal kernel in production
   if (!input.IsValid() || !cos_sin.IsValid() || !positions || !output ||
       !output->IsValid()) {
     return;
   }
 
-  // Copy to output first
+  // Copy input to output first (RoPE is in-place on output)
   CopyToDevice(output->data, input.data, input.SizeBytes());
 
-  // Apply RoPE on CPU (Metal kernel TODO)
-  int n_tokens, head_dim, n_heads;
+  // Parse dimensions
+  uint n_tokens, head_dim, n_heads;
   if (input.ndim == 2) {
-    n_tokens = static_cast<int>(input.shape[0]);
-    head_dim = static_cast<int>(input.shape[1]);
+    n_tokens = static_cast<uint>(input.shape[0]);
+    head_dim = static_cast<uint>(input.shape[1]);
     n_heads = 1;
   } else {
-    n_heads = static_cast<int>(input.shape[0]);
-    n_tokens = static_cast<int>(input.shape[1]);
-    head_dim = static_cast<int>(input.shape[2]);
+    n_heads = static_cast<uint>(input.shape[0]);
+    n_tokens = static_cast<uint>(input.shape[1]);
+    head_dim = static_cast<uint>(input.shape[2]);
   }
 
-  if (rope_dim < 0)
-    rope_dim = head_dim;
+  uint rope_dim_u = (rope_dim < 0) ? head_dim : static_cast<uint>(rope_dim);
 
+  // GPU path
+  if (impl_->ropePipeline) {
+    @autoreleasepool {
+      id<MTLCommandBuffer> commandBuffer = [impl_->commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> encoder =
+          [commandBuffer computeCommandEncoder];
+
+      [encoder setComputePipelineState:impl_->ropePipeline];
+
+      // Get or wrap buffers - prefer zero-copy via GetOrWrapBuffer
+      id<MTLBuffer> dataBuffer =
+          impl_->GetOrWrapBuffer(output->data, output->SizeBytes());
+      id<MTLBuffer> cosSinBuffer = impl_->GetOrWrapBuffer(
+          const_cast<void *>(cos_sin.data), cos_sin.SizeBytes());
+
+      // Create buffer for positions
+      size_t pos_size = n_tokens * sizeof(int);
+      id<MTLBuffer> posBuffer =
+          [impl_->device newBufferWithBytes:positions
+                                     length:pos_size
+                                    options:MTLResourceStorageModeShared];
+
+      [encoder setBuffer:dataBuffer offset:0 atIndex:0];
+      [encoder setBuffer:cosSinBuffer offset:0 atIndex:1];
+      [encoder setBuffer:posBuffer offset:0 atIndex:2];
+      [encoder setBytes:&n_heads length:sizeof(uint) atIndex:3];
+      [encoder setBytes:&n_tokens length:sizeof(uint) atIndex:4];
+      [encoder setBytes:&head_dim length:sizeof(uint) atIndex:5];
+      [encoder setBytes:&rope_dim_u length:sizeof(uint) atIndex:6];
+
+      // Grid: (rope_dim/2, n_tokens, n_heads)
+      MTLSize gridSize = MTLSizeMake(rope_dim_u / 2, n_tokens, n_heads);
+      MTLSize threadgroupSize =
+          MTLSizeMake(std::min(rope_dim_u / 2, 64u), 1, 1);
+
+      [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+      [encoder endEncoding];
+
+      [commandBuffer commit];
+      // Zero-copy via GetOrWrapBuffer - no copy-back needed
+
+      return;
+    }
+  }
+
+  // CPU fallback (only if GPU pipeline not available)
   float *out = output->DataAs<float>();
   const float *cs = cos_sin.DataAs<float>();
 
-  for (int t = 0; t < n_tokens; ++t) {
+  for (uint t = 0; t < n_tokens; ++t) {
     int pos = positions[t];
     const float *pos_cs = cs + pos * head_dim;
 
-    for (int h = 0; h < n_heads; ++h) {
+    for (uint h = 0; h < n_heads; ++h) {
       float *token = out + (h * n_tokens + t) * head_dim;
 
-      for (int d = 0; d < rope_dim / 2; ++d) {
+      for (uint d = 0; d < rope_dim_u / 2; ++d) {
         float cos_theta = pos_cs[2 * d];
         float sin_theta = pos_cs[2 * d + 1];
 
@@ -1595,11 +2165,20 @@ void MetalBackend::FlashAttention(const Tensor &Q, const Tensor &K,
 
       [encoder setComputePipelineState:impl_->flashAttentionDecodePipeline];
 
-      // Set buffers - Q, K, V, output all use UMA pointers directly
-      [encoder setBytes:Q.data length:Q.SizeBytes() atIndex:0];
-      [encoder setBytes:K.data length:K.SizeBytes() atIndex:1];
-      [encoder setBytes:V.data length:V.SizeBytes() atIndex:2];
-      [encoder setBytes:output->data length:output->SizeBytes() atIndex:3];
+      // Set buffers - use zero-copy MTLBuffer for UMA efficiency
+      id<MTLBuffer> bufferQ =
+          impl_->GetOrWrapBuffer(const_cast<void *>(Q.data), Q.SizeBytes());
+      id<MTLBuffer> bufferK =
+          impl_->GetOrWrapBuffer(const_cast<void *>(K.data), K.SizeBytes());
+      id<MTLBuffer> bufferV =
+          impl_->GetOrWrapBuffer(const_cast<void *>(V.data), V.SizeBytes());
+      id<MTLBuffer> bufferOut =
+          impl_->GetOrWrapBuffer(output->data, output->SizeBytes());
+
+      [encoder setBuffer:bufferQ offset:0 atIndex:0];
+      [encoder setBuffer:bufferK offset:0 atIndex:1];
+      [encoder setBuffer:bufferV offset:0 atIndex:2];
+      [encoder setBuffer:bufferOut offset:0 atIndex:3];
 
       // Set constants
       [encoder setBytes:&scale length:sizeof(float) atIndex:4];
@@ -1629,8 +2208,69 @@ void MetalBackend::FlashAttention(const Tensor &Q, const Tensor &K,
   }
 
   // ==========================================================================
-  // CPU Fallback: Naive O(N^2) attention for prefill or when GPU unavailable
+  // GPU Path: Use Metal FlashAttention for prefill (seq_q > 1)
   // ==========================================================================
+  if (seq_q > 1 && impl_->flashAttentionPrefillPipeline) {
+    @autoreleasepool {
+      id<MTLCommandBuffer> commandBuffer = [impl_->commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> encoder =
+          [commandBuffer computeCommandEncoder];
+
+      [encoder setComputePipelineState:impl_->flashAttentionPrefillPipeline];
+
+      // Set buffers - use zero-copy MTLBuffer for UMA efficiency
+      id<MTLBuffer> bufferQ =
+          impl_->GetOrWrapBuffer(const_cast<void *>(Q.data), Q.SizeBytes());
+      id<MTLBuffer> bufferK =
+          impl_->GetOrWrapBuffer(const_cast<void *>(K.data), K.SizeBytes());
+      id<MTLBuffer> bufferV =
+          impl_->GetOrWrapBuffer(const_cast<void *>(V.data), V.SizeBytes());
+      id<MTLBuffer> bufferOut =
+          impl_->GetOrWrapBuffer(output->data, output->SizeBytes());
+
+      [encoder setBuffer:bufferQ offset:0 atIndex:0];
+      [encoder setBuffer:bufferK offset:0 atIndex:1];
+      [encoder setBuffer:bufferV offset:0 atIndex:2];
+      [encoder setBuffer:bufferOut offset:0 atIndex:3];
+
+      // Set constants
+      [encoder setBytes:&scale length:sizeof(float) atIndex:4];
+      uint seq_q_u = static_cast<uint>(seq_q);
+      uint seq_kv_u = static_cast<uint>(seq_kv);
+      uint head_dim_u = static_cast<uint>(head_dim);
+      uint n_heads_u = static_cast<uint>(n_head);
+      uint n_kv_heads_u = static_cast<uint>(n_head_kv);
+      uint causal_u = causal ? 1 : 0;
+      [encoder setBytes:&seq_q_u length:sizeof(uint) atIndex:5];
+      [encoder setBytes:&seq_kv_u length:sizeof(uint) atIndex:6];
+      [encoder setBytes:&head_dim_u length:sizeof(uint) atIndex:7];
+      [encoder setBytes:&n_heads_u length:sizeof(uint) atIndex:8];
+      [encoder setBytes:&n_kv_heads_u length:sizeof(uint) atIndex:9];
+      [encoder setBytes:&causal_u length:sizeof(uint) atIndex:10];
+
+      // Dispatch: one threadgroup per (head, q_pos, batch) triple
+      // Threadgroup size: 256 threads (handles K/V sequence parallelism)
+      MTLSize threadgroupSize = MTLSizeMake(256, 1, 1);
+      MTLSize gridSize = MTLSizeMake(static_cast<NSUInteger>(n_head),
+                                     static_cast<NSUInteger>(seq_q),
+                                     static_cast<NSUInteger>(batch));
+
+      [encoder dispatchThreadgroups:gridSize
+              threadsPerThreadgroup:threadgroupSize];
+      [encoder endEncoding];
+
+      [commandBuffer commit];
+      // [commandBuffer waitUntilCompleted]; // Removed for pipelining
+      return;
+    }
+  }
+
+  // ==========================================================================
+  // CPU Fallback: Naive O(N^2) attention when GPU pipelines unavailable
+  // ==========================================================================
+  std::cerr << "[MetalBackend] Warning: FlashAttention falling back to CPU. "
+            << "seq_q=" << seq_q << std::endl;
+
   const int n_rep = n_head / n_head_kv; // GQA repetition factor
 
   const float *q_data = Q.DataAs<float>();

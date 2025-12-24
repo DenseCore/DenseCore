@@ -60,6 +60,36 @@ void GemvInt4_AVX2(float *output, const float *input, const uint8_t *weights,
                    int group_size, int n_start, int n_end);
 
 /**
+ * @brief Decode-optimized INT4 GEMV using ARM NEON
+ *
+ * Same as AVX2 version but with:
+ * - 4-way unrolling along N dimension
+ * - 16 weights (8 packed bytes) per iteration
+ * - vmlaq_f32 for FMA accumulation
+ * - vaddvq_f32 for horizontal reduction
+ *
+ * Target platforms: Apple M-series, AWS Graviton, Qualcomm Snapdragon
+ */
+void GemvInt4_NEON(float *output, const float *input, const uint8_t *weights,
+                   const float *scales, const float *zeros, int K, int N,
+                   int group_size, int n_start, int n_end);
+
+/**
+ * @brief FP16-optimized INT4 GEMV using ARM NEON
+ *
+ * Uses FP16 compute for 2x throughput on modern ARM CPUs:
+ * - Apple M3/M4, Snapdragon 8 Gen 3, AWS Graviton3+
+ * - vfmaq_f16 for 2x wider vector FMA
+ * - vcvt for FP32<->FP16 conversion
+ *
+ * Requires: __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+ */
+void GemvInt4_NEON_FP16(float *output, const float *input,
+                        const uint8_t *weights, const float *scales,
+                        const float *zeros, int K, int N, int group_size,
+                        int n_start, int n_end);
+
+/**
  * @brief Scalar fallback for INT4 GEMV
  */
 void GemvInt4_Scalar(float *output, const float *input, const uint8_t *weights,

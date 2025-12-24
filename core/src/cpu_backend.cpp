@@ -9,13 +9,13 @@
  * both decode (M=1) and prefill (M>1) phases.
  */
 
-#include "cpu_backend.h"
-#include "flash_attention.h"
-#include "hardware_topology.h"
-#include "inference.h" // For InferenceConfig
+#include "../include/cpu_backend.h"
+#include "../include/flash_attention.h"
+#include "../include/hardware_topology.h"
+#include "../include/inference.h" // For InferenceConfig
+#include "../include/optimization_bridge.h"
+#include "../include/simd_platform.h"
 #include "kernels/cpu_int4.h"
-#include "optimization_bridge.h"
-#include "simd_platform.h"
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -832,6 +832,15 @@ void CpuBackend::MatMul(const Tensor &A, const Tensor &B, Tensor *C) {
     // GEMM Path: Matrix-Matrix multiplication (prefill phase)
     // Use cache-blocking with parallel distribution across M dimension
     // -------------------------------------------------------------------------
+
+    // Check for AMX support for large matrices (Intel Sapphire Rapids+)
+    if (simd_level_ == simd::SimdLevel::AMX && M >= 16 && K >= 64 && N >= 16) {
+      // AMX requires specific blocking, handled by the kernel
+      // MatMulAMX_BF16(a_data, b_data, c_data, M, K, N);
+      // Note: For now we fall back to AVX-512 until AMX kernel is fully
+      // validated
+    }
+
     constexpr int BLOCK_M = 32; // Tile size for M dimension
     constexpr int BLOCK_N = 32; // Tile size for N dimension
     constexpr int BLOCK_K =

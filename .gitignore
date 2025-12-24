@@ -125,6 +125,3 @@ scripts/*.csv
 python/core/
 
 GEMINI.md
-
-# Commercial/Proprietary code (not to be open-sourced)
-core/src/proprietary/
