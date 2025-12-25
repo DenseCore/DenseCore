@@ -90,6 +90,49 @@ void GemvInt4_NEON_FP16(float *output, const float *input,
                         int n_start, int n_end);
 
 /**
+ * @brief DOTPROD-accelerated INT4 GEMV using ARM NEON
+ *
+ * Uses vdotq_s32 instructions for accelerated dot products on INT8 vectors,
+ * avoiding per-element INT4->FP32 conversion overhead:
+ * - AWS Graviton 2+, Apple M-series, Qualcomm Snapdragon 845+
+ * - Processes 16 INT8 values per vdotq_s32 instruction
+ * - ~4x bandwidth reduction vs FP32 path
+ *
+ * Requires: __ARM_FEATURE_DOTPROD
+ */
+void GemvInt4_NEON_DOTPROD(float *output, const float *input,
+                           const uint8_t *weights, const float *scales,
+                           const float *zeros, int K, int N, int group_size,
+                           int n_start, int n_end);
+
+/**
+ * @brief AVX512-VNNI accelerated INT4 GEMV (Ice Lake+, Zen4+)
+ *
+ * Uses vpdpbusd (_mm512_dpbusd_epi32) for 4x u8*s8 dot products per lane.
+ * Keeps computation in integer domain until final scale/zero correction.
+ * ~4x throughput improvement vs FP32 conversion path.
+ *
+ * Requires: __AVX512VNNI__
+ */
+void GemvInt4_AVX512_VNNI(float *output, const float *input,
+                          const uint8_t *weights, const float *scales,
+                          const float *zeros, int K, int N, int group_size,
+                          int n_start, int n_end);
+
+/**
+ * @brief SVE DotProd accelerated INT4 GEMV (AWS Graviton 3/4)
+ *
+ * Uses svdot_s32 for scalable vector dot products on ARM SVE hardware.
+ * Supports 256-bit+ vectors for maximum throughput on Graviton processors.
+ *
+ * Requires: __ARM_FEATURE_SVE + runtime HWCAP_SVE detection
+ */
+void GemvInt4_SVE_DotProd(float *output, const float *input,
+                          const uint8_t *weights, const float *scales,
+                          const float *zeros, int K, int N, int group_size,
+                          int n_start, int n_end);
+
+/**
  * @brief Scalar fallback for INT4 GEMV
  */
 void GemvInt4_Scalar(float *output, const float *input, const uint8_t *weights,
@@ -99,7 +142,11 @@ void GemvInt4_Scalar(float *output, const float *input, const uint8_t *weights,
 /**
  * @brief Unified entry point with runtime dispatch
  *
- * Automatically selects AVX-512, AVX2, or scalar based on CPU capabilities.
+ * Automatically selects best available kernel:
+ * - AVX-512 (Intel Skylake-X+)
+ * - AVX2 (Intel Haswell+, AMD Zen+)
+ * - ARM NEON (Apple M-series, AWS Graviton)
+ * - Scalar fallback
  */
 void GemvInt4(float *output, const float *input, const uint8_t *weights,
               const float *scales, const float *zeros, int K, int N,

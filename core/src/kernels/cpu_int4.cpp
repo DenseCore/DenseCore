@@ -277,6 +277,156 @@ void GemvInt4_AVX512(float *output, const float *input, const uint8_t *weights,
 #endif // __AVX512F__
 
 // =============================================================================
+// AVX512-VNNI Implementation (Ice Lake+, Sapphire Rapids, Zen4+)
+// =============================================================================
+// Uses vpdpbusd (_mm512_dpbusd_epi32) for 4x u8*s8 dot products per lane.
+// Keeps computation in integer domain until final scale/zero correction.
+//
+// OPTIMIZATION: Input quantization hoisted outside N loop for O(K) vs O(N*K).
+// SAFETY: Uses __attribute__((target(...))) instead of file-level flags.
+// =============================================================================
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+#endif
+void GemvInt4_AVX512_VNNI(float *output, const float *input,
+                          const uint8_t *weights, const float *scales,
+                          const float *zeros, int K, int N, int group_size,
+                          int n_start, int n_end) {
+#if defined(__x86_64__) || defined(_M_X64)
+  const int num_full_groups = K / group_size;
+  const int packed_K = K / 2;
+  const float input_scale = 127.0f;
+
+  // ==========================================================================
+  // CRITICAL OPTIMIZATION: Hoist input quantization outside N loop
+  // This reduces quantization from O(N*K) to O(K)
+  // ==========================================================================
+
+  // Allocate aligned buffer for quantized input (64-byte aligned for AVX-512)
+  // Using heap allocation to avoid VLA (non-standard C++ extension)
+  int8_t *quantized_input =
+      static_cast<int8_t *>(_mm_malloc(static_cast<size_t>(K > 0 ? K : 1), 64));
+
+  // Quantize entire input vector ONCE before the N loop
+  for (int k = 0; k < K; k += 64) {
+    const int remaining = K - k;
+    const int count = remaining >= 64 ? 64 : remaining;
+
+    if (count >= 64) {
+      // AVX-512 vectorized quantization
+      __m512 a0 = _mm512_loadu_ps(input + k + 0);
+      __m512 a1 = _mm512_loadu_ps(input + k + 16);
+      __m512 a2 = _mm512_loadu_ps(input + k + 32);
+      __m512 a3 = _mm512_loadu_ps(input + k + 48);
+
+      __m512 vscale_in = _mm512_set1_ps(input_scale);
+      __m512i a0_i32 = _mm512_cvtps_epi32(_mm512_mul_ps(a0, vscale_in));
+      __m512i a1_i32 = _mm512_cvtps_epi32(_mm512_mul_ps(a1, vscale_in));
+      __m512i a2_i32 = _mm512_cvtps_epi32(_mm512_mul_ps(a2, vscale_in));
+      __m512i a3_i32 = _mm512_cvtps_epi32(_mm512_mul_ps(a3, vscale_in));
+
+      // Pack to INT8 (saturating)
+      __m512i a01_i16 = _mm512_packs_epi32(a0_i32, a1_i32);
+      __m512i a23_i16 = _mm512_packs_epi32(a2_i32, a3_i32);
+      __m512i a_s8 = _mm512_packs_epi16(a01_i16, a23_i16);
+
+      _mm512_store_si512(reinterpret_cast<__m512i *>(quantized_input + k),
+                         a_s8);
+    } else {
+      // Scalar fallback for tail
+      for (int i = 0; i < count; i++) {
+        float scaled = input[k + i] * input_scale;
+        int32_t clamped = static_cast<int32_t>(scaled);
+        clamped = clamped > 127 ? 127 : (clamped < -127 ? -127 : clamped);
+        quantized_input[k + i] = static_cast<int8_t>(clamped);
+      }
+    }
+  }
+
+  // ==========================================================================
+  // Main GEMV loop: Use pre-quantized input for O(1) per-element access
+  // ==========================================================================
+  for (int n = n_start; n < n_end; n++) {
+    float total_sum = 0.0f;
+
+    for (int g = 0; g < num_full_groups; g++) {
+      const int k_offset = g * group_size;
+      const int packed_offset = g * (group_size / 2);
+      const int8_t *a_ptr = quantized_input + k_offset; // Pre-quantized!
+      const uint8_t *w_ptr = weights + n * packed_K + packed_offset;
+      const float scale = scales[n * num_full_groups + g];
+      const float zero = zeros[n * num_full_groups + g];
+
+      __m512i acc = _mm512_setzero_si512();
+      __m512i isum = _mm512_setzero_si512();
+
+      int k = 0;
+      for (; k + 64 <= group_size; k += 64) {
+        // Load 32 packed bytes = 64 weights
+        __m256i packed = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i *>(w_ptr + k / 2));
+
+        // Unpack INT4 to INT8 (unsigned for dpbusd)
+        __m256i lo_nibble = _mm256_and_si256(packed, _mm256_set1_epi8(0x0F));
+        __m256i hi_nibble = _mm256_and_si256(_mm256_srli_epi16(packed, 4),
+                                             _mm256_set1_epi8(0x0F));
+        __m256i w_lo = _mm256_unpacklo_epi8(lo_nibble, hi_nibble);
+        __m256i w_hi = _mm256_unpackhi_epi8(lo_nibble, hi_nibble);
+        __m512i w_u8 =
+            _mm512_inserti64x4(_mm512_castsi256_si512(w_lo), w_hi, 1);
+
+        // Input sum for zero-point correction
+        // dpbusd: u8 * s8 -> s32. Use 1 (u8) * a_s8 (s8) = a_s8
+        isum = _mm512_dpbusd_epi32(isum, _mm512_set1_epi8(1), a_s8);
+
+        // Load pre-quantized input (already INT8!)
+        __m512i a_s8 =
+            _mm512_load_si512(reinterpret_cast<const __m512i *>(a_ptr + k));
+
+        // VNNI dot product: acc += u8 * s8
+        acc = _mm512_dpbusd_epi32(acc, w_u8, a_s8);
+      }
+
+      // Horizontal sum
+      int32_t dot_result = _mm512_reduce_add_epi32(acc);
+      int32_t input_sum = _mm512_reduce_add_epi32(isum);
+
+      // Dequantize: scale * (dot/127 - (zero+8)*isum/127)
+      // = (scale / 127) * (dot - (zero+8)*isum)
+      float group_sum = (scale / input_scale) *
+                        (static_cast<float>(dot_result) -
+                         (zero + 8.0f) * static_cast<float>(input_sum));
+      total_sum += group_sum;
+
+      // Scalar tail (rare, only when group_size % 64 != 0)
+      for (; k < group_size; k++) {
+        const int byte_idx = k / 2;
+        const int nibble_idx = k % 2;
+        uint8_t packed_byte = w_ptr[byte_idx];
+        int8_t q = (nibble_idx == 0)
+                       ? static_cast<int8_t>(packed_byte & 0x0F)
+                       : static_cast<int8_t>((packed_byte >> 4) & 0x0F);
+        if (q & 0x08)
+          q |= static_cast<int8_t>(0xF0);
+        float w_dequant = scale * (static_cast<float>(q) - zero);
+        total_sum += input[k_offset + k] * w_dequant;
+      }
+    }
+
+    output[n] = total_sum;
+  }
+
+  _mm_free(quantized_input); // Free aligned buffer
+#else
+  // Non-x86 fallback
+  (void)N; // Suppress unused parameter warning
+  GemvInt4_Scalar(output, input, weights, scales, zeros, K, N, group_size,
+                  n_start, n_end);
+#endif
+}
+
+// =============================================================================
 // AVX2 Implementation
 // =============================================================================
 
@@ -655,6 +805,218 @@ void GemvInt4_NEON(float *output, const float *input, const uint8_t *weights,
 }
 
 // =============================================================================
+// ARM NEON DOTPROD Implementation (ARMv8.2+: Graviton 2+, Apple M-series)
+// =============================================================================
+// Uses vdotq_s32 instructions to perform dot products on INT8 vectors directly.
+//
+// OPTIMIZATION: Input quantization hoisted outside N loop for O(K) vs O(N*K).
+// =============================================================================
+
+#if defined(__ARM_FEATURE_DOTPROD)
+
+void GemvInt4_NEON_DOTPROD(float *output, const float *input,
+                           const uint8_t *weights, const float *scales,
+                           const float *zeros, int K, int N, int group_size,
+                           int n_start, int n_end) {
+  const int num_full_groups = K / group_size;
+  const int packed_K = K / 2;
+  const float input_scale = 127.0f;
+
+  // Constants for nibble extraction
+  const uint8x16_t mask_0f = vdupq_n_u8(0x0F);
+  const int8x16_t sign_bit = vdupq_n_s8(8);
+  const int8x16_t offset = vdupq_n_s8(-16);
+
+  // ==========================================================================
+  // CRITICAL OPTIMIZATION: Hoist input quantization outside N loop
+  // This reduces quantization from O(N*K) to O(K)
+  // ==========================================================================
+
+  // Allocate aligned buffer for quantized input (16-byte aligned for NEON)
+  int8_t *quantized_input = nullptr;
+  if (posix_memalign(reinterpret_cast<void **>(&quantized_input), 16,
+                     static_cast<size_t>(K > 0 ? K : 1)) != 0) {
+    quantized_input = nullptr;
+  }
+  if (!quantized_input) {
+    GemvInt4_NEON(output, input, weights, scales, zeros, K, N, group_size,
+                  n_start, n_end);
+    return;
+  }
+
+  // Quantize entire input vector ONCE before the N loop using NEON
+  const float32x4_t ascale = vdupq_n_f32(input_scale);
+  for (int k = 0; k < K; k += 16) {
+    const int remaining = K - k;
+
+    if (remaining >= 16) {
+      // Load 16 floats
+      float32x4_t a0 = vld1q_f32(input + k + 0);
+      float32x4_t a1 = vld1q_f32(input + k + 4);
+      float32x4_t a2 = vld1q_f32(input + k + 8);
+      float32x4_t a3 = vld1q_f32(input + k + 12);
+
+      // Scale and convert to INT8 (saturating narrow)
+      int32x4_t i0 = vcvtq_s32_f32(vmulq_f32(a0, ascale));
+      int32x4_t i1 = vcvtq_s32_f32(vmulq_f32(a1, ascale));
+      int32x4_t i2 = vcvtq_s32_f32(vmulq_f32(a2, ascale));
+      int32x4_t i3 = vcvtq_s32_f32(vmulq_f32(a3, ascale));
+
+      // Narrow: i32 -> i16 -> i8
+      int16x4_t h0 = vmovn_s32(i0);
+      int16x4_t h1 = vmovn_s32(i1);
+      int16x4_t h2 = vmovn_s32(i2);
+      int16x4_t h3 = vmovn_s32(i3);
+      int16x8_t h01 = vcombine_s16(h0, h1);
+      int16x8_t h23 = vcombine_s16(h2, h3);
+      int8x8_t b01 = vmovn_s16(h01);
+      int8x8_t b23 = vmovn_s16(h23);
+      int8x16_t result = vcombine_s8(b01, b23);
+
+      vst1q_s8(quantized_input + k, result);
+    } else {
+      // Scalar fallback for tail
+      for (int i = 0; i < remaining; i++) {
+        float scaled = input[k + i] * input_scale;
+        int32_t clamped = static_cast<int32_t>(scaled);
+        clamped = clamped > 127 ? 127 : (clamped < -127 ? -127 : clamped);
+        quantized_input[k + i] = static_cast<int8_t>(clamped);
+      }
+    }
+  }
+
+  // ==========================================================================
+  // Main GEMV loop: Use pre-quantized input for O(1) per-element access
+  // ==========================================================================
+  for (int n = n_start; n < n_end; n++) {
+    float total_sum = 0.0f;
+
+    for (int g = 0; g < num_full_groups; g++) {
+      const int k_offset = g * group_size;
+      const int packed_offset = g * (group_size / 2);
+      const int8_t *a_ptr = quantized_input + k_offset; // Pre-quantized!
+      const uint8_t *w_ptr = weights + n * packed_K + packed_offset;
+      const float scale = scales[n * num_full_groups + g];
+      const float zero = zeros[n * num_full_groups + g];
+
+      // Accumulators for dot products (INT32)
+      int32x4_t acc0 = vdupq_n_s32(0);
+      int32x4_t acc1 = vdupq_n_s32(0);
+      int32x4_t acc2 = vdupq_n_s32(0);
+      int32x4_t acc3 = vdupq_n_s32(0);
+
+      // Track sum of inputs for zero-point adjustment
+      int32x4_t isum0 = vdupq_n_s32(0);
+      int32x4_t isum1 = vdupq_n_s32(0);
+      int32x4_t isum2 = vdupq_n_s32(0);
+      int32x4_t isum3 = vdupq_n_s32(0);
+
+      int k = 0;
+      for (; k + 64 <= group_size; k += 64) {
+        // Load 32 packed bytes = 64 nibbles = 64 weights
+        uint8x16_t packed0 = vld1q_u8(w_ptr + k / 2);
+        uint8x16_t packed1 = vld1q_u8(w_ptr + k / 2 + 16);
+
+        // Extract and interleave nibbles
+        uint8x16_t w_low_0 = vandq_u8(packed0, mask_0f);
+        uint8x16_t w_high_0 = vshrq_n_u8(packed0, 4);
+        uint8x16_t w_low_1 = vandq_u8(packed1, mask_0f);
+        uint8x16_t w_high_1 = vshrq_n_u8(packed1, 4);
+
+        uint8x16_t w_ord_0 = vzip1q_u8(w_low_0, w_high_0);
+        uint8x16_t w_ord_1 = vzip2q_u8(w_low_0, w_high_0);
+        uint8x16_t w_ord_2 = vzip1q_u8(w_low_1, w_high_1);
+        uint8x16_t w_ord_3 = vzip2q_u8(w_low_1, w_high_1);
+
+        // Sign extend INT4 to INT8
+        int8x16_t w0_s8 = vreinterpretq_s8_u8(w_ord_0);
+        int8x16_t w1_s8 = vreinterpretq_s8_u8(w_ord_1);
+        int8x16_t w2_s8 = vreinterpretq_s8_u8(w_ord_2);
+        int8x16_t w3_s8 = vreinterpretq_s8_u8(w_ord_3);
+
+        uint8x16_t ns0 = vcgeq_s8(w0_s8, sign_bit);
+        uint8x16_t ns1 = vcgeq_s8(w1_s8, sign_bit);
+        uint8x16_t ns2 = vcgeq_s8(w2_s8, sign_bit);
+        uint8x16_t ns3 = vcgeq_s8(w3_s8, sign_bit);
+
+        w0_s8 = vaddq_s8(w0_s8, vandq_s8(vreinterpretq_s8_u8(ns0), offset));
+        w1_s8 = vaddq_s8(w1_s8, vandq_s8(vreinterpretq_s8_u8(ns1), offset));
+        w2_s8 = vaddq_s8(w2_s8, vandq_s8(vreinterpretq_s8_u8(ns2), offset));
+        w3_s8 = vaddq_s8(w3_s8, vandq_s8(vreinterpretq_s8_u8(ns3), offset));
+
+        // Load pre-quantized input (already INT8!)
+        int8x16_t a_s8_0 = vld1q_s8(a_ptr + k + 0);
+        int8x16_t a_s8_1 = vld1q_s8(a_ptr + k + 16);
+        int8x16_t a_s8_2 = vld1q_s8(a_ptr + k + 32);
+        int8x16_t a_s8_3 = vld1q_s8(a_ptr + k + 48);
+
+        // DOTPROD: acc += dot(w, a)
+        acc0 = vdotq_s32(acc0, w0_s8, a_s8_0);
+        acc1 = vdotq_s32(acc1, w1_s8, a_s8_1);
+        acc2 = vdotq_s32(acc2, w2_s8, a_s8_2);
+        acc3 = vdotq_s32(acc3, w3_s8, a_s8_3);
+
+        // Accumulate weight sums for zero-point correction
+        // Accumulate input sums for zero-point correction
+        // a_s8 is signed, use ones (s8=1) -> dot(ones, a_s8) = sum(a_s8)
+        const int8x16_t ones = vdupq_n_s8(1);
+        isum0 = vdotq_s32(isum0, ones, a_s8_0);
+        isum1 = vdotq_s32(isum1, ones, a_s8_1);
+        isum2 = vdotq_s32(isum2, ones, a_s8_2);
+        isum3 = vdotq_s32(isum3, ones, a_s8_3);
+      }
+
+      // Horizontal sum of accumulators
+      int32x4_t acc_sum =
+          vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+      int32_t dot_result = vaddvq_s32(acc_sum);
+
+      int32x4_t isum_sum =
+          vaddq_s32(vaddq_s32(isum0, isum1), vaddq_s32(isum2, isum3));
+      int32_t input_sum = vaddvq_s32(isum_sum);
+
+      // Dequantize: scale * (dot/127 - zero*isum/127)
+      // = (scale / 127) * (dot - zero*isum)
+      float group_sum =
+          (scale / input_scale) * (static_cast<float>(dot_result) -
+                                   zero * static_cast<float>(input_sum));
+      total_sum += group_sum;
+
+      // Scalar tail
+      for (; k < group_size; k++) {
+        const int byte_idx = k / 2;
+        const int nibble_idx = k % 2;
+        uint8_t packed_byte = w_ptr[byte_idx];
+        int8_t q = (nibble_idx == 0)
+                       ? static_cast<int8_t>(packed_byte & 0x0F)
+                       : static_cast<int8_t>((packed_byte >> 4) & 0x0F);
+        if (q & 0x08)
+          q |= static_cast<int8_t>(0xF0);
+        float w_dequant = scale * (static_cast<float>(q) - zero);
+        total_sum += input[k_offset + k] * w_dequant;
+      }
+    }
+
+    output[n] = total_sum;
+  }
+
+  free(quantized_input);
+}
+
+#else
+
+// Fallback when DOTPROD is not available
+void GemvInt4_NEON_DOTPROD(float *output, const float *input,
+                           const uint8_t *weights, const float *scales,
+                           const float *zeros, int K, int N, int group_size,
+                           int n_start, int n_end) {
+  GemvInt4_NEON(output, input, weights, scales, zeros, K, N, group_size,
+                n_start, n_end);
+}
+
+#endif // __ARM_FEATURE_DOTPROD
+
+// =============================================================================
 // ARM NEON FP16 Implementation (for Graviton3+, Apple M3/M4, Snapdragon 8 Gen
 // 3+)
 // =============================================================================
@@ -918,25 +1280,296 @@ void GemvInt4_Scalar(float *output, const float *input, const uint8_t *weights,
 }
 
 // =============================================================================
-// Unified Entry Point
+// ARM SVE DotProd Implementation (AWS Graviton 3/4)
+// =============================================================================
+// Uses ARM Scalable Vector Extension with svdot_s32 for integer dot products.
+// SVE provides 256-bit+ scalable vectors on Graviton 3/4 processors.
+//
+// OPTIMIZATION: Input quantization hoisted outside N loop for O(K) vs O(N*K).
+// Uses svwhilelt_b8 predicates for natural tail handling without scalar
+// fallback.
+// =============================================================================
+
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+
+void GemvInt4_SVE_DotProd(float *output, const float *input,
+                          const uint8_t *weights, const float *scales,
+                          const float *zeros, int K, int N, int group_size,
+                          int n_start, int n_end) {
+  const int num_full_groups = K / group_size;
+  const int packed_K = K / 2;
+  const float input_scale = 127.0f;
+
+  // Get SVE vector length (varies by hardware: 256-bit on Graviton 3, etc.)
+  const uint64_t vl = svcntb(); // bytes per vector
+
+  // ==========================================================================
+  // CRITICAL OPTIMIZATION: Hoist input quantization outside N loop
+  // This reduces quantization from O(N*K) to O(K)
+  // ==========================================================================
+
+  // Allocate buffer for quantized input (aligned to vector length)
+  int8_t *quantized_input = nullptr;
+  if (posix_memalign(reinterpret_cast<void **>(&quantized_input), svcntb(),
+                     static_cast<size_t>(K > 0 ? K : 1)) != 0) {
+    quantized_input = nullptr;
+  }
+  if (!quantized_input) {
+    GemvInt4_NEON_DOTPROD(output, input, weights, scales, zeros, K, N,
+                          group_size, n_start, n_end);
+    return;
+  }
+
+  // Quantize entire input vector ONCE before the N loop using SVE
+  for (int k = 0; k < K;) {
+    // Generate predicate for remaining elements
+    svbool_t pg =
+        svwhilelt_b32(static_cast<uint64_t>(k), static_cast<uint64_t>(K));
+
+    // Load floats with predicate
+    svfloat32_t a = svld1_f32(pg, input + k);
+
+    // Scale and convert to INT32
+    svfloat32_t scaled = svmul_f32_z(pg, a, svdup_f32(input_scale));
+    svint32_t a_i32 = svcvt_s32_f32_z(pg, scaled);
+
+    // Saturating narrow: i32 -> i16 -> i8
+    svint16_t a_i16 = svqxtnb_s32(a_i32);
+    svint8_t a_s8 = svqxtnb_s16(a_i16);
+
+    // Store with predicate
+    svbool_t pg8 =
+        svwhilelt_b8(static_cast<uint64_t>(k), static_cast<uint64_t>(K));
+    svst1_s8(pg8, quantized_input + k, a_s8);
+
+    k += svcntw(); // Advance by number of 32-bit elements
+  }
+
+  // ==========================================================================
+  // Main GEMV loop: Use pre-quantized input for O(1) per-element access
+  // ==========================================================================
+  for (int n = n_start; n < n_end; n++) {
+    float total_sum = 0.0f;
+
+    for (int g = 0; g < num_full_groups; g++) {
+      const int k_offset = g * group_size;
+      const int packed_offset = g * (group_size / 2);
+      const int8_t *a_ptr = quantized_input + k_offset; // Pre-quantized!
+      const uint8_t *w_ptr = weights + n * packed_K + packed_offset;
+      const float scale = scales[n * num_full_groups + g];
+      const float zero = zeros[n * num_full_groups + g];
+
+      // INT32 accumulator for dot product
+      svint32_t acc = svdup_s32(0);
+      svint32_t isum = svdup_s32(0);
+
+      // Process elements with SVE using predicate for natural tail handling
+      int k = 0;
+      while (k < group_size) {
+        // Generate predicate for remaining packed bytes
+        const int remaining_packed = (group_size - k) / 2;
+        svbool_t pg = svwhilelt_b8(
+            static_cast<uint64_t>(0),
+            static_cast<uint64_t>(remaining_packed < (int)vl ? remaining_packed
+                                                             : (int)vl));
+
+        // Load packed bytes (predicated)
+        svuint8_t packed = svld1_u8(pg, w_ptr + k / 2);
+
+        // Unpack INT4 to INT8
+        svuint8_t lo_nibble = svand_u8_z(pg, packed, svdup_u8(0x0F));
+        svuint8_t hi_nibble = svlsr_n_u8_z(pg, packed, 4);
+
+        // Interleave nibbles (lo0,hi0,lo1,hi1,...)
+        svuint8_t w_interleaved = svzip1_u8(lo_nibble, hi_nibble);
+
+        // Sign extend: if nibble >= 8, subtract 16
+        svint8_t w_s8 = svreinterpret_s8_u8(w_interleaved);
+        svbool_t needs_sign = svcmpge_s8(pg, w_s8, svdup_s8(8));
+        w_s8 = svsub_s8_m(needs_sign, w_s8, svdup_s8(16));
+
+        // Load pre-quantized input (already INT8!)
+        svint8_t a_s8 = svld1_s8(pg, a_ptr + k);
+
+        // SVE dot product: acc += w * a
+        acc = svdot_s32(acc, w_s8, a_s8);
+
+        // Track input sum for zero correction
+        svint8_t ones = svdup_s8(1);
+        isum = svdot_s32(isum, ones, a_s8);
+
+        k += vl * 2; // 2 weights per packed byte
+      }
+
+      // Horizontal sum of SVE vector
+      int32_t dot_result = svaddv_s32(svptrue_b32(), acc);
+      int32_t input_sum = svaddv_s32(svptrue_b32(), isum);
+
+      // Dequantize: scale * (dot/127 - zero*isum/127)
+      // = (scale / 127) * (dot - zero*isum)
+      float group_sum =
+          (scale / input_scale) * (static_cast<float>(dot_result) -
+                                   zero * static_cast<float>(input_sum));
+      total_sum += group_sum;
+    }
+
+    output[n] = total_sum;
+  }
+
+  free(quantized_input);
+}
+
+#else
+
+void GemvInt4_SVE_DotProd(float *output, const float *input,
+                          const uint8_t *weights, const float *scales,
+                          const float *zeros, int K, int N, int group_size,
+                          int n_start, int n_end) {
+#if defined(__aarch64__) || defined(__ARM_NEON)
+  // Fallback to NEON DOTPROD on ARM without SVE
+  GemvInt4_NEON_DOTPROD(output, input, weights, scales, zeros, K, N, group_size,
+                        n_start, n_end);
+#else
+  // Fallback to Scalar on non-ARM platforms
+  GemvInt4_Scalar(output, input, weights, scales, zeros, K, N, group_size,
+                  n_start, n_end);
+#endif
+}
+
+#endif // __ARM_FEATURE_SVE
+
+// =============================================================================
+// Runtime Feature Detection
+// =============================================================================
+
+#if defined(__linux__) && defined(__aarch64__)
+#include <sys/auxv.h>
+#ifndef HWCAP_SVE
+#define HWCAP_SVE (1 << 22)
+#endif
+#ifndef HWCAP_ASIMDDP
+#define HWCAP_ASIMDDP (1 << 20)
+#endif
+
+static bool HasSVE() {
+  static bool checked = false;
+  static bool has_sve = false;
+  if (!checked) {
+    has_sve = (getauxval(AT_HWCAP) & HWCAP_SVE) != 0;
+    checked = true;
+  }
+  return has_sve;
+}
+
+static bool HasDotProd() {
+  static bool checked = false;
+  static bool has_dotprod = false;
+  if (!checked) {
+    has_dotprod = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+    checked = true;
+  }
+  return has_dotprod;
+}
+#endif
+
+// =============================================================================
+// Unified Entry Point with Runtime Dispatch
 // =============================================================================
 
 void GemvInt4(float *output, const float *input, const uint8_t *weights,
               const float *scales, const float *zeros, int K, int N,
               int group_size, int n_start, int n_end) {
-#if defined(__AVX512F__)
+
+#if defined(__x86_64__) || defined(_M_X64)
+  // x86-64: Runtime dispatch using __builtin_cpu_supports
+  // Check from highest to lowest capability
+
+#if defined(__GNUC__) || defined(__clang__)
+  // VNNI provides ~4x throughput for integer dot products
+  static bool has_vnni = __builtin_cpu_supports("avx512vnni");
+  if (has_vnni) {
+    GemvInt4_AVX512_VNNI(output, input, weights, scales, zeros, K, N,
+                         group_size, n_start, n_end);
+    return;
+  }
+
+  static bool has_avx512f = __builtin_cpu_supports("avx512f");
+  if (has_avx512f) {
+    GemvInt4_AVX512(output, input, weights, scales, zeros, K, N, group_size,
+                    n_start, n_end);
+    return;
+  }
+
+  static bool has_avx2 =
+      __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+  if (has_avx2) {
+    GemvInt4_AVX2(output, input, weights, scales, zeros, K, N, group_size,
+                  n_start, n_end);
+    return;
+  }
+#else
+  // MSVC or unknown compiler: use compile-time detection
+#if defined(__AVX512VNNI__)
+  GemvInt4_AVX512_VNNI(output, input, weights, scales, zeros, K, N, group_size,
+                       n_start, n_end);
+  return;
+#elif defined(__AVX512F__)
   GemvInt4_AVX512(output, input, weights, scales, zeros, K, N, group_size,
                   n_start, n_end);
+  return;
 #elif defined(__AVX2__)
   GemvInt4_AVX2(output, input, weights, scales, zeros, K, N, group_size,
                 n_start, n_end);
-#elif defined(__aarch64__) || defined(__ARM_NEON)
+  return;
+#endif
+#endif
+
+#elif defined(__aarch64__)
+  // ARM64: Runtime dispatch using getauxval
+
+#if defined(__linux__)
+  // SVE provides scalable vectors (256-bit+ on Graviton 3/4)
+  if (HasSVE()) {
+    GemvInt4_SVE_DotProd(output, input, weights, scales, zeros, K, N,
+                         group_size, n_start, n_end);
+    return;
+  }
+
+  // DotProd provides vdotq_s32 for integer acceleration
+  if (HasDotProd()) {
+    GemvInt4_NEON_DOTPROD(output, input, weights, scales, zeros, K, N,
+                          group_size, n_start, n_end);
+    return;
+  }
+#elif defined(__APPLE__)
+  // Apple Silicon: Always has DotProd, use FP16 for M3/M4
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+  GemvInt4_NEON_FP16(output, input, weights, scales, zeros, K, N, group_size,
+                     n_start, n_end);
+  return;
+#else
+  GemvInt4_NEON_DOTPROD(output, input, weights, scales, zeros, K, N, group_size,
+                        n_start, n_end);
+  return;
+#endif
+#endif
+
+  // Fallback to base NEON
   GemvInt4_NEON(output, input, weights, scales, zeros, K, N, group_size,
                 n_start, n_end);
-#else
+  return;
+
+#elif defined(__ARM_NEON)
+  // 32-bit ARM with NEON
+  GemvInt4_NEON(output, input, weights, scales, zeros, K, N, group_size,
+                n_start, n_end);
+  return;
+#endif
+
+  // Ultimate fallback: scalar
   GemvInt4_Scalar(output, input, weights, scales, zeros, K, N, group_size,
                   n_start, n_end);
-#endif
 }
 
 } // namespace kernels

@@ -4,12 +4,14 @@ bin/
 
 # Third-party dependencies (downloaded by scripts)
 core/third_party/
+_deps/
 
 workspace/
 
 # C++ build artifacts
 *.o
 *.so
+*.so.*
 *.dylib
 *.dll
 *.a
@@ -81,6 +83,8 @@ cmake_install.cmake
 Makefile.cmake
 *.cmake
 !CMakeLists.txt
+compile_commands.json
+core/Makefile
 
 # Test coverage
 *.gcov

@@ -24,6 +24,7 @@
 
 #include "../include/ane_backend.h"
 #include "../include/apple_silicon.h"
+#include "../include/metal_backend.h" // For RoPE/FlashAttention fallback
 
 #ifdef __APPLE__
 
@@ -89,6 +90,23 @@ struct ANEBackend::Impl {
   // Memory tracking
   std::atomic<size_t> allocatedBytes{0};
 
+  // Metal backend reference for fallback operations (RoPE, FlashAttention)
+  std::unique_ptr<MetalBackend> metalFallback;
+
+  // Bucketed models for dynamic sequence length support
+  // Extended range for both efficiency (small prompts) and long context (large
+  // prompts) Small buckets: 1, 8, 16, 32, 64                 - single token /
+  // short prompts Medium buckets: 128, 256, 512, 1024, 2048, 4096 - typical use
+  // cases Large buckets: 8192, 16384, 32768               - long context models
+  // (128K+)
+  std::vector<int> bucketSizes = {1,   8,    16,   32,   64,   128,   256,
+                                  512, 1024, 2048, 4096, 8192, 16384, 32768};
+
+  // Reusable padding buffers to avoid repeated allocations
+  std::vector<float> padded_input_buffer;
+  std::vector<float> padded_output_buffer;
+  std::vector<int> padded_pos_buffer;
+
   Impl() {
     @autoreleasepool {
       // Configure for ANE execution
@@ -116,7 +134,28 @@ struct ANEBackend::Impl {
     @autoreleasepool {
       compiledOps.clear();
       config = nil;
+      metalFallback.reset(); // Release Metal backend
     }
+  }
+
+  // Helper: Get the appropriate bucket size for a given sequence length
+  int GetBucketSize(int seq_len) const {
+    for (int bucket : bucketSizes) {
+      if (seq_len <= bucket)
+        return bucket;
+    }
+    return bucketSizes.back(); // Use largest bucket
+  }
+
+  // Helper: Ensure Metal fallback is initialized
+  MetalBackend *GetMetalFallback() {
+    if (!metalFallback) {
+      metalFallback = std::make_unique<MetalBackend>();
+      std::cerr
+          << "[ANEBackend] Initialized Metal fallback for RoPE/FlashAttention"
+          << std::endl;
+    }
+    return metalFallback.get();
   }
 };
 
@@ -303,11 +342,25 @@ void ANEBackend::SoftmaxInplace(Tensor *data) {
 
 void ANEBackend::RoPE(const Tensor &input, const Tensor &cos_sin,
                       const int *positions, Tensor *output, int rope_dim) {
-  // CPU fallback - RoPE is complex to compile to CoreML dynamically
-  CopyToDevice(output->data, input.data, input.SizeBytes());
+  // ==========================================================================
+  // PRODUCTION STRATEGY: Delegate RoPE to Metal GPU
+  // ==========================================================================
+  // RoPE is a lightweight per-token operation that doesn't benefit from ANE's
+  // matrix-focused architecture. Metal GPU provides excellent performance for
+  // RoPE with its flexible compute shaders.
+  // ==========================================================================
 
-  // Simplified RoPE (full implementation in metal_backend.mm)
-  std::cerr << "[ANEBackend] RoPE using CPU fallback" << std::endl;
+  MetalBackend *metal = impl_->GetMetalFallback();
+  if (metal) {
+    metal->RoPE(input, cos_sin, positions, output, rope_dim);
+    return;
+  }
+
+  // Ultimate fallback: CPU copy (should rarely happen)
+  CopyToDevice(output->data, input.data, input.SizeBytes());
+  std::cerr
+      << "[ANEBackend] WARNING: RoPE using CPU fallback (Metal unavailable)"
+      << std::endl;
 }
 
 void ANEBackend::FusedQKVProjection(const Tensor &input, const Tensor &wq,
@@ -322,9 +375,25 @@ void ANEBackend::FusedQKVProjection(const Tensor &input, const Tensor &wq,
 void ANEBackend::FlashAttention(const Tensor &Q, const Tensor &K,
                                 const Tensor &V, Tensor *output, float scale,
                                 bool causal, int n_head_kv) {
-  // FlashAttention is complex - ANE supports simpler attention patterns
-  std::cerr << "[ANEBackend] FlashAttention not supported, use MetalBackend"
+  // ==========================================================================
+  // PRODUCTION STRATEGY: Delegate FlashAttention to Metal GPU
+  // ==========================================================================
+  // FlashAttention requires dynamic memory access patterns (softmax over
+  // variable-length sequences) that don't map well to ANE's fixed-function
+  // units. Metal's FlashAttention kernel with threadgroup memory streaming
+  // is the optimal choice.
+  // ==========================================================================
+
+  MetalBackend *metal = impl_->GetMetalFallback();
+  if (metal) {
+    metal->FlashAttention(Q, K, V, output, scale, causal, n_head_kv);
+    return;
+  }
+
+  std::cerr << "[ANEBackend] ERROR: FlashAttention requires Metal backend"
             << std::endl;
+  throw std::runtime_error(
+      "FlashAttention not available: Metal backend initialization failed");
 }
 
 void ANEBackend::Synchronize() {
@@ -825,6 +894,128 @@ const char *ANEBackend::GetCacheDirectory() const {
 
 void ANEBackend::SetCacheDirectory(const char *path) {
   impl_->cacheDirectory = path;
+}
+
+// =============================================================================
+// Dynamic Sequence Length Support (Bucketed Models)
+// =============================================================================
+
+bool ANEBackend::ExecuteTransformerLayerDynamic(const std::string &layer_prefix,
+                                                const float *input,
+                                                float *output,
+                                                const int *positions,
+                                                int seq_len, int hidden_dim) {
+  // Get the appropriate bucket size
+  int bucket_size = impl_->GetBucketSize(seq_len);
+
+  // Construct the bucketed model name
+  std::string model_name = layer_prefix + "_seq" + std::to_string(bucket_size);
+
+  // Check if bucketed model exists
+  ANEOpStatus status = GetOpStatus(model_name);
+  if (status != ANEOpStatus::Ready) {
+    std::cerr
+        << "[ANEBackend] Bucketed model '" << model_name
+        << "' not found. Use PrecompileBucketedModels() or compile manually."
+        << std::endl;
+    return false;
+  }
+
+  // If seq_len == bucket_size, execute directly
+  if (seq_len == bucket_size) {
+    return ExecuteTransformerLayer(model_name, input, output, positions,
+                                   seq_len);
+  }
+
+  // seq_len < bucket_size: Pad input, execute, slice output
+  // Reuse buffers from impl to avoid allocation overhead
+  const size_t needed_elements = bucket_size * hidden_dim;
+
+  std::lock_guard<std::mutex> lock(impl_->opsMutex);
+  if (impl_->padded_input_buffer.size() < needed_elements) {
+    impl_->padded_input_buffer.resize(needed_elements);
+    impl_->padded_output_buffer.resize(needed_elements);
+  }
+  if (impl_->padded_pos_buffer.size() < bucket_size) {
+    impl_->padded_pos_buffer.resize(bucket_size);
+  }
+
+  float *padded_in_ptr = impl_->padded_input_buffer.data();
+  float *padded_out_ptr = impl_->padded_output_buffer.data();
+  int *padded_pos_ptr = impl_->padded_pos_buffer.data();
+
+  // Zero-fill padding areas (resize preserves data, so we might need to clear
+  // if reusing) Optimization: Only clear if necessary, or assume model handles
+  // padding via masking (usually does). For safety, we'll zero init the used
+  // portion if size increased, but since we overwrite with memcpy below, we
+  // only care about the excessive part if model reads it. Assuming masking
+  // handles it, but let's be safe and zero the whole reused buffer if it helps
+  // debugging, or just rely on memcpy. To be strictly safe like previous code
+  // (vector init to 0), we zero. However, memset is faster.
+  std::memset(padded_in_ptr, 0, needed_elements * sizeof(float));
+  std::memset(padded_out_ptr, 0, needed_elements * sizeof(float));
+  std::memset(padded_pos_ptr, 0, bucket_size * sizeof(int));
+
+  // Copy actual data to padded buffers
+  std::memcpy(padded_in_ptr, input, seq_len * hidden_dim * sizeof(float));
+  std::memcpy(padded_pos_ptr, positions, seq_len * sizeof(int));
+
+  // Execute with padded inputs
+  bool success = ExecuteTransformerLayer(
+      model_name, padded_in_ptr, padded_out_ptr, padded_pos_ptr, bucket_size);
+  if (!success) {
+    return false;
+  }
+
+  // Copy only the valid portion of output
+  std::memcpy(output, padded_out_ptr, seq_len * hidden_dim * sizeof(float));
+
+  return true;
+}
+
+std::vector<int> ANEBackend::GetBucketSizes() const {
+  return impl_->bucketSizes;
+}
+
+void ANEBackend::SetBucketSizes(const std::vector<int> &sizes) {
+  impl_->bucketSizes = sizes;
+  // Ensure sorted in ascending order
+  std::sort(impl_->bucketSizes.begin(), impl_->bucketSizes.end());
+}
+
+int ANEBackend::PrecompileBucketedModels(const std::string &layer_prefix,
+                                         const TransformerLayerConfig &config,
+                                         const void *layer_weights) {
+  int compiled_count = 0;
+
+  std::cout << "[ANEBackend] Pre-compiling bucketed models for '"
+            << layer_prefix << "' with " << impl_->bucketSizes.size()
+            << " bucket sizes..." << std::endl;
+
+  for (int bucket_size : impl_->bucketSizes) {
+    // Create config with this bucket size as max_seq_len
+    TransformerLayerConfig bucket_config = config;
+    bucket_config.max_seq_len = bucket_size;
+
+    // Construct bucketed model name
+    std::string model_name =
+        layer_prefix + "_seq" + std::to_string(bucket_size);
+
+    // Try to compile (this will check for cached .mlmodelc)
+    if (CompileTransformerLayer(model_name, bucket_config, layer_weights)) {
+      compiled_count++;
+      std::cout << "  [OK] " << model_name << " (seq_len=" << bucket_size << ")"
+                << std::endl;
+    } else {
+      std::cout << "  [SKIP] " << model_name << " - not found in cache"
+                << std::endl;
+    }
+  }
+
+  std::cout << "[ANEBackend] Compiled " << compiled_count << "/"
+            << impl_->bucketSizes.size() << " bucketed models" << std::endl;
+
+  return compiled_count;
 }
 
 } // namespace densecore

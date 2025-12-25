@@ -38,6 +38,13 @@
 #include <cstdlib> // For aligned_alloc/free
 #endif
 
+// =============================================================================
+// Apple Accelerate Framework (AMX-backed BLAS on Apple Silicon)
+// =============================================================================
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#endif
+
 namespace densecore {
 
 // =============================================================================
@@ -833,6 +840,29 @@ void CpuBackend::MatMul(const Tensor &A, const Tensor &B, Tensor *C) {
     // Use cache-blocking with parallel distribution across M dimension
     // -------------------------------------------------------------------------
 
+#ifdef __APPLE__
+    // =========================================================================
+    // APPLE ACCELERATE PATH: Use cblas_sgemm for AMX-backed BLAS
+    // =========================================================================
+    // On Apple Silicon (M1-M4), Accelerate.framework's BLAS is backed by the
+    // undocumented AMX (Apple Matrix coprocessor), which provides 2-4x
+    // performance over handwritten NEON loops for large matrices.
+    //
+    // AMX is a matrix coprocessor with 64x64 BF16/FP16 tiles, accessed through
+    // Apple's libraries (vDSP, BLAS, BNNS) but not directly programmable.
+    // =========================================================================
+    cblas_sgemm(CblasRowMajor, // Row-major storage
+                CblasNoTrans,  // A not transposed
+                CblasNoTrans,  // B not transposed
+                M, N, K,       // Dimensions
+                1.0f,          // alpha
+                a_data, K,     // A matrix and leading dimension
+                b_data, N,     // B matrix and leading dimension
+                0.0f,          // beta (overwrite C)
+                c_data, N);    // C matrix and leading dimension
+    return;
+#endif
+
     // Check for AMX support for large matrices (Intel Sapphire Rapids+)
     if (simd_level_ == simd::SimdLevel::AMX && M >= 16 && K >= 64 && N >= 16) {
       // AMX requires specific blocking, handled by the kernel
@@ -903,6 +933,25 @@ void CpuBackend::MatMulTransB(const Tensor &A, const Tensor &B, Tensor *C) {
   const float *a_data = A.DataAs<float>();
   const float *b_data = B.DataAs<float>();
   float *c_data = C->DataAs<float>();
+
+#ifdef __APPLE__
+  // ===========================================================================
+  // APPLE ACCELERATE PATH: cblas_sgemm with transposed B
+  // ===========================================================================
+  // B is [N, K] stored row-major, so B^T is [K, N].
+  // We use CblasTrans to transpose B in-place during multiplication.
+  // ===========================================================================
+  cblas_sgemm(CblasRowMajor, // Row-major storage
+              CblasNoTrans,  // A not transposed
+              CblasTrans,    // B transposed
+              M, N, K,       // Dimensions
+              1.0f,          // alpha
+              a_data, K,     // A matrix [M, K] with lda = K
+              b_data, K,  // B matrix [N, K] with ldb = K (will be transposed)
+              0.0f,       // beta
+              c_data, N); // C matrix [M, N] with ldc = N
+  return;
+#endif
 
   // Use simd::MatMulTransB which is optimized for this layout
   simd::MatMulTransB(c_data, a_data, b_data, M, N, K);
