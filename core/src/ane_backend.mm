@@ -94,9 +94,18 @@ struct ANEBackend::Impl {
   std::unique_ptr<MetalBackend> metalFallback;
 
   // Bucketed models for dynamic sequence length support
-  // Key: bucket size (e.g., 128, 256, 512, 1024, 2048, 4096)
-  // Value: compiled model name suffix
-  std::vector<int> bucketSizes = {1, 32, 128, 512, 1024, 2048, 4096};
+  // Extended range for both efficiency (small prompts) and long context (large
+  // prompts) Small buckets: 1, 8, 16, 32, 64                 - single token /
+  // short prompts Medium buckets: 128, 256, 512, 1024, 2048, 4096 - typical use
+  // cases Large buckets: 8192, 16384, 32768               - long context models
+  // (128K+)
+  std::vector<int> bucketSizes = {1,   8,    16,   32,   64,   128,   256,
+                                  512, 1024, 2048, 4096, 8192, 16384, 32768};
+
+  // Reusable padding buffers to avoid repeated allocations
+  std::vector<float> padded_input_buffer;
+  std::vector<float> padded_output_buffer;
+  std::vector<int> padded_pos_buffer;
 
   Impl() {
     @autoreleasepool {
@@ -142,7 +151,7 @@ struct ANEBackend::Impl {
   MetalBackend *GetMetalFallback() {
     if (!metalFallback) {
       metalFallback = std::make_unique<MetalBackend>();
-      std::cout
+      std::cerr
           << "[ANEBackend] Initialized Metal fallback for RoPE/FlashAttention"
           << std::endl;
     }
@@ -919,27 +928,47 @@ bool ANEBackend::ExecuteTransformerLayerDynamic(const std::string &layer_prefix,
   }
 
   // seq_len < bucket_size: Pad input, execute, slice output
-  // Allocate padded buffers
-  const size_t padded_size = bucket_size * hidden_dim * sizeof(float);
-  std::vector<float> padded_input(bucket_size * hidden_dim, 0.0f);
-  std::vector<float> padded_output(bucket_size * hidden_dim, 0.0f);
-  std::vector<int> padded_positions(bucket_size, 0);
+  // Reuse buffers from impl to avoid allocation overhead
+  const size_t needed_elements = bucket_size * hidden_dim;
+
+  std::lock_guard<std::mutex> lock(impl_->opsMutex);
+  if (impl_->padded_input_buffer.size() < needed_elements) {
+    impl_->padded_input_buffer.resize(needed_elements);
+    impl_->padded_output_buffer.resize(needed_elements);
+  }
+  if (impl_->padded_pos_buffer.size() < bucket_size) {
+    impl_->padded_pos_buffer.resize(bucket_size);
+  }
+
+  float *padded_in_ptr = impl_->padded_input_buffer.data();
+  float *padded_out_ptr = impl_->padded_output_buffer.data();
+  int *padded_pos_ptr = impl_->padded_pos_buffer.data();
+
+  // Zero-fill padding areas (resize preserves data, so we might need to clear
+  // if reusing) Optimization: Only clear if necessary, or assume model handles
+  // padding via masking (usually does). For safety, we'll zero init the used
+  // portion if size increased, but since we overwrite with memcpy below, we
+  // only care about the excessive part if model reads it. Assuming masking
+  // handles it, but let's be safe and zero the whole reused buffer if it helps
+  // debugging, or just rely on memcpy. To be strictly safe like previous code
+  // (vector init to 0), we zero. However, memset is faster.
+  std::memset(padded_in_ptr, 0, needed_elements * sizeof(float));
+  std::memset(padded_out_ptr, 0, needed_elements * sizeof(float));
+  std::memset(padded_pos_ptr, 0, bucket_size * sizeof(int));
 
   // Copy actual data to padded buffers
-  std::memcpy(padded_input.data(), input, seq_len * hidden_dim * sizeof(float));
-  std::memcpy(padded_positions.data(), positions, seq_len * sizeof(int));
+  std::memcpy(padded_in_ptr, input, seq_len * hidden_dim * sizeof(float));
+  std::memcpy(padded_pos_ptr, positions, seq_len * sizeof(int));
 
   // Execute with padded inputs
-  bool success = ExecuteTransformerLayer(model_name, padded_input.data(),
-                                         padded_output.data(),
-                                         padded_positions.data(), bucket_size);
+  bool success = ExecuteTransformerLayer(
+      model_name, padded_in_ptr, padded_out_ptr, padded_pos_ptr, bucket_size);
   if (!success) {
     return false;
   }
 
   // Copy only the valid portion of output
-  std::memcpy(output, padded_output.data(),
-              seq_len * hidden_dim * sizeof(float));
+  std::memcpy(output, padded_out_ptr, seq_len * hidden_dim * sizeof(float));
 
   return true;
 }

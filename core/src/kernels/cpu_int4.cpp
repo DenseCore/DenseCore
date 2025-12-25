@@ -359,7 +359,7 @@ void GemvInt4_AVX512_VNNI(float *output, const float *input,
       const float zero = zeros[n * num_full_groups + g];
 
       __m512i acc = _mm512_setzero_si512();
-      __m512i wsum = _mm512_setzero_si512();
+      __m512i isum = _mm512_setzero_si512();
 
       int k = 0;
       for (; k + 64 <= group_size; k += 64) {
@@ -376,9 +376,9 @@ void GemvInt4_AVX512_VNNI(float *output, const float *input,
         __m512i w_u8 =
             _mm512_inserti64x4(_mm512_castsi256_si512(w_lo), w_hi, 1);
 
-        // Weight sum for zero-point correction
-        wsum = _mm512_add_epi32(wsum,
-                                _mm512_sad_epu8(w_u8, _mm512_setzero_si512()));
+        // Input sum for zero-point correction
+        // dpbusd: u8 * s8 -> s32. Use 1 (u8) * a_s8 (s8) = a_s8
+        isum = _mm512_dpbusd_epi32(isum, _mm512_set1_epi8(1), a_s8);
 
         // Load pre-quantized input (already INT8!)
         __m512i a_s8 =
@@ -390,12 +390,13 @@ void GemvInt4_AVX512_VNNI(float *output, const float *input,
 
       // Horizontal sum
       int32_t dot_result = _mm512_reduce_add_epi32(acc);
-      int32_t weight_sum = _mm512_reduce_add_epi32(wsum);
+      int32_t input_sum = _mm512_reduce_add_epi32(isum);
 
-      // Dequantize
-      float group_sum =
-          scale * (static_cast<float>(dot_result) / input_scale -
-                   (zero + 8.0f) * static_cast<float>(weight_sum));
+      // Dequantize: scale * (dot/127 - (zero+8)*isum/127)
+      // = (scale / 127) * (dot - (zero+8)*isum)
+      float group_sum = (scale / input_scale) *
+                        (static_cast<float>(dot_result) -
+                         (zero + 8.0f) * static_cast<float>(input_sum));
       total_sum += group_sum;
 
       // Scalar tail (rare, only when group_size % 64 != 0)
@@ -832,8 +833,11 @@ void GemvInt4_NEON_DOTPROD(float *output, const float *input,
   // ==========================================================================
 
   // Allocate aligned buffer for quantized input (16-byte aligned for NEON)
-  int8_t *quantized_input =
-      static_cast<int8_t *>(malloc(static_cast<size_t>(K)));
+  int8_t *quantized_input = nullptr;
+  if (posix_memalign(reinterpret_cast<void **>(&quantized_input), 16,
+                     static_cast<size_t>(K > 0 ? K : 1)) != 0) {
+    quantized_input = nullptr;
+  }
   if (!quantized_input) {
     GemvInt4_NEON(output, input, weights, scales, zeros, K, N, group_size,
                   n_start, n_end);
@@ -901,11 +905,11 @@ void GemvInt4_NEON_DOTPROD(float *output, const float *input,
       int32x4_t acc2 = vdupq_n_s32(0);
       int32x4_t acc3 = vdupq_n_s32(0);
 
-      // Track sum of weights for zero-point adjustment
-      int32x4_t wsum0 = vdupq_n_s32(0);
-      int32x4_t wsum1 = vdupq_n_s32(0);
-      int32x4_t wsum2 = vdupq_n_s32(0);
-      int32x4_t wsum3 = vdupq_n_s32(0);
+      // Track sum of inputs for zero-point adjustment
+      int32x4_t isum0 = vdupq_n_s32(0);
+      int32x4_t isum1 = vdupq_n_s32(0);
+      int32x4_t isum2 = vdupq_n_s32(0);
+      int32x4_t isum3 = vdupq_n_s32(0);
 
       int k = 0;
       for (; k + 64 <= group_size; k += 64) {
@@ -953,11 +957,13 @@ void GemvInt4_NEON_DOTPROD(float *output, const float *input,
         acc3 = vdotq_s32(acc3, w3_s8, a_s8_3);
 
         // Accumulate weight sums for zero-point correction
+        // Accumulate input sums for zero-point correction
+        // a_s8 is signed, use ones (s8=1) -> dot(ones, a_s8) = sum(a_s8)
         const int8x16_t ones = vdupq_n_s8(1);
-        wsum0 = vdotq_s32(wsum0, w0_s8, ones);
-        wsum1 = vdotq_s32(wsum1, w1_s8, ones);
-        wsum2 = vdotq_s32(wsum2, w2_s8, ones);
-        wsum3 = vdotq_s32(wsum3, w3_s8, ones);
+        isum0 = vdotq_s32(isum0, ones, a_s8_0);
+        isum1 = vdotq_s32(isum1, ones, a_s8_1);
+        isum2 = vdotq_s32(isum2, ones, a_s8_2);
+        isum3 = vdotq_s32(isum3, ones, a_s8_3);
       }
 
       // Horizontal sum of accumulators
@@ -965,13 +971,15 @@ void GemvInt4_NEON_DOTPROD(float *output, const float *input,
           vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
       int32_t dot_result = vaddvq_s32(acc_sum);
 
-      int32x4_t wsum_sum =
-          vaddq_s32(vaddq_s32(wsum0, wsum1), vaddq_s32(wsum2, wsum3));
-      int32_t weight_sum = vaddvq_s32(wsum_sum);
+      int32x4_t isum_sum =
+          vaddq_s32(vaddq_s32(isum0, isum1), vaddq_s32(isum2, isum3));
+      int32_t input_sum = vaddvq_s32(isum_sum);
 
-      // Dequantize
-      float group_sum = scale * (static_cast<float>(dot_result) / input_scale -
-                                 zero * static_cast<float>(weight_sum));
+      // Dequantize: scale * (dot/127 - zero*isum/127)
+      // = (scale / 127) * (dot - zero*isum)
+      float group_sum =
+          (scale / input_scale) * (static_cast<float>(dot_result) -
+                                   zero * static_cast<float>(input_sum));
       total_sum += group_sum;
 
       // Scalar tail
@@ -1301,9 +1309,12 @@ void GemvInt4_SVE_DotProd(float *output, const float *input,
   // This reduces quantization from O(N*K) to O(K)
   // ==========================================================================
 
-  // Allocate buffer for quantized input
-  int8_t *quantized_input =
-      static_cast<int8_t *>(malloc(static_cast<size_t>(K)));
+  // Allocate buffer for quantized input (aligned to vector length)
+  int8_t *quantized_input = nullptr;
+  if (posix_memalign(reinterpret_cast<void **>(&quantized_input), svcntb(),
+                     static_cast<size_t>(K > 0 ? K : 1)) != 0) {
+    quantized_input = nullptr;
+  }
   if (!quantized_input) {
     GemvInt4_NEON_DOTPROD(output, input, weights, scales, zeros, K, N,
                           group_size, n_start, n_end);
@@ -1351,7 +1362,7 @@ void GemvInt4_SVE_DotProd(float *output, const float *input,
 
       // INT32 accumulator for dot product
       svint32_t acc = svdup_s32(0);
-      svint32_t wsum = svdup_s32(0);
+      svint32_t isum = svdup_s32(0);
 
       // Process elements with SVE using predicate for natural tail handling
       int k = 0;
@@ -1384,20 +1395,22 @@ void GemvInt4_SVE_DotProd(float *output, const float *input,
         // SVE dot product: acc += w * a
         acc = svdot_s32(acc, w_s8, a_s8);
 
-        // Track weight sum for zero correction
+        // Track input sum for zero correction
         svint8_t ones = svdup_s8(1);
-        wsum = svdot_s32(wsum, w_s8, ones);
+        isum = svdot_s32(isum, ones, a_s8);
 
         k += vl * 2; // 2 weights per packed byte
       }
 
       // Horizontal sum of SVE vector
       int32_t dot_result = svaddv_s32(svptrue_b32(), acc);
-      int32_t weight_sum = svaddv_s32(svptrue_b32(), wsum);
+      int32_t input_sum = svaddv_s32(svptrue_b32(), isum);
 
-      // Dequantize
-      float group_sum = scale * (static_cast<float>(dot_result) / input_scale -
-                                 zero * static_cast<float>(weight_sum));
+      // Dequantize: scale * (dot/127 - zero*isum/127)
+      // = (scale / 127) * (dot - zero*isum)
+      float group_sum =
+          (scale / input_scale) * (static_cast<float>(dot_result) -
+                                   zero * static_cast<float>(input_sum));
       total_sum += group_sum;
     }
 
