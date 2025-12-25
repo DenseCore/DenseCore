@@ -15,8 +15,11 @@
  *
  * @section example_usage Example Usage
  * @code
- * // Initialize engine
+ * // Initialize engine (basic usage)
  * DenseCoreHandle engine = InitEngine("model.gguf", NULL, 4);
+ *
+ * // Initialize engine with NUMA control (advanced)
+ * DenseCoreHandle engine = InitEngineEx("model.gguf", NULL, 4, 0, 0);
  *
  * // Generate text with streaming
  * void callback(const char *token, int is_finished, void *user_data) {
@@ -153,19 +156,53 @@ typedef void (*TokenResultCallback)(const TokenResult* result, void* user_data);
 typedef void (*EmbeddingCallback)(const float* embedding, int size, void* user_data);
 
 /**
- * @brief Initialize the DenseCore inference engine
+ * @brief Initialize the DenseCore inference engine (simplified API)
  *
- * Loads a GGUF model and initializes the inference engine with the specified
- * configuration. This is a blocking operation that may take several seconds
- * for large models.
+ * Loads a GGUF model and initializes the inference engine with default
+ * NUMA and thread pinning settings. This is the recommended entry point
+ * for most applications.
+ *
+ * For advanced control over NUMA topology and thread pinning, use
+ * InitEngineEx() instead.
  *
  * @param model_path Path to the GGUF model file (required)
  * @param reserved Reserved for future use (pass NULL)
  * @param threads Number of CPU threads to use (0 for auto-detect)
- * @param numa_node_id NUMA node to bind memory and threads (-1 for
- * auto/default)
+ * @return Handle to the initialized engine, or NULL on failure
+ *
+ * @note The engine must be freed with FreeEngine() when no longer needed.
+ *
+ * @see InitEngineEx() for advanced NUMA and thread pinning control
+ * @see FreeEngine()
+ *
+ * Example:
+ * @code
+ * DenseCoreHandle engine = InitEngine("model.gguf", NULL, 4);
+ * if (!engine) {
+ *     fprintf(stderr, "Failed to initialize engine\n");
+ *     return 1;
+ * }
+ * // ... use engine ...
+ * FreeEngine(engine);
+ * @endcode
+ */
+DENSECORE_API DenseCoreHandle InitEngine(const char* model_path, const char* reserved, int threads);
+
+/**
+ * @brief Initialize the DenseCore inference engine (extended API)
+ *
+ * Loads a GGUF model and initializes the inference engine with full control
+ * over NUMA topology and thread pinning. This is a blocking operation that
+ * may take several seconds for large models.
+ *
+ * @param model_path Path to the GGUF model file (required)
+ * @param reserved Reserved for future use (pass NULL)
+ * @param threads Number of CPU threads to use (0 for auto-detect)
+ * @param numa_node_id NUMA node to bind memory and threads:
+ *        - -1 = Auto/default (no explicit binding)
+ *        - 0+ = Specific NUMA node ID
  * @param pinning_policy Thread pinning policy for compute threads:
- *        - 0 = SCATTER (default): Distribute threads across physical cores,
+ *        - 0 = SCATTER: Distribute threads across physical cores,
  *          maximizes L3 cache and memory bandwidth. Best for latency-sensitive
  *          single-user workloads.
  *        - 1 = COMPACT: Pack threads on adjacent cores, shares L2 cache.
@@ -177,19 +214,24 @@ typedef void (*EmbeddingCallback)(const float* embedding, int size, void* user_d
  * @note For multi-socket servers, specifying numa_node_id can significantly
  *       improve performance by reducing cross-socket memory access.
  *
+ * @see InitEngine() for simplified initialization
  * @see FreeEngine()
  *
  * Example:
  * @code
  * // Auto-detect NUMA with SCATTER pinning (default)
- * DenseCoreHandle engine = InitEngine("model.gguf", NULL, 4, -1, 0);
+ * DenseCoreHandle engine = InitEngineEx("model.gguf", NULL, 4, -1, 0);
  *
  * // NUMA node 0 with COMPACT pinning for batch throughput
- * DenseCoreHandle engine = InitEngine("model.gguf", NULL, 4, 0, 1);
+ * DenseCoreHandle engine = InitEngineEx("model.gguf", NULL, 8, 0, 1);
+ *
+ * // Multi-socket server: one engine per NUMA node
+ * DenseCoreHandle engine_node0 = InitEngineEx("model.gguf", NULL, 16, 0, 0);
+ * DenseCoreHandle engine_node1 = InitEngineEx("model.gguf", NULL, 16, 1, 0);
  * @endcode
  */
-DENSECORE_API DenseCoreHandle InitEngine(const char* model_path, const char* reserved, int threads,
-                                         int numa_node_id, int pinning_policy);
+DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* reserved,
+                                           int threads, int numa_node_id, int pinning_policy);
 
 /**
  * Submit a request to the DenseCore engine (Non-blocking)
