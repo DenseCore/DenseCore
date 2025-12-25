@@ -69,14 +69,12 @@ jobs:
         working-directory: python
         run: |
           python -m pip install --upgrade pip
-          pip install -e . || true
-        continue-on-error: true
+          pip install -e .
 
       - name: Run basic import test
         working-directory: python
         run: |
-          python -c "import densecore; print('Import OK')" || true
-        continue-on-error: true
+          python -c "import densecore; print('DenseCore import OK')"
 
   # Docker Build Test
   docker-build:

@@ -74,7 +74,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ env.IMAGE_NAME }}
           short-description: ${{ github.event.repository.description }}
-          readme-filepath: ./DOCKER_DEPLOYMENT.md
+          readme-filepath: ./README.md
         continue-on-error: true
 
       - name: Scan image for vulnerabilities
