@@ -121,7 +121,7 @@ func (m *RequestChannelMap) cleanupStaleChannels(ttl time.Duration) {
 			// Re-check existence to be safe (though delete is idempotent)
 			if item, exists := m.channels[id]; exists && item.createdAt.Before(threshold) {
 				log.Printf("Cleaning up zombie request channel %d (age > %v)", id, ttl)
-				
+
 				// Close channel to unblock workers
 				close(item.ch)
 				delete(m.channels, id)
@@ -264,4 +264,3 @@ func embeddingCallbackGateway(embedding *C.float, size C.int, userData unsafe.Po
 		embeddingChannels.Delete(id)
 	}
 }
-

@@ -120,26 +120,3 @@ func (m *RequestMetrics) TimeToFirstByte() time.Duration {
 	}
 	return m.FirstByteTime.Sub(m.StartTime)
 }
-
-// metricsWriter wraps ResponseWriter to capture metrics
-type metricsWriter struct {
-	http.ResponseWriter
-	metrics *RequestMetrics
-}
-
-func (mw *metricsWriter) WriteHeader(code int) {
-	if mw.metrics.FirstByteTime.IsZero() {
-		mw.metrics.FirstByteTime = time.Now()
-	}
-	mw.metrics.StatusCode = code
-	mw.ResponseWriter.WriteHeader(code)
-}
-
-func (mw *metricsWriter) Write(b []byte) (int, error) {
-	if mw.metrics.FirstByteTime.IsZero() {
-		mw.metrics.FirstByteTime = time.Now()
-	}
-	n, err := mw.ResponseWriter.Write(b)
-	mw.metrics.BytesWritten += int64(n)
-	return n, err
-}

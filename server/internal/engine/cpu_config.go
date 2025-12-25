@@ -8,6 +8,9 @@ import (
 	"strings"
 )
 
+// Cgroup constants
+const cgroupUnlimited = "max"
+
 // CPUConfig holds CPU optimization settings
 type CPUConfig struct {
 	// Number of OS threads to use
@@ -69,9 +72,9 @@ func (c *CPUConfig) OptimalThreadCount() int {
 	// But leave 1-2 threads for Go runtime if we have many cores
 	threads := c.NumThreads
 	if threads > 8 {
-		threads = threads - 2 // Leave 2 threads for Go runtime
+		threads -= 2 // Leave 2 threads for Go runtime
 	} else if threads > 4 {
-		threads = threads - 1 // Leave 1 thread for Go runtime
+		threads-- // Leave 1 thread for Go runtime
 	}
 
 	if threads < 1 {
@@ -105,7 +108,7 @@ func readCgroupsV2CPUQuota() float64 {
 		return 0
 	}
 
-	if parts[0] == "max" {
+	if parts[0] == cgroupUnlimited {
 		return 0 // Unlimited
 	}
 

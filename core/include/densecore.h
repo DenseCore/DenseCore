@@ -192,7 +192,8 @@ typedef void (*EmbeddingCallback)(const float *embedding, int size,
  * @endcode
  */
 DENSECORE_API DenseCoreHandle InitEngine(const char *model_path,
-                                         const char *reserved, int threads);
+                                         const char *reserved, int threads,
+                                         int numa_node_id, int pinning_policy);
 
 /**
  * Submit a request to the DenseCore engine (Non-blocking)

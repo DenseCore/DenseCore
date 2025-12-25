@@ -13,17 +13,17 @@ import (
 type LoadingStatus int32
 
 const (
-	StatusIdle     LoadingStatus = 0
-	StatusLoading  LoadingStatus = 1
-	StatusReady    LoadingStatus = 2
-	StatusFailed   LoadingStatus = 3
+	StatusIdle    LoadingStatus = 0
+	StatusLoading LoadingStatus = 1
+	StatusReady   LoadingStatus = 2
+	StatusFailed  LoadingStatus = 3
 )
 
 type ModelService struct {
 	currentEngine    domain.Engine
 	currentModelPath string
 	mu               sync.RWMutex
-	
+
 	// Atomic status for non-blocking startup probe
 	loadingStatus atomic.Int32
 	loadingError  atomic.Value // stores error
@@ -50,20 +50,20 @@ func (s *ModelService) LoadModel(mainModelPath, draftModelPath string, threads i
 func (s *ModelService) LoadModelWithOptions(mainModelPath, draftModelPath string, threads int, force bool) error {
 	s.loadingStatus.Store(int32(StatusLoading))
 	s.loadingError.Store(error(nil))
-	
+
 	var err error
 	if force {
 		err = s.loadModelForce(mainModelPath, draftModelPath, threads)
 	} else {
 		err = s.loadModelBlueGreen(mainModelPath, draftModelPath, threads)
 	}
-	
+
 	if err != nil {
 		s.loadingStatus.Store(int32(StatusFailed))
 		s.loadingError.Store(err)
 		return err
 	}
-	
+
 	s.loadingStatus.Store(int32(StatusReady))
 	return nil
 }
@@ -74,7 +74,7 @@ func (s *ModelService) LoadModelWithOptions(mainModelPath, draftModelPath string
 // 3. Close old engine
 func (s *ModelService) loadModelBlueGreen(mainModelPath, draftModelPath string, threads int) error {
 	log.Printf("[ModelService] Blue/Green loading: %s", mainModelPath)
-	
+
 	// Step 1: Initialize new engine (old engine still serves requests)
 	newEngine, err := engine.NewDenseEngine(mainModelPath, draftModelPath, threads)
 	if err != nil {
@@ -82,23 +82,23 @@ func (s *ModelService) loadModelBlueGreen(mainModelPath, draftModelPath string, 
 		// If Blue/Green fails (e.g., OOM), fall back to force mode
 		return s.loadModelForce(mainModelPath, draftModelPath, threads)
 	}
-	
+
 	// Step 2: Atomically swap engine (critical section - very short)
 	s.mu.Lock()
 	oldEngine := s.currentEngine
 	s.currentEngine = newEngine
 	s.currentModelPath = mainModelPath
 	s.mu.Unlock()
-	
+
 	log.Printf("[ModelService] Engine swapped successfully")
-	
+
 	// Step 3: Close old engine (outside of lock, non-blocking for new requests)
 	if oldEngine != nil {
 		log.Printf("[ModelService] Closing old engine...")
 		oldEngine.Close()
 		log.Printf("[ModelService] Old engine closed")
 	}
-	
+
 	return nil
 }
 
@@ -106,7 +106,7 @@ func (s *ModelService) loadModelBlueGreen(mainModelPath, draftModelPath string, 
 // Unloads old engine first, then loads new one.
 func (s *ModelService) loadModelForce(mainModelPath, draftModelPath string, threads int) error {
 	log.Printf("[ModelService] Force loading (with downtime): %s", mainModelPath)
-	
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

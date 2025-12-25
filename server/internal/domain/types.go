@@ -78,7 +78,7 @@ type ErrorDetail struct {
 // Embedding structures
 type EmbeddingRequest struct {
 	Model          string      `json:"model"`
-	Input          interface{} `json:"input"` // string or []string
+	Input          interface{} `json:"input"`                     // string or []string
 	PoolingType    string      `json:"pooling_type,omitempty"`    // mean, cls, last, max
 	Normalize      *bool       `json:"normalize,omitempty"`       // L2 normalize (default: true)
 	EncodingFormat string      `json:"encoding_format,omitempty"` // float (default) or base64

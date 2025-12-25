@@ -1,7 +1,23 @@
+version: "2"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - gocritic
+    - gocyclo
+    - dupl
+    - goconst
+    - misspell
+    - noctx
+    - gosec
+
 linters-settings:
-  govet:
-    enable-all: true
-  
   gocyclo:
     min-complexity: 15
   
@@ -15,9 +31,6 @@ linters-settings:
   misspell:
     locale: US
   
-  lll:
-    line-length: 120
-  
   gocritic:
     enabled-tags:
       - diagnostic
@@ -25,40 +38,20 @@ linters-settings:
       - style
     disabled-checks:
       - commentedOutCode
-
-linters:
-  enable:
-    - gofmt
-    - goimports
-    - govet
-    - errcheck
-    - staticcheck
-    - unused
-    - gosimple
-    - structcheck
-    - varcheck
-    - ineffassign
-    - deadcode
-    - typecheck
-    - bodyclose
-    - noctx
-    - gosec
-  
-  disable:
-    - maligned
-    - prealloc
+      - hugeParam
 
 issues:
   exclude-rules:
+    # Test files are less strict
     - path: _test\.go
       linters:
         - gocyclo
-        - errcheck
         - dupl
+        - errcheck
         - gosec
 
 run:
   timeout: 5m
-  skip-dirs:
+  exclude-dirs:
     - vendor
     - third_party

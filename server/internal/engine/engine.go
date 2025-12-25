@@ -113,6 +113,7 @@ func (e *DenseEngine) GenerateStream(ctx context.Context, prompt string, maxToke
 	completionCh := completionChannels.Register(reqID)
 
 	// Call C wrapper
+	//nolint:govet // G103: unsafe.Pointer is required for CGO callback user_data
 	ret := C.SubmitRequestWrapper(e.handle, cPrompt, C.int(maxTokens), unsafe.Pointer(reqID))
 	if ret < 0 {
 		Cleanup(reqID)
@@ -146,6 +147,7 @@ func (e *DenseEngine) GenerateStreamWithFormat(ctx context.Context, prompt strin
 	}
 
 	// Call C wrapper with format
+	//nolint:govet // G103: unsafe.Pointer is required for CGO callback user_data
 	ret := C.SubmitRequestWithFormatWrapper(e.handle, cPrompt, C.int(maxTokens), C.int(jsonModeInt), unsafe.Pointer(reqID))
 	if ret < 0 {
 		Cleanup(reqID)
@@ -213,6 +215,7 @@ func (e *DenseEngine) GetEmbeddingsWithOptions(prompt string, poolingType string
 		normalizeInt = 0
 	}
 
+	//nolint:govet // G103: unsafe.Pointer is required for CGO callback user_data
 	ret := C.SubmitEmbeddingRequestExWrapper(e.handle, cPrompt, C.int(poolingInt), C.int(normalizeInt), unsafe.Pointer(uintptr(id)))
 	if ret < 0 {
 		embeddingChannels.Delete(uintptr(id))

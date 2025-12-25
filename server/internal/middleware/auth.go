@@ -256,6 +256,7 @@ func (e *authError) Error() string {
 type authContextKey string
 
 const (
+	//nolint:gosec // G101 false positive: this is a context key name, not a credential
 	apiKeyContextKey  authContextKey = "api_key_hash"
 	apiTierContextKey authContextKey = "api_tier"
 	userIDContextKey  authContextKey = "user_id"
@@ -279,7 +280,7 @@ func writeAuthError(w http.ResponseWriter, message string) {
 		},
 	}
 
-	json.NewEncoder(w).Encode(response)
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 // ============================================================================
@@ -310,4 +311,3 @@ func GetUserID(ctx context.Context) string {
 	}
 	return ""
 }
-

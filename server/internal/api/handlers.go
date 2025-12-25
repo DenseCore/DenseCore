@@ -105,7 +105,9 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 
 	for event := range outputChan {
 		if event.IsFinished {
-			fmt.Fprintf(w, "data: [DONE]\n\n")
+			if _, err := fmt.Fprintf(w, "data: [DONE]\n\n"); err != nil {
+				slog.Debug("SSE write error", slog.String("error", err.Error()))
+			}
 			flusher.Flush()
 			break
 		}
@@ -127,7 +129,10 @@ func (h *Handler) handleStream(ctx context.Context, w http.ResponseWriter, req d
 		}
 
 		data, _ := json.Marshal(chunk)
-		fmt.Fprintf(w, "data: %s\n\n", data)
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+			slog.Debug("SSE write error", slog.String("error", err.Error()))
+			break
+		}
 		flusher.Flush()
 	}
 }
@@ -170,7 +175,9 @@ func (h *Handler) handleSync(ctx context.Context, w http.ResponseWriter, req dom
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		slog.Error("failed to encode response", slog.String("error", err.Error()))
+	}
 }
 
 func (h *Handler) EmbeddingsHandler(w http.ResponseWriter, r *http.Request) {
@@ -225,7 +232,9 @@ func (h *Handler) EmbeddingsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		slog.Error("failed to encode response", slog.String("error", err.Error()))
+	}
 }
 
 func (h *Handler) ModelsHandler(w http.ResponseWriter, r *http.Request) {
@@ -250,7 +259,9 @@ func (h *Handler) ModelsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		slog.Error("failed to encode response", slog.String("error", err.Error()))
+	}
 }
 
 func (h *Handler) LoadModelHandler(w http.ResponseWriter, r *http.Request) {
@@ -285,10 +296,12 @@ func (h *Handler) LoadModelHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	if err := json.NewEncoder(w).Encode(map[string]string{
 		"status":  "success",
 		"message": fmt.Sprintf("Model loaded: %s", req.ModelPath),
-	})
+	}); err != nil {
+		slog.Error("failed to encode response", slog.String("error", err.Error()))
+	}
 }
 
 func (h *Handler) UnloadModelHandler(w http.ResponseWriter, r *http.Request) {
@@ -304,10 +317,12 @@ func (h *Handler) UnloadModelHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	if err := json.NewEncoder(w).Encode(map[string]string{
 		"status":  "success",
 		"message": "Model unloaded",
-	})
+	}); err != nil {
+		slog.Error("failed to encode response", slog.String("error", err.Error()))
+	}
 }
 
 // HealthHandler - Basic health check (legacy)
@@ -318,17 +333,21 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 		"engine":  "densecore",
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		slog.Error("failed to encode response", slog.String("error", err.Error()))
+	}
 }
 
 // LivenessHandler - K8s liveness probe
 // Returns 200 if the process is alive
 func (h *Handler) LivenessHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":    "ok",
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
-	})
+	}); err != nil {
+		slog.Debug("failed to encode response", slog.String("error", err.Error()))
+	}
 }
 
 // ReadinessHandler - K8s readiness probe
@@ -339,16 +358,18 @@ func (h *Handler) ReadinessHandler(w http.ResponseWriter, r *http.Request) {
 	engine := h.modelService.GetEngine()
 	if engine == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
 			"status": "not_ready",
 			"reason": "model_not_loaded",
-		})
+		}); err != nil {
+			slog.Debug("failed to encode response", slog.String("error", err.Error()))
+		}
 		return
 	}
 
 	// Check if engine is healthy by getting metrics
 	metrics := engine.GetDetailedMetrics()
-	
+
 	response := map[string]interface{}{
 		"status":       "ready",
 		"model":        h.modelService.GetCurrentModel(),
@@ -363,7 +384,9 @@ func (h *Handler) ReadinessHandler(w http.ResponseWriter, r *http.Request) {
 		response["reason"] = "kv_cache_full"
 	}
 
-	json.NewEncoder(w).Encode(response)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		slog.Debug("failed to encode response", slog.String("error", err.Error()))
+	}
 }
 
 // StartupHandler - K8s startup probe
@@ -374,20 +397,28 @@ func (h *Handler) StartupHandler(w http.ResponseWriter, r *http.Request) {
 	engine := h.modelService.GetEngine()
 	if engine == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":   "starting",
 			"progress": 0,
-		})
+		}); err != nil {
+			slog.Debug("failed to encode response", slog.String("error", err.Error()))
+		}
 		return
 	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":   "started",
 		"progress": 100,
 		"model":    h.modelService.GetCurrentModel(),
-	})
+	}); err != nil {
+		slog.Debug("failed to encode response", slog.String("error", err.Error()))
+	}
 }
 
+// MetricsHandler outputs Prometheus-format metrics.
+// Error checking for fmt.Fprintf is intentionally omitted per Prometheus exposition pattern.
+//
+//nolint:errcheck // Prometheus exposition format - write errors are non-recoverable
 func (h *Handler) MetricsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		sendError(w, "Method not allowed", "invalid_request_error", "", http.StatusMethodNotAllowed)
@@ -505,5 +536,7 @@ func sendError(w http.ResponseWriter, message, errType, code string, statusCode 
 		},
 	}
 
-	json.NewEncoder(w).Encode(errorResp)
+	if err := json.NewEncoder(w).Encode(errorResp); err != nil {
+		slog.Debug("failed to encode error response", slog.String("error", err.Error()))
+	}
 }

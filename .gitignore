@@ -3,7 +3,9 @@ build/
 bin/
 
 # Third-party dependencies (downloaded by scripts)
-core/third_party/
+# But allow ggml submodule to be tracked
+core/third_party/*
+!core/third_party/ggml
 _deps/
 
 workspace/
@@ -129,3 +131,6 @@ scripts/*.csv
 python/core/
 
 GEMINI.md
+
+# test file
+python/benchmark_fixed.py

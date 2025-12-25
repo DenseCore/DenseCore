@@ -1,5 +1,5 @@
-#include "densecore/hal/backend_registry.h" // Backend abstraction layer
 #include "densecore.h"
+#include "densecore/hal/backend_registry.h" // Backend abstraction layer
 #include "embedding.h"
 #include "engine_internal.h"
 #include "inference.h"
@@ -105,8 +105,8 @@ int GetEmbeddingDimension(DenseCoreHandle handle) {
 }
 
 DENSECORE_API DenseCoreHandle InitEngine(const char *model_path,
-                                         const char * /*reserved*/,
-                                         int threads) {
+                                         const char * /*reserved*/, int threads,
+                                         int numa_node_id, int pinning_policy) {
   try {
     // =========================================================================
     // INITIALIZATION DELAY CONFIGURATION (Large Model Support)
@@ -162,9 +162,9 @@ DENSECORE_API DenseCoreHandle InitEngine(const char *model_path,
       return nullptr;
 
     EngineState *state = new EngineState();
-    // Default values
-    state->numa_node_id = -1;
-    state->pinning_policy = 0;
+    // Use provided NUMA/pinning configuration
+    state->numa_node_id = numa_node_id;
+    state->pinning_policy = pinning_policy;
     state->n_threads = threads; // Store for worker thread
 
     // Calculate optimal KV cache size based on model dimensions
