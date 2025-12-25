@@ -33,26 +33,27 @@ Features:
 """
 
 from typing import TYPE_CHECKING
+
 print("[DEBUG] densecore package init start")
 
 # Core exports
-from .engine import DenseCore
-from .config import GenerationConfig, ModelConfig, SamplingParams
-from .hub import from_pretrained, list_gguf_files, download_model
-from .embedding import EmbeddingModel, EmbeddingConfig, embed
-from .convert import convert_from_hf, quick_convert
-from .smart_loader import smart_load, recommend_quantization, get_system_resources
-from .lora import LoRAConfig, LoRAAdapterInfo, LoRAManager
 from .auto import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from .config import GenerationConfig, ModelConfig, SamplingParams
+from .convert import convert_from_hf, quick_convert
+from .embedding import EmbeddingConfig, EmbeddingModel, embed
+from .engine import DenseCore
 from .generate_output import (
-    GenerateOutput,
+    EosTokenCriteria,
     GenerateBeamOutput,
-    StoppingCriteria,
-    StoppingCriteriaList,
+    GenerateOutput,
     MaxLengthCriteria,
     MaxNewTokensCriteria,
-    EosTokenCriteria,
+    StoppingCriteria,
+    StoppingCriteriaList,
 )
+from .hub import download_model, from_pretrained, list_gguf_files
+from .lora import LoRAAdapterInfo, LoRAConfig, LoRAManager
+from .smart_loader import get_system_resources, recommend_quantization, smart_load
 
 # Version info
 __version__ = "2.0.0"
@@ -115,8 +116,8 @@ def get_version() -> str:
 
 def get_device_info() -> dict:
     """Get information about available compute devices."""
-    import platform
     import os
+    import platform
 
     return {
         "platform": platform.system(),

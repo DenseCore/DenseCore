@@ -1,8 +1,9 @@
 #ifndef DENSECORE_SYMMETRIC_INT8_QUANTIZER_H
 #define DENSECORE_SYMMETRIC_INT8_QUANTIZER_H
 
-#include "quantizer.h"
 #include <vector>
+
+#include "quantizer.h"
 
 namespace densecore {
 
@@ -34,24 +35,22 @@ namespace densecore {
  */
 class SymmetricInt8Quantizer : public Quantizer {
 public:
-  explicit SymmetricInt8Quantizer(const QuantConfig &config)
-      : Quantizer(config) {}
+    explicit SymmetricInt8Quantizer(const QuantConfig& config) : Quantizer(config) {}
 
-  /**
-   * @brief Calibrate is a no-op for symmetric quantization.
-   *
-   * Q8_0 uses per-block scaling computed directly from weights,
-   * so no calibration data is needed.
-   */
-  void Calibrate(const std::vector<float *> &samples,
-                 size_t sample_size) override;
+    /**
+     * @brief Calibrate is a no-op for symmetric quantization.
+     *
+     * Q8_0 uses per-block scaling computed directly from weights,
+     * so no calibration data is needed.
+     */
+    void Calibrate(const std::vector<float*>& samples, size_t sample_size) override;
 
-  void QuantizeWeight(struct ggml_tensor *tensor) override;
+    void QuantizeWeight(struct ggml_tensor* tensor) override;
 };
 
 // Legacy alias for API compatibility
 using SmoothQuantQuantizer = SymmetricInt8Quantizer;
 
-} // namespace densecore
+}  // namespace densecore
 
-#endif // DENSECORE_SYMMETRIC_INT8_QUANTIZER_H
+#endif  // DENSECORE_SYMMETRIC_INT8_QUANTIZER_H

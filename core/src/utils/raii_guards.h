@@ -18,49 +18,47 @@ namespace densecore {
 /// For cached graphs that should NOT be freed, initialize with nullptr:
 ///   GGMLContextGuard guard(nullptr);  // No-op destructor
 struct GGMLContextGuard {
-  explicit GGMLContextGuard(struct ggml_context* ctx) noexcept : ctx_(ctx) {}
+    explicit GGMLContextGuard(struct ggml_context* ctx) noexcept : ctx_(ctx) {}
 
-  ~GGMLContextGuard() {
-    if (ctx_) {
-      ggml_free(ctx_);
+    ~GGMLContextGuard() {
+        if (ctx_) {
+            ggml_free(ctx_);
+        }
     }
-  }
 
-  // Delete copy operations to prevent double-free
-  GGMLContextGuard(const GGMLContextGuard&) = delete;
-  GGMLContextGuard& operator=(const GGMLContextGuard&) = delete;
+    // Delete copy operations to prevent double-free
+    GGMLContextGuard(const GGMLContextGuard&) = delete;
+    GGMLContextGuard& operator=(const GGMLContextGuard&) = delete;
 
-  // Allow move operations for flexibility
-  GGMLContextGuard(GGMLContextGuard&& other) noexcept : ctx_(other.ctx_) {
-    other.ctx_ = nullptr;
-  }
+    // Allow move operations for flexibility
+    GGMLContextGuard(GGMLContextGuard&& other) noexcept : ctx_(other.ctx_) { other.ctx_ = nullptr; }
 
-  GGMLContextGuard& operator=(GGMLContextGuard&& other) noexcept {
-    if (this != &other) {
-      if (ctx_) {
-        ggml_free(ctx_);
-      }
-      ctx_ = other.ctx_;
-      other.ctx_ = nullptr;
+    GGMLContextGuard& operator=(GGMLContextGuard&& other) noexcept {
+        if (this != &other) {
+            if (ctx_) {
+                ggml_free(ctx_);
+            }
+            ctx_ = other.ctx_;
+            other.ctx_ = nullptr;
+        }
+        return *this;
     }
-    return *this;
-  }
 
-  /// @brief Returns the managed context pointer.
-  struct ggml_context* get() const noexcept { return ctx_; }
+    /// @brief Returns the managed context pointer.
+    struct ggml_context* get() const noexcept { return ctx_; }
 
-  /// @brief Releases ownership without freeing. Caller assumes responsibility.
-  struct ggml_context* release() noexcept {
-    struct ggml_context* tmp = ctx_;
-    ctx_ = nullptr;
-    return tmp;
-  }
+    /// @brief Releases ownership without freeing. Caller assumes responsibility.
+    struct ggml_context* release() noexcept {
+        struct ggml_context* tmp = ctx_;
+        ctx_ = nullptr;
+        return tmp;
+    }
 
-  /// @brief Check if the guard is managing a valid context.
-  explicit operator bool() const noexcept { return ctx_ != nullptr; }
+    /// @brief Check if the guard is managing a valid context.
+    explicit operator bool() const noexcept { return ctx_ != nullptr; }
 
 private:
-  struct ggml_context* ctx_;
+    struct ggml_context* ctx_;
 };
 
 }  // namespace densecore

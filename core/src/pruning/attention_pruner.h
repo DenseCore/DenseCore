@@ -19,25 +19,22 @@ namespace densecore {
  */
 class AttentionPruner : public Pruner {
 public:
-  explicit AttentionPruner(const PruneConfig &config) : Pruner(config) {}
+    explicit AttentionPruner(const PruneConfig& config) : Pruner(config) {}
 
-  std::vector<float>
-  ComputeImportanceScores(const TransformerModel &model) override;
-  void PruneModel(TransformerModel *model) override;
+    std::vector<float> ComputeImportanceScores(const TransformerModel& model) override;
+    void PruneModel(TransformerModel* model) override;
 
 private:
-  // Compute importance for each attention head across all layers
-  std::vector<float> ComputeHeadImportance(const TransformerModel &model);
+    // Compute importance for each attention head across all layers
+    std::vector<float> ComputeHeadImportance(const TransformerModel& model);
 
-  // Select which heads to keep based on importance scores
-  std::vector<int> SelectHeadsToKeep(const std::vector<float> &scores,
-                                     int target_n_heads);
+    // Select which heads to keep based on importance scores
+    std::vector<int> SelectHeadsToKeep(const std::vector<float>& scores, int target_n_heads);
 
-  // Prune attention weights to remove selected heads
-  void PruneAttentionHeads(TransformerModel *model,
-                           const std::vector<int> &heads_to_keep);
+    // Prune attention weights to remove selected heads
+    void PruneAttentionHeads(TransformerModel* model, const std::vector<int>& heads_to_keep);
 };
 
-} // namespace densecore
+}  // namespace densecore
 
-#endif // DENSECORE_ATTENTION_PRUNER_H
+#endif  // DENSECORE_ATTENTION_PRUNER_H

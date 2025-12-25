@@ -43,9 +43,8 @@ namespace kernels {
  * @param n_start Start index in N dimension (inclusive)
  * @param n_end End index in N dimension (exclusive)
  */
-void GemvInt4_AVX512(float *output, const float *input, const uint8_t *weights,
-                     const float *scales, const float *zeros, int K, int N,
-                     int group_size, int n_start, int n_end);
+void GemvInt4_AVX512(float* output, const float* input, const uint8_t* weights, const float* scales,
+                     const float* zeros, int K, int N, int group_size, int n_start, int n_end);
 
 /**
  * @brief Decode-optimized INT4 GEMV using AVX2
@@ -55,9 +54,8 @@ void GemvInt4_AVX512(float *output, const float *input, const uint8_t *weights,
  * - 16 weights dequantized per iteration
  * - Manual horizontal sum (no _mm256_reduce_add_ps)
  */
-void GemvInt4_AVX2(float *output, const float *input, const uint8_t *weights,
-                   const float *scales, const float *zeros, int K, int N,
-                   int group_size, int n_start, int n_end);
+void GemvInt4_AVX2(float* output, const float* input, const uint8_t* weights, const float* scales,
+                   const float* zeros, int K, int N, int group_size, int n_start, int n_end);
 
 /**
  * @brief Decode-optimized INT4 GEMV using ARM NEON
@@ -70,9 +68,8 @@ void GemvInt4_AVX2(float *output, const float *input, const uint8_t *weights,
  *
  * Target platforms: Apple M-series, AWS Graviton, Qualcomm Snapdragon
  */
-void GemvInt4_NEON(float *output, const float *input, const uint8_t *weights,
-                   const float *scales, const float *zeros, int K, int N,
-                   int group_size, int n_start, int n_end);
+void GemvInt4_NEON(float* output, const float* input, const uint8_t* weights, const float* scales,
+                   const float* zeros, int K, int N, int group_size, int n_start, int n_end);
 
 /**
  * @brief FP16-optimized INT4 GEMV using ARM NEON
@@ -84,9 +81,8 @@ void GemvInt4_NEON(float *output, const float *input, const uint8_t *weights,
  *
  * Requires: __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
  */
-void GemvInt4_NEON_FP16(float *output, const float *input,
-                        const uint8_t *weights, const float *scales,
-                        const float *zeros, int K, int N, int group_size,
+void GemvInt4_NEON_FP16(float* output, const float* input, const uint8_t* weights,
+                        const float* scales, const float* zeros, int K, int N, int group_size,
                         int n_start, int n_end);
 
 /**
@@ -100,9 +96,8 @@ void GemvInt4_NEON_FP16(float *output, const float *input,
  *
  * Requires: __ARM_FEATURE_DOTPROD
  */
-void GemvInt4_NEON_DOTPROD(float *output, const float *input,
-                           const uint8_t *weights, const float *scales,
-                           const float *zeros, int K, int N, int group_size,
+void GemvInt4_NEON_DOTPROD(float* output, const float* input, const uint8_t* weights,
+                           const float* scales, const float* zeros, int K, int N, int group_size,
                            int n_start, int n_end);
 
 /**
@@ -114,9 +109,8 @@ void GemvInt4_NEON_DOTPROD(float *output, const float *input,
  *
  * Requires: __AVX512VNNI__
  */
-void GemvInt4_AVX512_VNNI(float *output, const float *input,
-                          const uint8_t *weights, const float *scales,
-                          const float *zeros, int K, int N, int group_size,
+void GemvInt4_AVX512_VNNI(float* output, const float* input, const uint8_t* weights,
+                          const float* scales, const float* zeros, int K, int N, int group_size,
                           int n_start, int n_end);
 
 /**
@@ -127,17 +121,15 @@ void GemvInt4_AVX512_VNNI(float *output, const float *input,
  *
  * Requires: __ARM_FEATURE_SVE + runtime HWCAP_SVE detection
  */
-void GemvInt4_SVE_DotProd(float *output, const float *input,
-                          const uint8_t *weights, const float *scales,
-                          const float *zeros, int K, int N, int group_size,
+void GemvInt4_SVE_DotProd(float* output, const float* input, const uint8_t* weights,
+                          const float* scales, const float* zeros, int K, int N, int group_size,
                           int n_start, int n_end);
 
 /**
  * @brief Scalar fallback for INT4 GEMV
  */
-void GemvInt4_Scalar(float *output, const float *input, const uint8_t *weights,
-                     const float *scales, const float *zeros, int K, int N,
-                     int group_size, int n_start, int n_end);
+void GemvInt4_Scalar(float* output, const float* input, const uint8_t* weights, const float* scales,
+                     const float* zeros, int K, int N, int group_size, int n_start, int n_end);
 
 /**
  * @brief Unified entry point with runtime dispatch
@@ -148,11 +140,10 @@ void GemvInt4_Scalar(float *output, const float *input, const uint8_t *weights,
  * - ARM NEON (Apple M-series, AWS Graviton)
  * - Scalar fallback
  */
-void GemvInt4(float *output, const float *input, const uint8_t *weights,
-              const float *scales, const float *zeros, int K, int N,
-              int group_size, int n_start, int n_end);
+void GemvInt4(float* output, const float* input, const uint8_t* weights, const float* scales,
+              const float* zeros, int K, int N, int group_size, int n_start, int n_end);
 
-} // namespace kernels
-} // namespace densecore
+}  // namespace kernels
+}  // namespace densecore
 
-#endif // DENSECORE_KERNELS_CPU_INT4_H
+#endif  // DENSECORE_KERNELS_CPU_INT4_H

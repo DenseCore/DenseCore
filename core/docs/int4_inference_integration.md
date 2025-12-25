@@ -19,7 +19,7 @@ The DenseCore inference engine now supports automatic detection and usage of INT
 The system automatically detects whether to use INT4 kernel at runtime:
 
 ```cpp
-static const bool use_int4_kernel = 
+static const bool use_int4_kernel =
     (densecore::simd::DetectSimdLevel() >= densecore::simd::SimdLevel::AVX512);
 ```
 
@@ -33,10 +33,10 @@ Each `ggml_tensor` is checked for INT4 quantization metadata:
 inline bool IsINT4Quantized(const struct ggml_tensor *tensor) {
     if (!tensor || !tensor->extra)
         return false;
-    
-    const densecore::TensorInt4 *int4 = 
+
+    const densecore::TensorInt4 *int4 =
         static_cast<const densecore::TensorInt4 *>(tensor->extra);
-    
+
     return (int4 && int4->q_data && int4->scales && int4->zero_points);
 }
 ```
@@ -52,7 +52,7 @@ inline struct ggml_tensor *smart_mul_mat(
     struct ggml_context *ctx,
     struct ggml_tensor *weight,
     struct ggml_tensor *input) {
-    
+
     if (use_int4_kernel && IsINT4Quantized(weight)) {
         // Custom INT4 GEMM
         return ggml_mul_mat_int4(ctx, weight, input, ...);
@@ -91,11 +91,11 @@ The `cb_int4_gemm` callback bridges GGML's computation graph with the INT4 kerne
 void cb_int4_gemm(struct ggml_tensor *dst, const struct ggml_tensor *src,
                   int ith, int nth, void *userdata) {
     auto *ud = (INT4GemmUserData *)userdata;
-    
+
     const float *A = (const float *)src->data;
     float *C = (float *)dst->data;
     const auto *w = ud->int4_weight;
-    
+
     // Call AVX512 kernel
     densecore::simd::GemmInt4Fp32_AVX512(
         C, A,
@@ -248,7 +248,7 @@ Add debug output to verify INT4 path is used:
 
 ```cpp
 if (IsINT4Quantized(weight)) {
-    std::cout << "[DEBUG] Using INT4 kernel for " 
+    std::cout << "[DEBUG] Using INT4 kernel for "
               << ggml_get_name(weight) << std::endl;
 }
 ```
@@ -261,7 +261,7 @@ Check if weights are properly quantized:
 auto *int4 = static_cast<TensorInt4 *>(tensor->extra);
 std::cout << "Group size: " << int4->group_size << std::endl;
 std::cout << "Num blocks: " << int4->num_blocks << std::endl;
-std::cout << "Compression: " 
+std::cout << "Compression: "
           << (float)original_size / quantized_size << "x" << std::endl;
 ```
 
@@ -278,10 +278,10 @@ ggml_graph_print(graph);  // Shows timing for each operation
 
 The INT4 inference integration provides:
 
-✅ **Automatic detection** - No code changes for users  
-✅ **Transparent fallback** - Works with non-quantized models  
-✅ **5-6× speedup** - On memory-bound inference  
-✅ **7-8× memory savings** - Fits larger models in RAM  
+✅ **Automatic detection** - No code changes for users
+✅ **Transparent fallback** - Works with non-quantized models
+✅ **5-6× speedup** - On memory-bound inference
+✅ **7-8× memory savings** - Fits larger models in RAM
 ✅ **Production-ready** - Thread-safe, no allocations per inference
 
 This implementation matches the architecture described in "Efficient LLM Inference on CPUs" and is ready for deployment.

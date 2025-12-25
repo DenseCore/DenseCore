@@ -422,7 +422,7 @@ class GraphCheckpoint:
             logger.warning("Checkpoint '%s' not found", checkpoint_id)
             return None
 
-        with open(checkpoint_path, "r", encoding="utf-8") as f:
+        with open(checkpoint_path, encoding="utf-8") as f:
             state = json.load(f)
 
         logger.info("Loaded checkpoint '%s' from %s", checkpoint_id, checkpoint_path)

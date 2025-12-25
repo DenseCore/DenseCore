@@ -34,7 +34,7 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      
+
       # ========================================================================
       # Init Container: Download Model
       # ========================================================================
@@ -75,7 +75,7 @@ spec:
             limits:
               cpu: "2"
               memory: "1Gi"
-      
+
       # ========================================================================
       # Main Container
       # ========================================================================
@@ -87,7 +87,7 @@ spec:
             - containerPort: {{ .Values.service.targetPort }}
               name: http
               protocol: TCP
-          
+
           env:
             - name: MAIN_MODEL_PATH
               value: {{ .Values.model.path | quote }}
@@ -103,7 +103,7 @@ spec:
                   name: {{ .Values.secrets.name }}
                   key: HF_TOKEN
                   optional: true
-          
+
           # Probes
           livenessProbe:
             httpGet:
@@ -113,7 +113,7 @@ spec:
             periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
             timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
             failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
-          
+
           readinessProbe:
             httpGet:
               path: {{ .Values.probes.readiness.path }}
@@ -122,7 +122,7 @@ spec:
             periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
             timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
             failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
-          
+
           startupProbe:
             httpGet:
               path: {{ .Values.probes.startup.path }}
@@ -131,15 +131,15 @@ spec:
             periodSeconds: {{ .Values.probes.startup.periodSeconds }}
             timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
             failureThreshold: {{ .Values.probes.startup.failureThreshold }}
-          
+
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          
+
           volumeMounts:
             - name: model-volume
               mountPath: /models
               readOnly: true
-      
+
       # ========================================================================
       # Volumes Configuration
       # ========================================================================

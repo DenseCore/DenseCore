@@ -30,15 +30,15 @@ namespace densecore {
  * - Two weights packed per byte
  */
 struct INT4Block {
-  float scale;      ///< Quantization scale factor
-  float zero_point; ///< Zero point for asymmetric quantization
+    float scale;       ///< Quantization scale factor
+    float zero_point;  ///< Zero point for asymmetric quantization
 
-  /**
-   * Packed 4-bit weights (flexible array member)
-   * Size: group_size / 2 bytes
-   * Layout: Each byte contains two 4-bit values [low | high]
-   */
-  uint8_t data[];
+    /**
+     * Packed 4-bit weights (flexible array member)
+     * Size: group_size / 2 bytes
+     * Layout: Each byte contains two 4-bit values [low | high]
+     */
+    uint8_t data[];
 };
 
 /**
@@ -49,18 +49,18 @@ struct INT4Block {
  * separate arrays for fast access to scales and zero points.
  */
 struct TensorInt4 {
-  void *q_data;       ///< Pointer to quantized blocks (64-byte aligned)
-  float *scales;      ///< Per-block scales (num_blocks elements)
-  float *zero_points; ///< Per-block zero points (num_blocks elements)
+    void* q_data;        ///< Pointer to quantized blocks (64-byte aligned)
+    float* scales;       ///< Per-block scales (num_blocks elements)
+    float* zero_points;  ///< Per-block zero points (num_blocks elements)
 
-  int group_size;       ///< Number of weights per block (32 or 128)
-  int num_blocks;       ///< Total number of blocks
-  int64_t num_elements; ///< Total number of weights
+    int group_size;        ///< Number of weights per block (32 or 128)
+    int num_blocks;        ///< Total number of blocks
+    int64_t num_elements;  ///< Total number of weights
 
-  // Original tensor shape (for reconstruction)
-  int64_t ne[4]; ///< Dimensions [cols, rows, batch, ?]
+    // Original tensor shape (for reconstruction)
+    int64_t ne[4];  ///< Dimensions [cols, rows, batch, ?]
 
-  size_t data_alignment; ///< Alignment in bytes (should be 64 for AVX512)
+    size_t data_alignment;  ///< Alignment in bytes (should be 64 for AVX512)
 };
 
 // ============================================================================
@@ -82,7 +82,7 @@ struct TensorInt4 {
  *       Only lower 4 bits are preserved.
  */
 inline uint8_t PackInt4(int8_t low, int8_t high) {
-  return static_cast<uint8_t>((low & 0x0F) | ((high & 0x0F) << 4));
+    return static_cast<uint8_t>((low & 0x0F) | ((high & 0x0F) << 4));
 }
 
 /**
@@ -96,19 +96,19 @@ inline uint8_t PackInt4(int8_t low, int8_t high) {
  *
  * @note Sign extension: if bit 3 is set, fill upper 4 bits with 1s
  */
-inline void UnpackInt4(uint8_t packed, int8_t &low, int8_t &high) {
-  // Extract lower and upper nibbles
-  low = static_cast<int8_t>(packed & 0x0F);
-  high = static_cast<int8_t>((packed >> 4) & 0x0F);
+inline void UnpackInt4(uint8_t packed, int8_t& low, int8_t& high) {
+    // Extract lower and upper nibbles
+    low = static_cast<int8_t>(packed & 0x0F);
+    high = static_cast<int8_t>((packed >> 4) & 0x0F);
 
-  // Sign extend from 4-bit to 8-bit
-  // If bit 3 (0x08) is set, the number is negative in 2's complement
-  if (low & 0x08) {
-    low |= static_cast<int8_t>(0xF0); // Fill upper 4 bits with 1s
-  }
-  if (high & 0x08) {
-    high |= static_cast<int8_t>(0xF0);
-  }
+    // Sign extend from 4-bit to 8-bit
+    // If bit 3 (0x08) is set, the number is negative in 2's complement
+    if (low & 0x08) {
+        low |= static_cast<int8_t>(0xF0);  // Fill upper 4 bits with 1s
+    }
+    if (high & 0x08) {
+        high |= static_cast<int8_t>(0xF0);
+    }
 }
 
 /**
@@ -122,7 +122,7 @@ inline void UnpackInt4(uint8_t packed, int8_t &low, int8_t &high) {
  * @return Dequantized FP32 value
  */
 inline float DequantizeInt4(int8_t q, float scale, float zero_point) {
-  return scale * (static_cast<float>(q) - zero_point);
+    return scale * (static_cast<float>(q) - zero_point);
 }
 
 // ============================================================================
@@ -136,7 +136,7 @@ inline float DequantizeInt4(int8_t q, float scale, float zero_point) {
  * @return Size in bytes: 8 (scale + zero) + group_size/2 (packed data)
  */
 inline size_t GetBlockSize(int group_size) {
-  return sizeof(float) * 2 + (group_size / 2);
+    return sizeof(float) * 2 + (group_size / 2);
 }
 
 /**
@@ -147,14 +147,14 @@ inline size_t GetBlockSize(int group_size) {
  * @return Total bytes needed (including alignment padding)
  */
 inline size_t GetQuantizedSize(int64_t num_elements, int group_size) {
-  int num_blocks = (num_elements + group_size - 1) / group_size;
-  size_t block_size = GetBlockSize(group_size);
+    int num_blocks = (num_elements + group_size - 1) / group_size;
+    size_t block_size = GetBlockSize(group_size);
 
-  // Add padding to ensure 64-byte alignment for each block
-  size_t aligned_block_size = (block_size + 63) & ~63ULL;
-  return num_blocks * aligned_block_size;
+    // Add padding to ensure 64-byte alignment for each block
+    size_t aligned_block_size = (block_size + 63) & ~63ULL;
+    return num_blocks * aligned_block_size;
 }
 
-} // namespace densecore
+}  // namespace densecore
 
-#endif // DENSECORE_INT4_TYPES_H
+#endif  // DENSECORE_INT4_TYPES_H

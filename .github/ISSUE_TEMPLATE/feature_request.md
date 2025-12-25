@@ -34,8 +34,8 @@ assignees: ''
 
 <!-- What are the benefits of implementing this feature? -->
 
-- 
-- 
+-
+-
 
 ## Additional Context
 

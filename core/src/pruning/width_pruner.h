@@ -9,25 +9,22 @@ namespace densecore {
 // Based on magnitude/L2 norm importance scoring
 class WidthPruner : public Pruner {
 public:
-  explicit WidthPruner(const PruneConfig &config) : Pruner(config) {}
+    explicit WidthPruner(const PruneConfig& config) : Pruner(config) {}
 
-  std::vector<float>
-  ComputeImportanceScores(const TransformerModel &model) override;
-  void PruneModel(TransformerModel *model) override;
+    std::vector<float> ComputeImportanceScores(const TransformerModel& model) override;
+    void PruneModel(TransformerModel* model) override;
 
 private:
-  // Compute importance scores for each dimension
-  std::vector<float> ComputeDimensionImportance(const TransformerModel &model);
+    // Compute importance scores for each dimension
+    std::vector<float> ComputeDimensionImportance(const TransformerModel& model);
 
-  // Select dimensions to keep based on importance
-  std::vector<int> SelectDimensionsToKeep(const std::vector<float> &scores,
-                                          int target_dim);
+    // Select dimensions to keep based on importance
+    std::vector<int> SelectDimensionsToKeep(const std::vector<float>& scores, int target_dim);
 
-  // Prune embedding dimension (hidden_size)
-  void PruneEmbeddingDimension(TransformerModel *model,
-                               const std::vector<int> &dims_to_keep);
+    // Prune embedding dimension (hidden_size)
+    void PruneEmbeddingDimension(TransformerModel* model, const std::vector<int>& dims_to_keep);
 };
 
-} // namespace densecore
+}  // namespace densecore
 
-#endif // DENSECORE_WIDTH_PRUNER_H
+#endif  // DENSECORE_WIDTH_PRUNER_H

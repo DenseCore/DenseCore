@@ -162,13 +162,13 @@ func (e *DenseEngine) GenerateStreamWithFormat(ctx context.Context, prompt strin
 
 // watchContext monitors for context cancellation and cancels the C++ request if needed.
 // This goroutine exits when either:
-// 1. The context is cancelled (and we call CancelRequest), or
+// 1. The context is canceled (and we call CancelRequest), or
 // 2. The request completes normally (completionCh is closed)
 func (e *DenseEngine) watchContext(ctx context.Context, reqID uintptr, completionCh <-chan struct{}) {
 	select {
 	case <-ctx.Done():
-		// Context cancelled - signal C++ to stop generating
-		log.Printf("Context cancelled for request %d, cleaning up...", reqID)
+		// Context canceled - signal C++ to stop generating
+		log.Printf("Context canceled for request %d, cleaning up...", reqID)
 		e.CancelRequest(reqID) // C++ side cancellation
 		Cleanup(reqID)         // Go side cleanup
 	case <-completionCh:

@@ -46,7 +46,7 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 		// 1. Dequeue request (blocks until available)
 		req, ok := p.queue.Dequeue(ctx)
 		if !ok {
-			// Queue closed or context cancelled
+			// Queue closed or context canceled
 			slog.Debug("worker stopping", slog.Int("worker_id", workerID))
 			return
 		}

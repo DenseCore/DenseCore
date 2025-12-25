@@ -17,25 +17,24 @@ namespace densecore {
  */
 class CombinedPruner : public Pruner {
 public:
-  explicit CombinedPruner(const PruneConfig &config) : Pruner(config) {}
+    explicit CombinedPruner(const PruneConfig& config) : Pruner(config) {}
 
-  std::vector<float>
-  ComputeImportanceScores(const TransformerModel &model) override;
-  void PruneModel(TransformerModel *model) override;
+    std::vector<float> ComputeImportanceScores(const TransformerModel& model) override;
+    void PruneModel(TransformerModel* model) override;
 
 private:
-  // Store intermediate stats from each phase
-  struct PhaseStats {
-    int layers_before = 0;
-    int layers_after = 0;
-    int hidden_before = 0;
-    int hidden_after = 0;
-  };
+    // Store intermediate stats from each phase
+    struct PhaseStats {
+        int layers_before = 0;
+        int layers_after = 0;
+        int hidden_before = 0;
+        int hidden_after = 0;
+    };
 
-  PhaseStats depth_stats_;
-  PhaseStats width_stats_;
+    PhaseStats depth_stats_;
+    PhaseStats width_stats_;
 };
 
-} // namespace densecore
+}  // namespace densecore
 
-#endif // DENSECORE_COMBINED_PRUNER_H
+#endif  // DENSECORE_COMBINED_PRUNER_H

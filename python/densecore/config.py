@@ -7,10 +7,10 @@ following HuggingFace's configuration patterns for familiarity.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Optional, Union
 import json
 import os
+from dataclasses import dataclass, field
+from typing import Any, Optional, Union
 
 
 @dataclass
@@ -73,7 +73,7 @@ class ModelConfig:
         }
 
     @classmethod
-    def from_dict(cls, config_dict: dict[str, Any]) -> "ModelConfig":
+    def from_dict(cls, config_dict: dict[str, Any]) -> ModelConfig:
         """Create config from dictionary."""
         return cls(**{k: v for k, v in config_dict.items() if k in cls.__dataclass_fields__})
 
@@ -83,9 +83,9 @@ class ModelConfig:
             json.dump(self.to_dict(), f, indent=2)
 
     @classmethod
-    def load(cls, path: str) -> "ModelConfig":
+    def load(cls, path: str) -> ModelConfig:
         """Load config from JSON file."""
-        with open(path, "r") as f:
+        with open(path) as f:
             return cls.from_dict(json.load(f))
 
 
@@ -268,12 +268,12 @@ class GenerationConfig:
         }
 
     @classmethod
-    def from_dict(cls, config_dict: dict[str, Any]) -> "GenerationConfig":
+    def from_dict(cls, config_dict: dict[str, Any]) -> GenerationConfig:
         """Create from dictionary."""
         return cls(**{k: v for k, v in config_dict.items() if k in cls.__dataclass_fields__})
 
     @classmethod
-    def from_pretrained(cls, model_name_or_path: str) -> "GenerationConfig":
+    def from_pretrained(cls, model_name_or_path: str) -> GenerationConfig:
         """
         Load generation config from a pretrained model.
 
@@ -283,7 +283,7 @@ class GenerationConfig:
         # Try to load from local file
         config_path = os.path.join(model_name_or_path, "generation_config.json")
         if os.path.exists(config_path):
-            with open(config_path, "r") as f:
+            with open(config_path) as f:
                 return cls.from_dict(json.load(f))
 
         # Return default config

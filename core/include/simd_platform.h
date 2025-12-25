@@ -24,4 +24,4 @@
 #include <simde/x86/fma.h>
 #endif
 
-#endif // DENSECORE_SIMD_PLATFORM_H
+#endif  // DENSECORE_SIMD_PLATFORM_H

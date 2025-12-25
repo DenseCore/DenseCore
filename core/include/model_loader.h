@@ -6,7 +6,7 @@
 /**
  * Load GGUF model (standard mmap-based loading)
  */
-TransformerModel *LoadGGUFModel(const char *path);
+TransformerModel* LoadGGUFModel(const char* path);
 
 /**
  * Load GGUF model with NUMA-aware memory placement
@@ -19,7 +19,7 @@ TransformerModel *LoadGGUFModel(const char *path);
  * @param use_huge_pages Whether to use huge pages for tensor buffers
  * @return Loaded model with NUMA-optimized memory layout, or nullptr on error
  */
-TransformerModel *LoadGGUFModelNuma(const char *path, int numa_node = -1,
+TransformerModel* LoadGGUFModelNuma(const char* path, int numa_node = -1,
                                     bool use_huge_pages = false);
 
 /**
@@ -28,6 +28,6 @@ TransformerModel *LoadGGUFModelNuma(const char *path, int numa_node = -1,
  * @param path Output path
  * @return 0 on success, negative on error
  */
-int SaveModel(const TransformerModel *model, const char *path);
+int SaveModel(const TransformerModel* model, const char* path);
 
-#endif // DENSECORE_MODEL_LOADER_H
+#endif  // DENSECORE_MODEL_LOADER_H

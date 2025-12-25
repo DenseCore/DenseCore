@@ -23,12 +23,10 @@
 #define DENSECORE_BUILD_TIMESTAMP "2025-12-25T03:29:26Z"
 
 // Full version string with commit: "X.Y.Z (abc1234)"
-#define DENSECORE_VERSION_FULL                                                 \
-  "1.0.0 (5781039)"
+#define DENSECORE_VERSION_FULL "1.0.0 (5781039)"
 
 // Numeric version for comparison: MAJOR * 10000 + MINOR * 100 + PATCH
-#define DENSECORE_VERSION_NUMBER                                               \
-  (DENSECORE_VERSION_MAJOR * 10000 + DENSECORE_VERSION_MINOR * 100 +           \
-   DENSECORE_VERSION_PATCH)
+#define DENSECORE_VERSION_NUMBER \
+    (DENSECORE_VERSION_MAJOR * 10000 + DENSECORE_VERSION_MINOR * 100 + DENSECORE_VERSION_PATCH)
 
-#endif // DENSECORE_VERSION_H
+#endif  // DENSECORE_VERSION_H

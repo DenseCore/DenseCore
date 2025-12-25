@@ -12,26 +12,26 @@ graph TB
         APP[Inference Engine]
         HS[Hybrid Scheduler]
     end
-    
+
     subgraph "Compute Units"
         CPU[CPU + NEON + AMX]
         GPU[Metal GPU]
         ANE[Neural Engine]
     end
-    
+
     subgraph "Unified Memory"
         UMA[100-400+ GB/s]
     end
-    
+
     APP --> HS
     HS --> CPU
     HS --> GPU
     HS --> ANE
-    
+
     CPU --> UMA
     GPU --> UMA
     ANE --> UMA
-    
+
     style GPU fill:#4a9
     style ANE fill:#49a
     style HS fill:#a94

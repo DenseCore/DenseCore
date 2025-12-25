@@ -61,22 +61,22 @@ kernel void gemv_f32(
     // Each threadgroup handles one output row
     uint row = tgid;
     if (row >= M) return;
-    
+
     // Shared memory for parallel reduction
     threadgroup float shared_sum[THREADGROUP_SIZE];
-    
+
     // Each thread accumulates a portion of the dot product
     float sum = 0.0f;
     device const float* weight_row = weight + row * K;
-    
+
     // Coalesced memory access: threads access consecutive K elements
     for (uint k = tid; k < K; k += tg_size) {
         sum = fma(weight_row[k], input[k], sum);
     }
-    
+
     shared_sum[tid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     // Parallel reduction in shared memory
     // Uses tree-based reduction for O(log N) complexity
     for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
@@ -85,7 +85,7 @@ kernel void gemv_f32(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     // Write final result
     if (tid == 0) {
         output[row] = shared_sum[0];
@@ -113,26 +113,26 @@ kernel void gemv_f32_simd(
 {
     uint row = tgid;
     if (row >= M) return;
-    
+
     device const float* weight_row = weight + row * K;
-    
+
     // Each thread accumulates partial dot product
     float sum = 0.0f;
     for (uint k = tid; k < K; k += tg_size) {
         sum = fma(weight_row[k], input[k], sum);
     }
-    
+
     // SIMD reduction within each simdgroup (32 threads)
     sum = simd_sum(sum);
-    
+
     // One thread per simdgroup writes to shared memory
     threadgroup float simd_results[8];  // Max 256/32 = 8 simdgroups
-    
+
     if (simd_lane == 0) {
         simd_results[simd_group] = sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     // Final reduction across simdgroups
     if (tid == 0) {
         uint num_simdgroups = (tg_size + SIMD_SIZE - 1) / SIMD_SIZE;
@@ -160,13 +160,13 @@ kernel void gemv_f16(
 {
     uint row = tgid;
     if (row >= M) return;
-    
+
     threadgroup float shared_sum[THREADGROUP_SIZE];
-    
+
     // Accumulate in FP32 for precision
     float sum = 0.0f;
     device const half* weight_row = weight + row * K;
-    
+
     // Process 2 elements at a time using half2
     uint k = tid * 2;
     for (; k + 1 < K; k += tg_size * 2) {
@@ -174,22 +174,22 @@ kernel void gemv_f16(
         half2 x = *reinterpret_cast<device const half2*>(input + k);
         sum += float(w.x) * float(x.x) + float(w.y) * float(x.y);
     }
-    
+
     // Handle remainder
     if (k < K) {
         sum += float(weight_row[k]) * float(input[k]);
     }
-    
+
     shared_sum[tid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
             shared_sum[tid] += shared_sum[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     if (tid == 0) {
         output[row] = half(shared_sum[0]);
     }
@@ -226,59 +226,59 @@ kernel void gemv_int4(
 {
     uint row = tgid;
     if (row >= M) return;
-    
+
     threadgroup float shared_sum[THREADGROUP_SIZE];
-    
+
     uint num_groups = K / group_size;
     uint packed_K = K / 2;
-    
+
     device const uint8_t* weight_row = weight_packed + row * packed_K;
     device const float* scale_row = scales + row * num_groups;
-    
+
     float sum = 0.0f;
-    
+
     // Each thread processes multiple groups
     for (uint g = tid; g < num_groups; g += tg_size) {
         float scale = scale_row[g];
         uint k_start = g * group_size;
         uint packed_start = k_start / 2;
-        
+
         float group_sum = 0.0f;
-        
+
         // Process group_size weights (packed_size bytes)
         for (uint i = 0; i < group_size; i += 2) {
             uint packed_idx = packed_start + i / 2;
             uint8_t packed_byte = weight_row[packed_idx];
-            
+
             // Extract two 4-bit unsigned weights
             // Q4_0 format: unsigned 4-bit ints [0-15] centered by subtracting 8
             // This gives effective range [-8, +7] without sign extension
             uint8_t w0 = packed_byte & 0x0F;
             uint8_t w1 = (packed_byte >> 4) & 0x0F;
-            
+
             // Q4_0 centering: subtract 8 to convert [0,15] -> [-8,+7]
             float f0 = (float(w0) - 8.0f) * scale;
             float f1 = (float(w1) - 8.0f) * scale;
-            
+
             group_sum = fma(f0, input[k_start + i], group_sum);
             if (k_start + i + 1 < K) {
                 group_sum = fma(f1, input[k_start + i + 1], group_sum);
             }
         }
-        
+
         sum += group_sum;
     }
-    
+
     shared_sum[tid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
             shared_sum[tid] += shared_sum[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     if (tid == 0) {
         output[row] = shared_sum[0];
     }
@@ -308,30 +308,30 @@ kernel void gemv_f32_batched(
 {
     uint batch = tgid.y;
     uint row = tgid.x;
-    
+
     if (batch >= B || row >= M) return;
-    
+
     threadgroup float shared_sum[THREADGROUP_SIZE];
-    
+
     device const float* input_batch = input + batch * K;
     device const float* weight_row = weight + row * K;
     device float* output_batch = output + batch * M;
-    
+
     float sum = 0.0f;
     for (uint k = tid; k < K; k += tg_size) {
         sum = fma(weight_row[k], input_batch[k], sum);
     }
-    
+
     shared_sum[tid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
             shared_sum[tid] += shared_sum[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     if (tid == 0) {
         output_batch[row] = shared_sum[0];
     }
@@ -354,26 +354,26 @@ kernel void gemv_f32_bias(
 {
     uint row = tgid;
     if (row >= M) return;
-    
+
     threadgroup float shared_sum[THREADGROUP_SIZE];
-    
+
     float sum = 0.0f;
     device const float* weight_row = weight + row * K;
-    
+
     for (uint k = tid; k < K; k += tg_size) {
         sum = fma(weight_row[k], input[k], sum);
     }
-    
+
     shared_sum[tid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
             shared_sum[tid] += shared_sum[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     if (tid == 0) {
         output[row] = shared_sum[0] + bias[row];
     }

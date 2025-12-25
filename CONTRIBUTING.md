@@ -318,15 +318,15 @@ def generate(
     temperature: float = 0.8,
 ) -> str:
     """Generate text completion.
-    
+
     Args:
         prompt: Input text prompt
         max_tokens: Maximum tokens to generate
         temperature: Sampling temperature (0.0 = deterministic)
-        
+
     Returns:
         Generated text string
-        
+
     Raises:
         InferenceError: If generation fails
     """
@@ -386,19 +386,19 @@ def test_basic_generation():
     """Test basic text generation works."""
     model = DenseCore("test_model.gguf")
     response = model.generate("Hello", max_tokens=10)
-    
+
     assert isinstance(response, str)
     assert len(response) > 0
-    
+
 @pytest.mark.asyncio
 async def test_async_streaming():
     """Test async streaming generation."""
     model = DenseCore("test_model.gguf")
     tokens = []
-    
+
     async for token in model.stream_async("Hello"):
         tokens.append(token)
-    
+
     assert len(tokens) > 0
 ```
 
@@ -410,10 +410,10 @@ async def test_async_streaming():
 
 void test_allocate_blocks() {
     PagedKVCache cache(1000);  // 1000 blocks
-    
+
     auto blocks = cache.AllocateBlocks(123, 32);  // seq_id=123, 32 tokens
     assert(blocks.size() == 2);  // 32 tokens / 16 per block = 2 blocks
-    
+
     cache.ReleaseSequence(123);
     assert(cache.GetUsedBlocks() == 0);
 }
@@ -497,29 +497,29 @@ Use Javadoc-style comments in header files:
 ```cpp
 /**
  * @brief Generate text completion
- * 
+ *
  * This function submits a text generation request to the inference engine
  * and invokes the callback for each generated token.
- * 
+ *
  * @param handle Handle to the DenseCore engine
  * @param prompt Input text prompt (null-terminated UTF-8)
  * @param max_tokens Maximum number of tokens to generate
  * @param callback Function to call for each token
  * @param user_data User pointer passed to callback
  * @return Request ID (positive) on success, negative error code on failure
- * 
+ *
  * @note The callback may be invoked from a different thread
  * @see SubmitRequestIds for pre-tokenized input
- * 
+ *
  * @code
  * void my_callback(const char* token, int finished, void* data) {
  *     printf("%s", token);
  * }
- * 
+ *
  * int req_id = SubmitRequest(engine, "Hello", 100, my_callback, NULL);
  * @endcode
  */
-int SubmitRequest(DenseCoreHandle handle, const char* prompt, 
+int SubmitRequest(DenseCoreHandle handle, const char* prompt,
                   int max_tokens, TokenCallback callback, void* user_data);
 ```
 

@@ -8,8 +8,8 @@ Supports INT4, INT8, and FP8 quantization with AWQ and SmoothQuant algorithms.
 import ctypes
 import json
 import os
-from dataclasses import dataclass, asdict
-from typing import Literal, Optional, Callable
+from dataclasses import asdict, dataclass
+from typing import Callable, Literal, Optional
 
 import densecore.engine as engine_mod
 
@@ -18,7 +18,7 @@ import densecore.engine as engine_mod
 class QuantConfig:
     """
     Quantization configuration (mirrors core/include/quantization_config.h)
-    
+
     Args:
         format: Quantization format ('fp16', 'fp8_e4m3', 'int8', 'int4_blockwise')
         algorithm: Quantization algorithm ('max', 'smoothquant', 'awq_lite', 'awq_clip')
@@ -27,11 +27,12 @@ class QuantConfig:
         quantize_activations: Whether to quantize activations (default False)
         skip_output_layer: Skip lm_head/output quantization (default True)
         skip_embeddings: Skip embedding layer quantization (default False)
-    
+
     Example:
         >>> config = QuantConfig(format="int4_blockwise", algorithm="awq_lite")
         >>> quantize_model("model.gguf", "model-q4.gguf", config)
     """
+
     format: Literal["fp16", "fp8_e4m3", "int8", "int4_blockwise"] = "int4_blockwise"
     algorithm: Literal["max", "smoothquant", "awq_lite", "awq_clip"] = "awq_lite"
     block_size: int = 128
@@ -50,7 +51,7 @@ except Exception:
     _lib = None
 
 # Define C function signatures
-if _lib is not None and hasattr(_lib, 'QuantizeModel'):
+if _lib is not None and hasattr(_lib, "QuantizeModel"):
     _lib.QuantizeModel.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
     _lib.QuantizeModel.restype = ctypes.c_int
 
@@ -74,57 +75,55 @@ def quantize_model(
 ) -> None:
     """
     Quantize a GGUF model.
-    
+
     Args:
         input_path: Path to input GGUF model
         output_path: Path to save quantized GGUF model
         config: Quantization configuration (defaults to INT4_AWQ_CFG)
         progress_callback: Optional callback(current, total, message) for progress
-    
+
     Raises:
         FileNotFoundError: If input model doesn't exist
         RuntimeError: If quantization fails
-    
+
     Example:
         >>> from densecore.quantize import quantize_model, INT4_AWQ_CFG
         >>> quantize_model("model.gguf", "model-q4.gguf", INT4_AWQ_CFG)
     """
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Model file not found: {input_path}")
-    
+
     if config is None:
         config = INT4_AWQ_CFG
-    
+
     # Ensure output directory exists
     output_dir = os.path.dirname(output_path)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
-    
+
     # Convert config to JSON
     config_dict = asdict(config)
     config_json = json.dumps(config_dict)
-    
+
     print(f"Quantizing '{input_path}' -> '{output_path}'")
     print(f"  Format: {config.format}")
     print(f"  Algorithm: {config.algorithm}")
     print(f"  Block size: {config.block_size}")
-    
-    if _lib is None or not hasattr(_lib, 'QuantizeModel'):
+
+    if _lib is None or not hasattr(_lib, "QuantizeModel"):
         raise RuntimeError(
             "DenseCore C++ library not available. "
             "Please rebuild the library with: cd core && mkdir -p build && cd build && cmake .. && make"
         )
-    
+
     ret = _lib.QuantizeModel(
-        input_path.encode('utf-8'),
-        output_path.encode('utf-8'),
-        config_json.encode('utf-8')
+        input_path.encode("utf-8"), output_path.encode("utf-8"), config_json.encode("utf-8")
     )
-    
+
     if ret != 0:
         error_msg = _ERROR_CODES.get(ret, f"Unknown error code: {ret}")
         raise RuntimeError(f"Quantization failed: {error_msg}")
-    
+
     print(f"Quantization successful! Output saved to: {output_path}")
 
 
@@ -172,4 +171,3 @@ __all__ = [
     "INT4_MAX_CFG",
     "INT8_MAX_CFG",
 ]
-

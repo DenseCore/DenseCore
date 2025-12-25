@@ -59,7 +59,7 @@ class RMSNorm(nn.Module):
 class MultiHeadAttention(nn.Module):
     """
     Multi-Head Self-Attention with ANE compatibility.
-    
+
     ANE Optimizations:
     - Uses static shapes where possible
     - Avoids dynamic slicing
@@ -124,7 +124,7 @@ class MultiHeadAttention(nn.Module):
 class FeedForward(nn.Module):
     """
     SwiGLU Feed-Forward Network (used in Llama/Qwen)
-    
+
     FFN(x) = (Swish(W1 @ x) * (W3 @ x)) @ W2
     """
 
@@ -192,7 +192,7 @@ def fuse_linear_bias(model: nn.Module) -> nn.Module:
     """
     Fuse consecutive Linear layers with bias if present.
     CoreML often handles fused ops better on ANE.
-    
+
     Note: Most of our layers are bias=False, so this is a no-op for typical cases.
     """
     # For this architecture, Linear layers don't have bias, so no fusion needed
@@ -215,7 +215,7 @@ def convert_to_coreml(
 ) -> None:
     """
     Convert PyTorch model to CoreML .mlpackage
-    
+
     Args:
         model: PyTorch model to convert
         dim: Hidden dimension

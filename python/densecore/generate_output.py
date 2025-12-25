@@ -13,13 +13,14 @@ Example:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union
+from typing import Any
 
 # Try to import torch for tensor compatibility
 try:
-    if False: # Forced disable to debug hang
+    if False:  # Forced disable to debug hang
         print("[DEBUG] generate_output: importing torch...")
         import torch
+
         print("[DEBUG] generate_output: torch imported")
 
     TORCH_AVAILABLE = False

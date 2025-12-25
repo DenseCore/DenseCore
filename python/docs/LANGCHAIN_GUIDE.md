@@ -479,7 +479,7 @@ print(result)  # "100"
 def route_based_on_query(state):
     """Route to different nodes based on query content."""
     query = state["messages"][-1].content.lower()
-    
+
     if "technical" in query or "code" in query:
         return "technical_expert"
     elif "creative" in query or "story" in query:
@@ -671,7 +671,7 @@ from langchain.callbacks.base import BaseCallbackHandler
 class CustomCallback(BaseCallbackHandler):
     def on_llm_start(self, serialized, prompts, **kwargs):
         print(f"LLM started with {len(prompts)} prompts")
-    
+
     def on_llm_end(self, response, **kwargs):
         print(f"LLM finished: {response}")
 

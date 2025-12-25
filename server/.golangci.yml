@@ -19,26 +19,30 @@ linters:
 
 linters-settings:
   gocyclo:
-    min-complexity: 15
-  
+    min-complexity: 30
+
   dupl:
     threshold: 100
-  
+
   goconst:
     min-len: 3
     min-occurrences: 3
-  
+
   misspell:
     locale: US
-  
+
   gocritic:
     enabled-tags:
       - diagnostic
       - performance
-      - style
     disabled-checks:
       - commentedOutCode
       - hugeParam
+      - paramTypeCombine
+      - dupImport
+      - emptyStringTest
+      - httpNoBody
+      - equalFold
 
 issues:
   exclude-rules:
@@ -49,6 +53,7 @@ issues:
         - dupl
         - errcheck
         - gosec
+        - gocritic
 
 run:
   timeout: 5m

@@ -95,12 +95,12 @@ affinity:
 model:
   # 'huggingface' to download at startup, 'pvc' to use existing volume, 'hostPath' for local testing
   source: huggingface
-  
+
   # For huggingface source
   repoId: "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
   filename: "qwen2.5-0.5b-instruct-q4_k_m.gguf"
   hfTokenSecret: "" # Name of secret containing HF_TOKEN key
-  
+
   # For pvc/hostPath source
   path: "/models"
   existingClaim: "" # For pvc

@@ -1,13 +1,14 @@
 """
 DenseCore setup.py
 """
+
 import os
+import shutil
 import subprocess
 import sys
-import shutil
 from pathlib import Path
 
-from setuptools import setup, find_packages, Extension
+from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 from setuptools.command.sdist import sdist
 
@@ -16,10 +17,12 @@ PROJECT_DIR = Path(__file__).parent.resolve()
 # Root directory (DenseCore/)
 ROOT_DIR = PROJECT_DIR.parent.resolve()
 
+
 class CMakeExtension(Extension):
-    def __init__(self, name, sourcedir=''):
+    def __init__(self, name, sourcedir=""):
         Extension.__init__(self, name, sources=[])
         self.sourcedir = os.path.abspath(sourcedir)
+
 
 class CMakeBuild(build_ext):
     def build_extension(self, ext):
@@ -62,20 +65,15 @@ class CMakeBuild(build_ext):
             os.makedirs(self.build_temp)
 
         # Config and Build
-        subprocess.check_call(
-            ["cmake", ext.sourcedir] + cmake_args,
-            cwd=self.build_temp
-        )
-        subprocess.check_call(
-            ["cmake", "--build", "."] + build_args,
-            cwd=self.build_temp
-        )
+        subprocess.check_call(["cmake", ext.sourcedir] + cmake_args, cwd=self.build_temp)
+        subprocess.check_call(["cmake", "--build", "."] + build_args, cwd=self.build_temp)
 
         # Find the built library and copy to the expected location
         # CMake outputs directly to build_temp because of its configuration
         cmake_output_dir = Path(self.build_temp).resolve()
-        
+
         import platform
+
         if platform.system() == "Windows":
             lib_patterns = ["densecore.dll", "libdensecore.dll"]
         elif platform.system() == "Darwin":
@@ -100,26 +98,29 @@ class CMakeBuild(build_ext):
                 f"Looked for {lib_patterns} in {cmake_output_dir}"
             )
 
+
 class CustomSdist(sdist):
     def run(self):
         # When creating a source distribution, we need to bundle the C++ source
         # into the package so that it can be built by users.
-        
+
         # 1. Define source and destination
         core_src = ROOT_DIR / "core"
         dest_dir = PROJECT_DIR / "densecore" / "core_src"
-        
+
         # 2. Check if we are in the repo
         if core_src.exists():
             print(f"Bundling C++ source from {core_src} to {dest_dir}...")
             if dest_dir.exists():
                 shutil.rmtree(dest_dir)
-            
+
             # Copy, ignoring build artifacts and hidden files
-            shutil.copytree(core_src, dest_dir, ignore=shutil.ignore_patterns(
-                "build", "bin", ".git", "*.pyc", "__pycache__"
-            ))
-            
+            shutil.copytree(
+                core_src,
+                dest_dir,
+                ignore=shutil.ignore_patterns("build", "bin", ".git", "*.pyc", "__pycache__"),
+            )
+
             # Also copy root files if needed (LICENSE, README)
             # README is already handled by setup() metadata, LICENSE usually via MANIFEST.in
             # But let's verify LICENSE existence
@@ -128,34 +129,37 @@ class CustomSdist(sdist):
                 shutil.copy(license_src, PROJECT_DIR / "LICENSE")
 
         else:
-             print("Warning: ../core not found. Assuming we are already in an sdist or simplified environment.")
+            print(
+                "Warning: ../core not found. Assuming we are already in an sdist or simplified environment."
+            )
 
         # 3. Run the standard sdist command
         super().run()
-        
+
         # 4. Cleanup (optional, but keeps the tree clean)
         if dest_dir.exists():
-             print(f"Cleaning up {dest_dir}...")
-             shutil.rmtree(dest_dir)
+            print(f"Cleaning up {dest_dir}...")
+            shutil.rmtree(dest_dir)
         if (PROJECT_DIR / "LICENSE").exists():
             os.remove(PROJECT_DIR / "LICENSE")
 
+
 # Read long description from README
-readme_path = PROJECT_DIR / 'README.md'
+readme_path = PROJECT_DIR / "README.md"
 long_description = ""
 if readme_path.exists():
-    with open(readme_path, encoding='utf-8') as f:
+    with open(readme_path, encoding="utf-8") as f:
         long_description = f.read()
 
 setup(
-    name='densecore',
-    version='2.0.0',
-    author='DenseCore Team',
-    author_email='jake@densecore.ai',
-    description='High-Performance CPU Inference Engine for LLMs with HuggingFace Integration',
+    name="densecore",
+    version="2.0.0",
+    author="DenseCore Team",
+    author_email="jake@densecore.ai",
+    description="High-Performance CPU Inference Engine for LLMs with HuggingFace Integration",
     long_description=long_description,
-    long_description_content_type='text/markdown',
-    url='https://github.com/Jake-Network/DenseCore',
+    long_description_content_type="text/markdown",
+    url="https://github.com/Jake-Network/DenseCore",
     packages=find_packages(),
     # Add CMakeExtension
     ext_modules=[CMakeExtension("densecore.libdensecore")],
@@ -164,56 +168,56 @@ setup(
         "sdist": CustomSdist,
     },
     classifiers=[
-        'Development Status :: 4 - Beta',
-        'Intended Audience :: Developers',
-        'Intended Audience :: Science/Research',
-        'Topic :: Scientific/Engineering :: Artificial Intelligence',
-        'License :: OSI Approved :: Apache Software License',
-        'Operating System :: POSIX :: Linux',
-        'Operating System :: Microsoft :: Windows',
-        'Programming Language :: C++',
-        'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.9',
-        'Programming Language :: Python :: 3.10',
-        'Programming Language :: Python :: 3.11',
-        'Programming Language :: Python :: 3.12',
+        "Development Status :: 4 - Beta",
+        "Intended Audience :: Developers",
+        "Intended Audience :: Science/Research",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+        "License :: OSI Approved :: Apache Software License",
+        "Operating System :: POSIX :: Linux",
+        "Operating System :: Microsoft :: Windows",
+        "Programming Language :: C++",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
     ],
-    python_requires='>=3.9',
+    python_requires=">=3.9",
     install_requires=[
         # Minimal dependencies for lightweight mode (pure C++ binding)
-        'numpy>=1.20.0',
+        "numpy>=1.20.0",
         'typing-extensions>=4.0.0;python_version<"3.10"',
     ],
     extras_require={
-        'full': [
+        "full": [
             # Heavy ML dependencies for HuggingFace integration
-            'torch>=2.0.0',
-            'transformers>=4.35.0',
-            'huggingface-hub>=0.20.0',
-            'tokenizers>=0.15.0',
+            "torch>=2.0.0",
+            "transformers>=4.35.0",
+            "huggingface-hub>=0.20.0",
+            "tokenizers>=0.15.0",
         ],
-        'langchain': [
-            'langchain-core>=0.1.0',
-            'langchain-community>=0.0.20',
-            'langchain>=0.1.0',
-            'langgraph>=0.0.20',
+        "langchain": [
+            "langchain-core>=0.1.0",
+            "langchain-community>=0.0.20",
+            "langchain>=0.1.0",
+            "langgraph>=0.0.20",
         ],
-        'dev': [
-            'pytest>=7.0',
-            'pytest-cov>=4.0',
-            'pytest-asyncio>=0.21.0',
-            'mypy>=1.0',
-            'ruff>=0.1.0',
-            'black>=23.0',
+        "dev": [
+            "pytest>=7.0",
+            "pytest-cov>=4.0",
+            "pytest-asyncio>=0.21.0",
+            "mypy>=1.0",
+            "ruff>=0.1.0",
+            "black>=23.0",
         ],
-        'docs': [
-            'sphinx>=7.0',
-            'sphinx-rtd-theme>=2.0',
-            'myst-parser>=2.0',
+        "docs": [
+            "sphinx>=7.0",
+            "sphinx-rtd-theme>=2.0",
+            "myst-parser>=2.0",
         ],
     },
     package_data={
-        'densecore': ['py.typed', '*.so', '*.dll'],
+        "densecore": ["py.typed", "*.so", "*.dll"],
     },
     include_package_data=True,
     zip_safe=False,

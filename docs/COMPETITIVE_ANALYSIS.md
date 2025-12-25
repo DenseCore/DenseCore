@@ -1,7 +1,7 @@
 # 🛡️ DenseCore Competitive Analysis & Market Positioning
 
-**Date:** 2025-12-13  
-**Author:** DenseCore Architecture Team  
+**Date:** 2025-12-13
+**Author:** DenseCore Architecture Team
 **Review Perspective:** Head Solution Architect / Product Owner (AWS, Google Cloud, Intel, HF)
 
 ---
@@ -42,7 +42,7 @@ Its primary strength lies in **Total Cost of Ownership (TCO)** and **Operational
 
 *   **Reality Check**: access memory bandwidth on H100 GPU (3TB/s) vs DDR4 RAM (50GB/s) is a 60x difference. DenseCore will never beat vLLM on raw throughput.
 *   **The "Good Enough" Threshold**: For SLMs (e.g., Qwen2.5-0.5B), DenseCore achieves **28 TPS** on cheap CPUs. This crosses the "real-time reading speed" threshold.
-*   **TCO**: 
+*   **TCO**:
     *   **vLLM Cluster**: Requires expensive GPU instances (e.g., `g5.xlarge` @ ~$1.00/hr). High idle cost.
     *   **DenseCore Fleet**: Runs on spot CPU instances (e.g., `c7i.large` @ ~$0.08/hr).
 *   **Verdict**: DenseCore wins on **Cost-Efficiency** for models <4B parameters.

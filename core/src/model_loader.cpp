@@ -1,12 +1,15 @@
 #include "model_loader.h"
-#include "hardware_topology.h"
-#include "inference.h" // For InitRoPETable
-#include "numa_allocator.h"
-#include <cstring>
+
 #include <ggml-cpu.h>
+
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <thread>
+
+#include "hardware_topology.h"
+#include "inference.h"  // For InitRoPETable
+#include "numa_allocator.h"
 
 // ============================================================================
 // Mock Model (Test Build Only)
@@ -17,590 +20,551 @@
  * Creates a mock model for testing purposes.
  * Only available when DENSECORE_TEST_BUILD is defined.
  */
-static TransformerModel *CreateMockModel() {
-  std::cout << "[DenseCore] Initializing MOCK model..." << std::endl;
-  TransformerModel *model = new TransformerModel();
-  model->is_mock = true;
-  model->hparams.n_vocab = 32000;
-  model->hparams.n_embd = 256;
-  model->hparams.n_layer = 2; // Small for mock
-  model->hparams.n_head = 8;
-  model->hparams.n_head_kv = 8;
-  model->hparams.n_rot = 64;
+static TransformerModel* CreateMockModel() {
+    std::cout << "[DenseCore] Initializing MOCK model..." << std::endl;
+    TransformerModel* model = new TransformerModel();
+    model->is_mock = true;
+    model->hparams.n_vocab = 32000;
+    model->hparams.n_embd = 256;
+    model->hparams.n_layer = 2;  // Small for mock
+    model->hparams.n_head = 8;
+    model->hparams.n_head_kv = 8;
+    model->hparams.n_rot = 64;
 
-  // Mock vocab
-  for (int i = 0; i < 32000; i++) {
-    std::string s = "t" + std::to_string(i);
-    model->vocab_tokens.push_back(s);
-    model->token_to_id[s] = i;
-  }
+    // Mock vocab
+    for (int i = 0; i < 32000; i++) {
+        std::string s = "t" + std::to_string(i);
+        model->vocab_tokens.push_back(s);
+        model->token_to_id[s] = i;
+    }
 
-  // Initialize backend
-  model->backend = ggml_backend_cpu_init();
-  if (!model->backend) {
-    std::cerr << "[DenseCore] Error: Failed to initialize CPU backend"
-              << std::endl;
-    delete model;
-    return nullptr;
-  }
+    // Initialize backend
+    model->backend = ggml_backend_cpu_init();
+    if (!model->backend) {
+        std::cerr << "[DenseCore] Error: Failed to initialize CPU backend" << std::endl;
+        delete model;
+        return nullptr;
+    }
 
-  // Allocate dummy weights
-  struct ggml_init_params params = {
-      .mem_size = 1024LL * 1024LL * 1024LL * 2LL, // 2 GB for dummy weights
-      .mem_buffer = nullptr,
-      .no_alloc = false,
-  };
-  model->ctx_w = ggml_init(params);
+    // Allocate dummy weights
+    struct ggml_init_params params = {
+        .mem_size = 1024LL * 1024LL * 1024LL * 2LL,  // 2 GB for dummy weights
+        .mem_buffer = nullptr,
+        .no_alloc = false,
+    };
+    model->ctx_w = ggml_init(params);
 
-  auto create_tensor = [&](int ne0, int ne1) {
-    struct ggml_tensor *t =
-        ggml_new_tensor_2d(model->ctx_w, GGML_TYPE_F32, ne0, ne1);
-    ggml_set_f32(t, 0.01f); // Set to small value
-    return t;
-  };
+    auto create_tensor = [&](int ne0, int ne1) {
+        struct ggml_tensor* t = ggml_new_tensor_2d(model->ctx_w, GGML_TYPE_F32, ne0, ne1);
+        ggml_set_f32(t, 0.01f);  // Set to small value
+        return t;
+    };
 
-  auto create_tensor_1d = [&](int ne0) {
-    struct ggml_tensor *t =
-        ggml_new_tensor_1d(model->ctx_w, GGML_TYPE_F32, ne0);
-    ggml_set_f32(t, 0.01f);
-    return t;
-  };
+    auto create_tensor_1d = [&](int ne0) {
+        struct ggml_tensor* t = ggml_new_tensor_1d(model->ctx_w, GGML_TYPE_F32, ne0);
+        ggml_set_f32(t, 0.01f);
+        return t;
+    };
 
-  model->tok_embeddings =
-      create_tensor(model->hparams.n_embd, model->hparams.n_vocab);
-  model->output_norm = create_tensor_1d(model->hparams.n_embd);
-  model->output = create_tensor(model->hparams.n_embd, model->hparams.n_vocab);
+    model->tok_embeddings = create_tensor(model->hparams.n_embd, model->hparams.n_vocab);
+    model->output_norm = create_tensor_1d(model->hparams.n_embd);
+    model->output = create_tensor(model->hparams.n_embd, model->hparams.n_vocab);
 
-  model->layers.resize(model->hparams.n_layer);
-  for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
-    model->layers[i].attention_norm = create_tensor_1d(model->hparams.n_embd);
-    model->layers[i].ffn_norm = create_tensor_1d(model->hparams.n_embd);
+    model->layers.resize(model->hparams.n_layer);
+    for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
+        model->layers[i].attention_norm = create_tensor_1d(model->hparams.n_embd);
+        model->layers[i].ffn_norm = create_tensor_1d(model->hparams.n_embd);
 
-    model->layers[i].wq =
-        create_tensor(model->hparams.n_embd, model->hparams.n_embd);
-    model->layers[i].wk =
-        create_tensor(model->hparams.n_embd, model->hparams.n_embd);
-    model->layers[i].wv =
-        create_tensor(model->hparams.n_embd, model->hparams.n_embd);
-    model->layers[i].wo =
-        create_tensor(model->hparams.n_embd, model->hparams.n_embd);
+        model->layers[i].wq = create_tensor(model->hparams.n_embd, model->hparams.n_embd);
+        model->layers[i].wk = create_tensor(model->hparams.n_embd, model->hparams.n_embd);
+        model->layers[i].wv = create_tensor(model->hparams.n_embd, model->hparams.n_embd);
+        model->layers[i].wo = create_tensor(model->hparams.n_embd, model->hparams.n_embd);
 
-    model->layers[i].w1 =
-        create_tensor(model->hparams.n_embd, model->hparams.n_embd * 4);
-    model->layers[i].w2 =
-        create_tensor(model->hparams.n_embd * 4, model->hparams.n_embd);
-    model->layers[i].w3 =
-        create_tensor(model->hparams.n_embd, model->hparams.n_embd * 4);
-  }
+        model->layers[i].w1 = create_tensor(model->hparams.n_embd, model->hparams.n_embd * 4);
+        model->layers[i].w2 = create_tensor(model->hparams.n_embd * 4, model->hparams.n_embd);
+        model->layers[i].w3 = create_tensor(model->hparams.n_embd, model->hparams.n_embd * 4);
+    }
 
-  return model;
+    return model;
 }
-#endif // DENSECORE_TEST_BUILD
+#endif  // DENSECORE_TEST_BUILD
 
 // ============================================================================
 // LoadGGUFModel
 // ============================================================================
 
-TransformerModel *LoadGGUFModel(const char *path) {
-  if (!path) {
-    std::cerr << "Error: Model path is NULL" << std::endl;
-    return nullptr;
-  }
-  std::cout << "[DenseCore] Loading model from '" << path << "'..."
-            << std::endl;
+TransformerModel* LoadGGUFModel(const char* path) {
+    if (!path) {
+        std::cerr << "Error: Model path is NULL" << std::endl;
+        return nullptr;
+    }
+    std::cout << "[DenseCore] Loading model from '" << path << "'..." << std::endl;
 
-  struct gguf_init_params params = {
-      .no_alloc = false,
-      .ctx = nullptr,
-  };
+    struct gguf_init_params params = {
+        .no_alloc = false,
+        .ctx = nullptr,
+    };
 
-  struct ggml_context *ctx_w = nullptr;
-  params.ctx = &ctx_w;
+    struct ggml_context* ctx_w = nullptr;
+    params.ctx = &ctx_w;
 
 #ifdef DENSECORE_TEST_BUILD
-  if (std::string(path) == "mock") {
-    return CreateMockModel();
-  }
+    if (std::string(path) == "mock") {
+        return CreateMockModel();
+    }
 #else
-  if (std::string(path) == "mock") {
-    std::cerr << "[DenseCore] Error: Mock model not available in release build"
-              << std::endl;
-    return nullptr;
-  }
+    if (std::string(path) == "mock") {
+        std::cerr << "[DenseCore] Error: Mock model not available in release build" << std::endl;
+        return nullptr;
+    }
 #endif
 
-  struct gguf_context *ctx_gguf = gguf_init_from_file(path, params);
-  if (!ctx_gguf) {
-    std::cerr << "[DenseCore] Error: Failed to load GGUF file" << std::endl;
-    return nullptr;
-  }
-
-  TransformerModel *model = new TransformerModel();
-  model->ctx_gguf = ctx_gguf;
-  model->ctx_w = ctx_w;
-
-  // 1. Detect architecture from GGUF metadata
-  std::string arch = "llama"; // default fallback
-  int idx_arch = gguf_find_key(ctx_gguf, "general.architecture");
-  if (idx_arch != -1) {
-    arch = gguf_get_val_str(ctx_gguf, idx_arch);
-  }
-
-  std::cout << "[DenseCore] Detected architecture: " << arch << std::endl;
-
-  // Set architecture enum and flags from detected string
-  if (arch == "llama") {
-    model->arch = ModelArch::LLAMA;
-  } else if (arch == "qwen2") {
-    model->arch = ModelArch::QWEN2;
-  } else if (arch == "qwen3") {
-    model->arch = ModelArch::QWEN3;
-    model->arch_flags.requires_q_norm = true;
-    model->arch_flags.requires_k_norm = true;
-  } else {
-    model->arch = ModelArch::UNKNOWN;
-  }
-
-  // 2. Generic parameter loader using architecture prefix
-  auto get_u32 = [&](const std::string &suffix, uint32_t &val) {
-    // Try architecture-specific key first, then fallback to general
-    std::string key = arch + "." + suffix;
-    int idx = gguf_find_key(ctx_gguf, key.c_str());
-    if (idx == -1) {
-      // Fallback to "general." prefix
-      key = "general." + suffix;
-      idx = gguf_find_key(ctx_gguf, key.c_str());
+    struct gguf_context* ctx_gguf = gguf_init_from_file(path, params);
+    if (!ctx_gguf) {
+        std::cerr << "[DenseCore] Error: Failed to load GGUF file" << std::endl;
+        return nullptr;
     }
-    if (idx != -1) {
-      val = gguf_get_val_u32(ctx_gguf, idx);
+
+    TransformerModel* model = new TransformerModel();
+    model->ctx_gguf = ctx_gguf;
+    model->ctx_w = ctx_w;
+
+    // 1. Detect architecture from GGUF metadata
+    std::string arch = "llama";  // default fallback
+    int idx_arch = gguf_find_key(ctx_gguf, "general.architecture");
+    if (idx_arch != -1) {
+        arch = gguf_get_val_str(ctx_gguf, idx_arch);
     }
-  };
 
-  auto get_f32 = [&](const std::string &suffix, float &val) {
-    std::string key = arch + "." + suffix;
-    int idx = gguf_find_key(ctx_gguf, key.c_str());
-    if (idx == -1) {
-      key = "general." + suffix;
-      idx = gguf_find_key(ctx_gguf, key.c_str());
+    std::cout << "[DenseCore] Detected architecture: " << arch << std::endl;
+
+    // Set architecture enum and flags from detected string
+    if (arch == "llama") {
+        model->arch = ModelArch::LLAMA;
+    } else if (arch == "qwen2") {
+        model->arch = ModelArch::QWEN2;
+    } else if (arch == "qwen3") {
+        model->arch = ModelArch::QWEN3;
+        model->arch_flags.requires_q_norm = true;
+        model->arch_flags.requires_k_norm = true;
+    } else {
+        model->arch = ModelArch::UNKNOWN;
     }
-    if (idx != -1) {
-      val = gguf_get_val_f32(ctx_gguf, idx);
+
+    // 2. Generic parameter loader using architecture prefix
+    auto get_u32 = [&](const std::string& suffix, uint32_t& val) {
+        // Try architecture-specific key first, then fallback to general
+        std::string key = arch + "." + suffix;
+        int idx = gguf_find_key(ctx_gguf, key.c_str());
+        if (idx == -1) {
+            // Fallback to "general." prefix
+            key = "general." + suffix;
+            idx = gguf_find_key(ctx_gguf, key.c_str());
+        }
+        if (idx != -1) {
+            val = gguf_get_val_u32(ctx_gguf, idx);
+        }
+    };
+
+    auto get_f32 = [&](const std::string& suffix, float& val) {
+        std::string key = arch + "." + suffix;
+        int idx = gguf_find_key(ctx_gguf, key.c_str());
+        if (idx == -1) {
+            key = "general." + suffix;
+            idx = gguf_find_key(ctx_gguf, key.c_str());
+        }
+        if (idx != -1) {
+            val = gguf_get_val_f32(ctx_gguf, idx);
+        }
+    };
+
+    // Load hyperparameters using dynamic architecture prefix
+    get_u32("vocab_size", model->hparams.n_vocab);
+    get_u32("embedding_length", model->hparams.n_embd);
+    get_u32("block_count", model->hparams.n_layer);
+    get_u32("attention.head_count", model->hparams.n_head);
+    get_u32("attention.head_count_kv", model->hparams.n_head_kv);
+    get_u32("context_length", model->hparams.n_ctx);
+
+    if (model->hparams.n_head_kv == 0)
+        model->hparams.n_head_kv = model->hparams.n_head;
+
+    // Calculate n_rot (rotary embedding dimension)
+    model->hparams.n_rot = model->hparams.n_embd / model->hparams.n_head;
+
+    // llama.cpp style: Load head dimensions from GGUF
+    get_u32("attention.key_length", model->hparams.n_embd_head_k);
+    get_u32("attention.value_length", model->hparams.n_embd_head_v);
+
+    // Fix: Update n_rot if head dimension is explicitly specified and differs
+    if (model->hparams.n_embd_head_k > 0 && model->hparams.n_embd_head_k != model->hparams.n_rot) {
+        std::cout << "[DenseCore] Updating n_rot (" << model->hparams.n_rot
+                  << ") to match head_dim (" << model->hparams.n_embd_head_k << ")" << std::endl;
+        model->hparams.n_rot = model->hparams.n_embd_head_k;
     }
-  };
 
-  // Load hyperparameters using dynamic architecture prefix
-  get_u32("vocab_size", model->hparams.n_vocab);
-  get_u32("embedding_length", model->hparams.n_embd);
-  get_u32("block_count", model->hparams.n_layer);
-  get_u32("attention.head_count", model->hparams.n_head);
-  get_u32("attention.head_count_kv", model->hparams.n_head_kv);
-  get_u32("context_length", model->hparams.n_ctx);
+    // Load RMS epsilon
+    model->hparams.f_norm_rms_eps = 1e-5f;
+    get_f32("attention.layer_norm_rms_epsilon", model->hparams.f_norm_rms_eps);
 
-  if (model->hparams.n_head_kv == 0)
-    model->hparams.n_head_kv = model->hparams.n_head;
-
-  // Calculate n_rot (rotary embedding dimension)
-  model->hparams.n_rot = model->hparams.n_embd / model->hparams.n_head;
-
-  // llama.cpp style: Load head dimensions from GGUF
-  get_u32("attention.key_length", model->hparams.n_embd_head_k);
-  get_u32("attention.value_length", model->hparams.n_embd_head_v);
-
-  // Fix: Update n_rot if head dimension is explicitly specified and differs
-  if (model->hparams.n_embd_head_k > 0 &&
-      model->hparams.n_embd_head_k != model->hparams.n_rot) {
-    std::cout << "[DenseCore] Updating n_rot (" << model->hparams.n_rot
-              << ") to match head_dim (" << model->hparams.n_embd_head_k << ")"
+    std::cout << "[DenseCore] Loaded RMS norm epsilon: " << model->hparams.f_norm_rms_eps
               << std::endl;
-    model->hparams.n_rot = model->hparams.n_embd_head_k;
-  }
 
-  // Load RMS epsilon
-  model->hparams.f_norm_rms_eps = 1e-5f;
-  get_f32("attention.layer_norm_rms_epsilon", model->hparams.f_norm_rms_eps);
+    // Load RoPE parameters
+    get_f32("rope.freq_base", model->hparams.rope_freq_base);
+    get_f32("rope.freq_scale", model->hparams.rope_freq_scale);
 
-  std::cout << "[DenseCore] Loaded RMS norm epsilon: "
-            << model->hparams.f_norm_rms_eps << std::endl;
+    // Load BOS/EOS token IDs from tokenizer metadata
+    int idx_bos = gguf_find_key(ctx_gguf, "tokenizer.ggml.bos_token_id");
+    if (idx_bos != -1)
+        model->bos_token_id = gguf_get_val_u32(ctx_gguf, idx_bos);
 
-  // Load RoPE parameters
-  get_f32("rope.freq_base", model->hparams.rope_freq_base);
-  get_f32("rope.freq_scale", model->hparams.rope_freq_scale);
+    int idx_eos = gguf_find_key(ctx_gguf, "tokenizer.ggml.eos_token_id");
+    if (idx_eos != -1)
+        model->eos_token_id = gguf_get_val_u32(ctx_gguf, idx_eos);
 
-  // Load BOS/EOS token IDs from tokenizer metadata
-  int idx_bos = gguf_find_key(ctx_gguf, "tokenizer.ggml.bos_token_id");
-  if (idx_bos != -1)
-    model->bos_token_id = gguf_get_val_u32(ctx_gguf, idx_bos);
-
-  int idx_eos = gguf_find_key(ctx_gguf, "tokenizer.ggml.eos_token_id");
-  if (idx_eos != -1)
-    model->eos_token_id = gguf_get_val_u32(ctx_gguf, idx_eos);
-
-  // Check if model actually wants BOS added
-  int idx_add_bos = gguf_find_key(ctx_gguf, "tokenizer.ggml.add_bos_token");
-  bool add_bos = true;
-  if (idx_add_bos != -1) {
-    add_bos = gguf_get_val_bool(ctx_gguf, idx_add_bos);
-  }
-
-  // Disable BOS if BOS equals PAD token
-  int idx_pad = gguf_find_key(ctx_gguf, "tokenizer.ggml.padding_token_id");
-  if (idx_pad != -1) {
-    uint32_t pad_id = gguf_get_val_u32(ctx_gguf, idx_pad);
-    if (model->bos_token_id == (int)pad_id) {
-      std::cout << "[DenseCore] BOS == PAD, disabling BOS (model likely "
-                   "doesn't use BOS)"
-                << std::endl;
-      add_bos = false;
-    }
-  }
-
-  if (!add_bos) {
-    model->bos_token_id = -1;
-  }
-
-  std::cout << "[DenseCore] Model params: "
-            << "n_vocab=" << model->hparams.n_vocab << ", "
-            << "n_embd=" << model->hparams.n_embd << ", "
-            << "n_layer=" << model->hparams.n_layer << ", "
-            << "n_head=" << model->hparams.n_head << ", "
-            << "n_head_kv=" << model->hparams.n_head_kv << ", "
-            << "n_rot=" << model->hparams.n_rot << ", "
-            << "n_ctx=" << model->hparams.n_ctx << std::endl;
-  std::cout << "[DenseCore] BOS=" << model->bos_token_id
-            << ", EOS=" << model->eos_token_id
-            << ", rope_freq=" << model->hparams.rope_freq_base
-            << ", rope_scale=" << model->hparams.rope_freq_scale << std::endl;
-
-  // 2. Load Vocab
-  int token_idx = gguf_find_key(ctx_gguf, "tokenizer.ggml.tokens");
-  if (token_idx != -1) {
-    int n_tokens = gguf_get_arr_n(ctx_gguf, token_idx);
-    model->vocab_tokens.reserve(n_tokens);
-    for (int i = 0; i < n_tokens; i++) {
-      const char *str = gguf_get_arr_str(ctx_gguf, token_idx, i);
-      std::string s(str);
-      model->vocab_tokens.push_back(s);
-      model->token_to_id[s] = i;
+    // Check if model actually wants BOS added
+    int idx_add_bos = gguf_find_key(ctx_gguf, "tokenizer.ggml.add_bos_token");
+    bool add_bos = true;
+    if (idx_add_bos != -1) {
+        add_bos = gguf_get_val_bool(ctx_gguf, idx_add_bos);
     }
 
-    // Update n_vocab to match actual loaded vocab size
-    if (n_tokens != (int)model->hparams.n_vocab) {
-      std::cout << "[DenseCore] Vocab size mismatch! Metadata="
-                << model->hparams.n_vocab << " but loaded " << n_tokens
-                << " tokens. Updating to " << n_tokens << std::endl;
-      model->hparams.n_vocab = n_tokens;
-    }
-  }
-
-  // 3. Initialize backend with error checking
-  model->backend = ggml_backend_cpu_init();
-  if (!model->backend) {
-    std::cerr << "[DenseCore] Error: Failed to initialize CPU backend"
-              << std::endl;
-    gguf_free(ctx_gguf);
-    if (ctx_w)
-      ggml_free(ctx_w);
-    delete model;
-    return nullptr;
-  }
-
-  // 4. Map Tensors
-  model->layers.resize(model->hparams.n_layer);
-
-  auto get_tensor = [&](const std::string &name) -> struct ggml_tensor * {
-    struct ggml_tensor *t = ggml_get_tensor(model->ctx_w, name.c_str());
-    return t;
-  };
-
-  // Helper with fallback: tries primary key, then fallback without ".weight"
-  // suffix
-  auto get_tensor_with_fallback =
-      [&](const std::string &primary) -> struct ggml_tensor * {
-    struct ggml_tensor *t = ggml_get_tensor(model->ctx_w, primary.c_str());
-    if (t)
-      return t;
-
-    // Fallback: strip ".weight" suffix if present and try again
-    const std::string suffix = ".weight";
-    if (primary.size() > suffix.size() &&
-        primary.compare(primary.size() - suffix.size(), suffix.size(),
-                        suffix) == 0) {
-      std::string fallback = primary.substr(0, primary.size() - suffix.size());
-      t = ggml_get_tensor(model->ctx_w, fallback.c_str());
-    }
-    return t;
-  };
-
-  model->tok_embeddings = get_tensor("token_embd.weight");
-  model->output_norm = get_tensor("output_norm.weight");
-
-  // Try multiple possible names for lm_head/output projection
-  model->output = get_tensor("output.weight");
-  if (!model->output) {
-    model->output = get_tensor("lm_head.weight");
-  }
-  // Tie embeddings fallback
-  if (!model->output && model->tok_embeddings) {
-    std::cout << "[DenseCore] output.weight not found, using tied embeddings"
-              << std::endl;
-    model->output = model->tok_embeddings;
-    model->tied_embeddings = true;
-  }
-
-  if (!model->output) {
-    std::cout
-        << "[DenseCore] CRITICAL ERROR: Could not find output weight tensor!"
-        << std::endl;
-    std::cout << "[DenseCore] Available tensors:" << std::endl;
-    struct ggml_tensor *t = ggml_get_first_tensor(model->ctx_w);
-    while (t) {
-      std::cout << "  - " << t->name << " [" << t->ne[0] << ", " << t->ne[1]
-                << "]" << std::endl;
-      t = ggml_get_next_tensor(model->ctx_w, t);
-    }
-  }
-
-  // Debug: Print tensor shapes
-  if (model->tok_embeddings) {
-    std::cout << "[DenseCore] tok_embeddings shape: ["
-              << model->tok_embeddings->ne[0] << ", "
-              << model->tok_embeddings->ne[1] << "]" << std::endl;
-  }
-  if (model->output) {
-    std::cout << "[DenseCore] output shape: [" << model->output->ne[0] << ", "
-              << model->output->ne[1] << "]" << std::endl;
-
-    // Validate n_vocab matches output tensor shape
-    uint32_t tensor_vocab_size = model->output->ne[1];
-    if (tensor_vocab_size != model->hparams.n_vocab && tensor_vocab_size > 0) {
-      std::cout << "[DenseCore] ERROR: Vocab size inconsistency! "
-                << "Loaded vocab=" << model->hparams.n_vocab
-                << " but output tensor expects " << tensor_vocab_size
-                << " tokens." << std::endl;
-      std::cout << "[DenseCore] This will cause garbage output. "
-                << "Check GGUF file integrity." << std::endl;
-
-      if (tensor_vocab_size > model->hparams.n_vocab) {
-        std::cout
-            << "[DenseCore] WARNING: Tensor vocab larger than loaded vocab. "
-            << "Some tokens may not decode properly." << std::endl;
-      }
-    }
-  }
-
-  for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
-    std::string layer_prefix = "blk." + std::to_string(i) + ".";
-
-    model->layers[i].attention_norm =
-        get_tensor(layer_prefix + "attn_norm.weight");
-    model->layers[i].ffn_norm = get_tensor(layer_prefix + "ffn_norm.weight");
-
-    model->layers[i].wq = get_tensor(layer_prefix + "attn_q.weight");
-    model->layers[i].wk = get_tensor(layer_prefix + "attn_k.weight");
-    model->layers[i].wv = get_tensor(layer_prefix + "attn_v.weight");
-    model->layers[i].wo = get_tensor(layer_prefix + "attn_output.weight");
-
-    model->layers[i].bq = get_tensor(layer_prefix + "attn_q.bias");
-    model->layers[i].bk = get_tensor(layer_prefix + "attn_k.bias");
-    model->layers[i].bv = get_tensor(layer_prefix + "attn_v.bias");
-    model->layers[i].bo = get_tensor(layer_prefix + "attn_output.bias");
-
-    // QK-Norm (Qwen3) - uses fallback for different GGUF naming conventions
-    model->layers[i].attn_q_norm =
-        get_tensor_with_fallback(layer_prefix + "attn_q_norm.weight");
-    model->layers[i].attn_k_norm =
-        get_tensor_with_fallback(layer_prefix + "attn_k_norm.weight");
-
-    if (i == 0) {
-      if (model->layers[i].attn_q_norm && model->layers[i].attn_k_norm) {
-        std::cout
-            << "[DenseCore] Qwen3 architecture detected: Q/K Norms enabled"
-            << std::endl;
-        std::cout << "[DenseCore]   attn_q_norm shape: ["
-                  << model->layers[i].attn_q_norm->ne[0] << "]" << std::endl;
-        std::cout << "[DenseCore]   attn_k_norm shape: ["
-                  << model->layers[i].attn_k_norm->ne[0] << "]" << std::endl;
-      }
+    // Disable BOS if BOS equals PAD token
+    int idx_pad = gguf_find_key(ctx_gguf, "tokenizer.ggml.padding_token_id");
+    if (idx_pad != -1) {
+        uint32_t pad_id = gguf_get_val_u32(ctx_gguf, idx_pad);
+        if (model->bos_token_id == (int)pad_id) {
+            std::cout << "[DenseCore] BOS == PAD, disabling BOS (model likely "
+                         "doesn't use BOS)"
+                      << std::endl;
+            add_bos = false;
+        }
     }
 
-    model->layers[i].w1 = get_tensor(layer_prefix + "ffn_gate.weight");
-    model->layers[i].w2 = get_tensor(layer_prefix + "ffn_down.weight");
-    model->layers[i].w3 = get_tensor(layer_prefix + "ffn_up.weight");
-  }
+    if (!add_bos) {
+        model->bos_token_id = -1;
+    }
 
-  // Auto-compute head dimensions from weight tensor shapes
-  if (model->hparams.n_embd_head_k == 0 && model->layers[0].wk) {
-    model->hparams.n_embd_head_k =
-        model->layers[0].wk->ne[1] / model->hparams.n_head_kv;
-  }
-  if (model->hparams.n_embd_head_v == 0 && model->layers[0].wv) {
-    model->hparams.n_embd_head_v =
-        model->layers[0].wv->ne[1] / model->hparams.n_head_kv;
-  }
-  // Fallback to n_embd/n_head
-  if (model->hparams.n_embd_head_k == 0) {
-    model->hparams.n_embd_head_k =
-        model->hparams.n_embd / model->hparams.n_head;
-  }
-  if (model->hparams.n_embd_head_v == 0) {
-    model->hparams.n_embd_head_v =
-        model->hparams.n_embd / model->hparams.n_head;
-  }
+    std::cout << "[DenseCore] Model params: "
+              << "n_vocab=" << model->hparams.n_vocab << ", "
+              << "n_embd=" << model->hparams.n_embd << ", "
+              << "n_layer=" << model->hparams.n_layer << ", "
+              << "n_head=" << model->hparams.n_head << ", "
+              << "n_head_kv=" << model->hparams.n_head_kv << ", "
+              << "n_rot=" << model->hparams.n_rot << ", "
+              << "n_ctx=" << model->hparams.n_ctx << std::endl;
+    std::cout << "[DenseCore] BOS=" << model->bos_token_id << ", EOS=" << model->eos_token_id
+              << ", rope_freq=" << model->hparams.rope_freq_base
+              << ", rope_scale=" << model->hparams.rope_freq_scale << std::endl;
 
-  std::cout << "[DenseCore] Head dimensions: n_embd_head_k="
-            << model->hparams.n_embd_head_k
-            << ", n_embd_head_v=" << model->hparams.n_embd_head_v << std::endl;
+    // 2. Load Vocab
+    int token_idx = gguf_find_key(ctx_gguf, "tokenizer.ggml.tokens");
+    if (token_idx != -1) {
+        int n_tokens = gguf_get_arr_n(ctx_gguf, token_idx);
+        model->vocab_tokens.reserve(n_tokens);
+        for (int i = 0; i < n_tokens; i++) {
+            const char* str = gguf_get_arr_str(ctx_gguf, token_idx, i);
+            std::string s(str);
+            model->vocab_tokens.push_back(s);
+            model->token_to_id[s] = i;
+        }
 
-  // =========================================================================
-  // QWEN3 ARCHITECTURE VALIDATION
-  // =========================================================================
-  // Qwen3 requires per-head Q/K normalization. If these tensors are missing,
-  // the model will produce incorrect outputs. Fail fast instead of silently
-  // corrupting results.
-  // =========================================================================
-  if (model->arch == ModelArch::QWEN3) {
-    bool has_qk_norms = true;
+        // Update n_vocab to match actual loaded vocab size
+        if (n_tokens != (int)model->hparams.n_vocab) {
+            std::cout << "[DenseCore] Vocab size mismatch! Metadata=" << model->hparams.n_vocab
+                      << " but loaded " << n_tokens << " tokens. Updating to " << n_tokens
+                      << std::endl;
+            model->hparams.n_vocab = n_tokens;
+        }
+    }
+
+    // 3. Initialize backend with error checking
+    model->backend = ggml_backend_cpu_init();
+    if (!model->backend) {
+        std::cerr << "[DenseCore] Error: Failed to initialize CPU backend" << std::endl;
+        gguf_free(ctx_gguf);
+        if (ctx_w)
+            ggml_free(ctx_w);
+        delete model;
+        return nullptr;
+    }
+
+    // 4. Map Tensors
+    model->layers.resize(model->hparams.n_layer);
+
+    auto get_tensor = [&](const std::string& name) -> struct ggml_tensor* {
+        struct ggml_tensor* t = ggml_get_tensor(model->ctx_w, name.c_str());
+        return t;
+    };
+
+    // Helper with fallback: tries primary key, then fallback without ".weight"
+    // suffix
+    auto get_tensor_with_fallback = [&](const std::string& primary) -> struct ggml_tensor* {
+        struct ggml_tensor* t = ggml_get_tensor(model->ctx_w, primary.c_str());
+        if (t)
+            return t;
+
+        // Fallback: strip ".weight" suffix if present and try again
+        const std::string suffix = ".weight";
+        if (primary.size() > suffix.size() &&
+            primary.compare(primary.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            std::string fallback = primary.substr(0, primary.size() - suffix.size());
+            t = ggml_get_tensor(model->ctx_w, fallback.c_str());
+        }
+        return t;
+    };
+
+    model->tok_embeddings = get_tensor("token_embd.weight");
+    model->output_norm = get_tensor("output_norm.weight");
+
+    // Try multiple possible names for lm_head/output projection
+    model->output = get_tensor("output.weight");
+    if (!model->output) {
+        model->output = get_tensor("lm_head.weight");
+    }
+    // Tie embeddings fallback
+    if (!model->output && model->tok_embeddings) {
+        std::cout << "[DenseCore] output.weight not found, using tied embeddings" << std::endl;
+        model->output = model->tok_embeddings;
+        model->tied_embeddings = true;
+    }
+
+    if (!model->output) {
+        std::cout << "[DenseCore] CRITICAL ERROR: Could not find output weight tensor!"
+                  << std::endl;
+        std::cout << "[DenseCore] Available tensors:" << std::endl;
+        struct ggml_tensor* t = ggml_get_first_tensor(model->ctx_w);
+        while (t) {
+            std::cout << "  - " << t->name << " [" << t->ne[0] << ", " << t->ne[1] << "]"
+                      << std::endl;
+            t = ggml_get_next_tensor(model->ctx_w, t);
+        }
+    }
+
+    // Debug: Print tensor shapes
+    if (model->tok_embeddings) {
+        std::cout << "[DenseCore] tok_embeddings shape: [" << model->tok_embeddings->ne[0] << ", "
+                  << model->tok_embeddings->ne[1] << "]" << std::endl;
+    }
+    if (model->output) {
+        std::cout << "[DenseCore] output shape: [" << model->output->ne[0] << ", "
+                  << model->output->ne[1] << "]" << std::endl;
+
+        // Validate n_vocab matches output tensor shape
+        uint32_t tensor_vocab_size = model->output->ne[1];
+        if (tensor_vocab_size != model->hparams.n_vocab && tensor_vocab_size > 0) {
+            std::cout << "[DenseCore] ERROR: Vocab size inconsistency! "
+                      << "Loaded vocab=" << model->hparams.n_vocab << " but output tensor expects "
+                      << tensor_vocab_size << " tokens." << std::endl;
+            std::cout << "[DenseCore] This will cause garbage output. "
+                      << "Check GGUF file integrity." << std::endl;
+
+            if (tensor_vocab_size > model->hparams.n_vocab) {
+                std::cout << "[DenseCore] WARNING: Tensor vocab larger than loaded vocab. "
+                          << "Some tokens may not decode properly." << std::endl;
+            }
+        }
+    }
+
     for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
-      if (!model->layers[i].attn_q_norm || !model->layers[i].attn_k_norm) {
-        has_qk_norms = false;
-        break;
-      }
+        std::string layer_prefix = "blk." + std::to_string(i) + ".";
+
+        model->layers[i].attention_norm = get_tensor(layer_prefix + "attn_norm.weight");
+        model->layers[i].ffn_norm = get_tensor(layer_prefix + "ffn_norm.weight");
+
+        model->layers[i].wq = get_tensor(layer_prefix + "attn_q.weight");
+        model->layers[i].wk = get_tensor(layer_prefix + "attn_k.weight");
+        model->layers[i].wv = get_tensor(layer_prefix + "attn_v.weight");
+        model->layers[i].wo = get_tensor(layer_prefix + "attn_output.weight");
+
+        model->layers[i].bq = get_tensor(layer_prefix + "attn_q.bias");
+        model->layers[i].bk = get_tensor(layer_prefix + "attn_k.bias");
+        model->layers[i].bv = get_tensor(layer_prefix + "attn_v.bias");
+        model->layers[i].bo = get_tensor(layer_prefix + "attn_output.bias");
+
+        // QK-Norm (Qwen3) - uses fallback for different GGUF naming conventions
+        model->layers[i].attn_q_norm =
+            get_tensor_with_fallback(layer_prefix + "attn_q_norm.weight");
+        model->layers[i].attn_k_norm =
+            get_tensor_with_fallback(layer_prefix + "attn_k_norm.weight");
+
+        if (i == 0) {
+            if (model->layers[i].attn_q_norm && model->layers[i].attn_k_norm) {
+                std::cout << "[DenseCore] Qwen3 architecture detected: Q/K Norms enabled"
+                          << std::endl;
+                std::cout << "[DenseCore]   attn_q_norm shape: ["
+                          << model->layers[i].attn_q_norm->ne[0] << "]" << std::endl;
+                std::cout << "[DenseCore]   attn_k_norm shape: ["
+                          << model->layers[i].attn_k_norm->ne[0] << "]" << std::endl;
+            }
+        }
+
+        model->layers[i].w1 = get_tensor(layer_prefix + "ffn_gate.weight");
+        model->layers[i].w2 = get_tensor(layer_prefix + "ffn_down.weight");
+        model->layers[i].w3 = get_tensor(layer_prefix + "ffn_up.weight");
     }
-    if (!has_qk_norms) {
-      std::cerr << "[DenseCore] FATAL: Qwen3 model requires attn_q_norm and "
-                << "attn_k_norm tensors, but they are missing from GGUF file."
-                << std::endl;
-      std::cerr << "[DenseCore] This is a corrupted or incompatible GGUF. "
-                << "Aborting load to prevent incorrect outputs." << std::endl;
-      if (model->backend)
-        ggml_backend_free(model->backend);
-      gguf_free(ctx_gguf);
-      if (ctx_w)
-        ggml_free(ctx_w);
-      delete model;
-      return nullptr;
+
+    // Auto-compute head dimensions from weight tensor shapes
+    if (model->hparams.n_embd_head_k == 0 && model->layers[0].wk) {
+        model->hparams.n_embd_head_k = model->layers[0].wk->ne[1] / model->hparams.n_head_kv;
     }
-    std::cout << "[DenseCore] Qwen3 architecture validated: Q/K norms present"
+    if (model->hparams.n_embd_head_v == 0 && model->layers[0].wv) {
+        model->hparams.n_embd_head_v = model->layers[0].wv->ne[1] / model->hparams.n_head_kv;
+    }
+    // Fallback to n_embd/n_head
+    if (model->hparams.n_embd_head_k == 0) {
+        model->hparams.n_embd_head_k = model->hparams.n_embd / model->hparams.n_head;
+    }
+    if (model->hparams.n_embd_head_v == 0) {
+        model->hparams.n_embd_head_v = model->hparams.n_embd / model->hparams.n_head;
+    }
+
+    std::cout << "[DenseCore] Head dimensions: n_embd_head_k=" << model->hparams.n_embd_head_k
+              << ", n_embd_head_v=" << model->hparams.n_embd_head_v << std::endl;
+
+    // =========================================================================
+    // QWEN3 ARCHITECTURE VALIDATION
+    // =========================================================================
+    // Qwen3 requires per-head Q/K normalization. If these tensors are missing,
+    // the model will produce incorrect outputs. Fail fast instead of silently
+    // corrupting results.
+    // =========================================================================
+    if (model->arch == ModelArch::QWEN3) {
+        bool has_qk_norms = true;
+        for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
+            if (!model->layers[i].attn_q_norm || !model->layers[i].attn_k_norm) {
+                has_qk_norms = false;
+                break;
+            }
+        }
+        if (!has_qk_norms) {
+            std::cerr << "[DenseCore] FATAL: Qwen3 model requires attn_q_norm and "
+                      << "attn_k_norm tensors, but they are missing from GGUF file." << std::endl;
+            std::cerr << "[DenseCore] This is a corrupted or incompatible GGUF. "
+                      << "Aborting load to prevent incorrect outputs." << std::endl;
+            if (model->backend)
+                ggml_backend_free(model->backend);
+            gguf_free(ctx_gguf);
+            if (ctx_w)
+                ggml_free(ctx_w);
+            delete model;
+            return nullptr;
+        }
+        std::cout << "[DenseCore] Qwen3 architecture validated: Q/K norms present" << std::endl;
+    }
+
+    // Initialize pre-computed RoPE table for optimized inference
+    std::cout << "[DenseCore] Initializing RoPE table..." << std::endl;
+    InitRoPETable(model);
+    std::cout << "[DenseCore] RoPE table initialized: " << model->rope_cos_sin.size() << " values ("
+              << model->hparams.n_ctx << " positions × " << model->rope_head_dim << " dims)"
               << std::endl;
-  }
 
-  // Initialize pre-computed RoPE table for optimized inference
-  std::cout << "[DenseCore] Initializing RoPE table..." << std::endl;
-  InitRoPETable(model);
-  std::cout << "[DenseCore] RoPE table initialized: "
-            << model->rope_cos_sin.size() << " values (" << model->hparams.n_ctx
-            << " positions × " << model->rope_head_dim << " dims)" << std::endl;
-
-  // ==========================================================================
-  // NUMA Optimization: Interleaved Allocation for Multi-Socket Systems
-  // ==========================================================================
-  // For multi-socket servers, spread large weight tensors across all NUMA nodes
-  // using numa_alloc_interleaved. This maximizes aggregate memory bandwidth
-  // when multiple threads across different sockets access the weights.
-  //
-  // For single-socket/non-NUMA systems, use madvise(MADV_WILLNEED) to pre-fault
-  // pages into memory, reducing page fault latency during inference.
-  // ==========================================================================
+    // ==========================================================================
+    // NUMA Optimization: Interleaved Allocation for Multi-Socket Systems
+    // ==========================================================================
+    // For multi-socket servers, spread large weight tensors across all NUMA nodes
+    // using numa_alloc_interleaved. This maximizes aggregate memory bandwidth
+    // when multiple threads across different sockets access the weights.
+    //
+    // For single-socket/non-NUMA systems, use madvise(MADV_WILLNEED) to pre-fault
+    // pages into memory, reducing page fault latency during inference.
+    // ==========================================================================
 
 #if defined(__linux__)
-  // Get total weight memory size for reporting
-  size_t total_weight_bytes = 0;
-  struct ggml_tensor *t = ggml_get_first_tensor(model->ctx_w);
-  while (t) {
-    total_weight_bytes += ggml_nbytes(t);
-    t = ggml_get_next_tensor(model->ctx_w, t);
-  }
-
-  if (densecore::NumaAllocator::IsNumaAvailable()) {
-    std::cout << "[DenseCore] NUMA detected - weights will use interleaved "
-              << "allocation on next load via LoadGGUFModelNuma()" << std::endl;
-    std::cout << "[DenseCore] For optimal multi-socket performance, use "
-              << "LoadGGUFModelNuma(path, -1, false) for interleaved layout"
-              << std::endl;
-  } else {
-    // Non-NUMA: Pre-populate pages with MADV_WILLNEED
-    t = ggml_get_first_tensor(model->ctx_w);
-    size_t prefetched_bytes = 0;
+    // Get total weight memory size for reporting
+    size_t total_weight_bytes = 0;
+    struct ggml_tensor* t = ggml_get_first_tensor(model->ctx_w);
     while (t) {
-      if (t->data && ggml_nbytes(t) >= 1024 * 1024) { // Only for tensors >= 1MB
-        madvise(t->data, ggml_nbytes(t), MADV_WILLNEED);
-        prefetched_bytes += ggml_nbytes(t);
-      }
-      t = ggml_get_next_tensor(model->ctx_w, t);
+        total_weight_bytes += ggml_nbytes(t);
+        t = ggml_get_next_tensor(model->ctx_w, t);
     }
-    if (prefetched_bytes > 0) {
-      std::cout << "[DenseCore] Pre-populated "
-                << (prefetched_bytes / 1024 / 1024)
-                << " MB of weight pages (MADV_WILLNEED)" << std::endl;
+
+    if (densecore::NumaAllocator::IsNumaAvailable()) {
+        std::cout << "[DenseCore] NUMA detected - weights will use interleaved "
+                  << "allocation on next load via LoadGGUFModelNuma()" << std::endl;
+        std::cout << "[DenseCore] For optimal multi-socket performance, use "
+                  << "LoadGGUFModelNuma(path, -1, false) for interleaved layout" << std::endl;
+    } else {
+        // Non-NUMA: Pre-populate pages with MADV_WILLNEED
+        t = ggml_get_first_tensor(model->ctx_w);
+        size_t prefetched_bytes = 0;
+        while (t) {
+            if (t->data && ggml_nbytes(t) >= 1024 * 1024) {  // Only for tensors >= 1MB
+                madvise(t->data, ggml_nbytes(t), MADV_WILLNEED);
+                prefetched_bytes += ggml_nbytes(t);
+            }
+            t = ggml_get_next_tensor(model->ctx_w, t);
+        }
+        if (prefetched_bytes > 0) {
+            std::cout << "[DenseCore] Pre-populated " << (prefetched_bytes / 1024 / 1024)
+                      << " MB of weight pages (MADV_WILLNEED)" << std::endl;
+        }
     }
-  }
 #endif
 
-  std::cout << "[DenseCore] Model loaded successfully" << std::endl;
-  return model;
+    std::cout << "[DenseCore] Model loaded successfully" << std::endl;
+    return model;
 }
 
 // ============================================================================
 // SaveModel
 // ============================================================================
 
-int SaveModel(const TransformerModel *model, const char *path) {
-  if (!model || !path)
-    return -1;
+int SaveModel(const TransformerModel* model, const char* path) {
+    if (!model || !path)
+        return -1;
 
-  std::cout << "[DenseCore] Saving model to " << path << "..." << std::endl;
-  std::cerr << "[DenseCore] WARNING: SaveModel currently only supports "
-               "metadata updates. Tensor data writing is experimental."
-            << std::endl;
+    std::cout << "[DenseCore] Saving model to " << path << "..." << std::endl;
+    std::cerr << "[DenseCore] WARNING: SaveModel currently only supports "
+                 "metadata updates. Tensor data writing is experimental."
+              << std::endl;
 
-  struct gguf_context *ctx = gguf_init_empty();
+    struct gguf_context* ctx = gguf_init_empty();
 
-  // 1. Write metadata
-  gguf_set_val_str(ctx, "general.architecture", "llama");
-  gguf_set_val_str(ctx, "general.name", "DenseCore-Optimized");
+    // 1. Write metadata
+    gguf_set_val_str(ctx, "general.architecture", "llama");
+    gguf_set_val_str(ctx, "general.name", "DenseCore-Optimized");
 
-  // Write hyperparameters
-  gguf_set_val_u32(ctx, "llama.vocab_size", model->hparams.n_vocab);
-  gguf_set_val_u32(ctx, "llama.embedding_length", model->hparams.n_embd);
-  gguf_set_val_u32(ctx, "llama.block_count", model->hparams.n_layer);
-  gguf_set_val_u32(ctx, "llama.attention.head_count", model->hparams.n_head);
-  gguf_set_val_u32(ctx, "llama.attention.head_count_kv",
-                   model->hparams.n_head_kv);
-  gguf_set_val_u32(ctx, "llama.context_length", model->hparams.n_ctx);
-  gguf_set_val_f32(ctx, "llama.attention.layer_norm_rms_epsilon",
-                   model->hparams.f_norm_rms_eps);
-  gguf_set_val_f32(ctx, "llama.rope.freq_base", model->hparams.rope_freq_base);
-  gguf_set_val_f32(ctx, "llama.rope.freq_scale",
-                   model->hparams.rope_freq_scale);
+    // Write hyperparameters
+    gguf_set_val_u32(ctx, "llama.vocab_size", model->hparams.n_vocab);
+    gguf_set_val_u32(ctx, "llama.embedding_length", model->hparams.n_embd);
+    gguf_set_val_u32(ctx, "llama.block_count", model->hparams.n_layer);
+    gguf_set_val_u32(ctx, "llama.attention.head_count", model->hparams.n_head);
+    gguf_set_val_u32(ctx, "llama.attention.head_count_kv", model->hparams.n_head_kv);
+    gguf_set_val_u32(ctx, "llama.context_length", model->hparams.n_ctx);
+    gguf_set_val_f32(ctx, "llama.attention.layer_norm_rms_epsilon", model->hparams.f_norm_rms_eps);
+    gguf_set_val_f32(ctx, "llama.rope.freq_base", model->hparams.rope_freq_base);
+    gguf_set_val_f32(ctx, "llama.rope.freq_scale", model->hparams.rope_freq_scale);
 
-  // Write vocab if available
-  if (!model->vocab_tokens.empty()) {
-    std::vector<const char *> tokens_cstr;
-    tokens_cstr.reserve(model->vocab_tokens.size());
-    for (const auto &s : model->vocab_tokens) {
-      tokens_cstr.push_back(s.c_str());
+    // Write vocab if available
+    if (!model->vocab_tokens.empty()) {
+        std::vector<const char*> tokens_cstr;
+        tokens_cstr.reserve(model->vocab_tokens.size());
+        for (const auto& s : model->vocab_tokens) {
+            tokens_cstr.push_back(s.c_str());
+        }
+        gguf_set_arr_str(ctx, "tokenizer.ggml.tokens", tokens_cstr.data(), tokens_cstr.size());
     }
-    gguf_set_arr_str(ctx, "tokenizer.ggml.tokens", tokens_cstr.data(),
-                     tokens_cstr.size());
-  }
 
-  // 2. Write Tensors (experimental)
-  // Note: Full tensor serialization requires properly set up tensors in the
-  // context. This is a simplified implementation that may not work for all
-  // models.
+    // 2. Write Tensors (experimental)
+    // Note: Full tensor serialization requires properly set up tensors in the
+    // context. This is a simplified implementation that may not work for all
+    // models.
 
-  // Write file (metadata only is safer, but we try full write)
-  bool ok = gguf_write_to_file(ctx, path, false); // false = include tensors
+    // Write file (metadata only is safer, but we try full write)
+    bool ok = gguf_write_to_file(ctx, path, false);  // false = include tensors
 
-  gguf_free(ctx);
+    gguf_free(ctx);
 
-  if (!ok) {
-    std::cerr << "[DenseCore] Error: Failed to write GGUF file" << std::endl;
-    return -2;
-  }
+    if (!ok) {
+        std::cerr << "[DenseCore] Error: Failed to write GGUF file" << std::endl;
+        return -2;
+    }
 
-  std::cout << "[DenseCore] Model saved (metadata-only mode)" << std::endl;
-  return 0;
+    std::cout << "[DenseCore] Model saved (metadata-only mode)" << std::endl;
+    return 0;
 }
 
 // ============================================================================
@@ -618,54 +582,53 @@ int SaveModel(const TransformerModel *model, const char *path) {
  * @param min_size_bytes Minimum tensor size threshold (skip smaller tensors)
  * @return True if tensor was successfully rebound
  */
-static bool RebindTensorNumaInterleaved(struct ggml_tensor *tensor,
-                                        TransformerModel *model,
+static bool RebindTensorNumaInterleaved(struct ggml_tensor* tensor, TransformerModel* model,
                                         size_t min_size_bytes = 1024 * 1024) {
-  if (!tensor || !tensor->data) {
-    return false;
-  }
+    if (!tensor || !tensor->data) {
+        return false;
+    }
 
-  const size_t tensor_size = ggml_nbytes(tensor);
-  if (tensor_size < min_size_bytes) {
-    return false; // Skip small tensors - overhead not worth it
-  }
+    const size_t tensor_size = ggml_nbytes(tensor);
+    if (tensor_size < min_size_bytes) {
+        return false;  // Skip small tensors - overhead not worth it
+    }
 
 #if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
-  // Use numa_alloc_interleaved for true interleaved allocation
-  void *new_buffer = numa_alloc_interleaved(tensor_size);
-  if (!new_buffer) {
-    std::cerr << "[NUMA] numa_alloc_interleaved failed for "
-              << (tensor_size / 1024 / 1024) << " MB" << std::endl;
-    return false;
-  }
+    // Use numa_alloc_interleaved for true interleaved allocation
+    void* new_buffer = numa_alloc_interleaved(tensor_size);
+    if (!new_buffer) {
+        std::cerr << "[NUMA] numa_alloc_interleaved failed for " << (tensor_size / 1024 / 1024)
+                  << " MB" << std::endl;
+        return false;
+    }
 
-  // Copy data to interleaved buffer
-  std::memcpy(new_buffer, tensor->data, tensor_size);
+    // Copy data to interleaved buffer
+    std::memcpy(new_buffer, tensor->data, tensor_size);
 
-  // Replace tensor data pointer
-  tensor->data = new_buffer;
+    // Replace tensor data pointer
+    tensor->data = new_buffer;
 
-  // Track allocation for cleanup (use Numa type for numa_free)
-  model->numa_buffers.emplace_back(new_buffer, tensor_size);
+    // Track allocation for cleanup (use Numa type for numa_free)
+    model->numa_buffers.emplace_back(new_buffer, tensor_size);
 
-  return true;
+    return true;
 #else
-  // Fallback: use aligned allocation with page pre-population
-  void *new_buffer = nullptr;
-  if (posix_memalign(&new_buffer, 64, tensor_size) != 0 || !new_buffer) {
-    return false;
-  }
+    // Fallback: use aligned allocation with page pre-population
+    void* new_buffer = nullptr;
+    if (posix_memalign(&new_buffer, 64, tensor_size) != 0 || !new_buffer) {
+        return false;
+    }
 
-  std::memcpy(new_buffer, tensor->data, tensor_size);
+    std::memcpy(new_buffer, tensor->data, tensor_size);
 
 #if defined(__linux__)
-  // Pre-populate pages to reduce page fault latency
-  madvise(new_buffer, tensor_size, MADV_WILLNEED);
+    // Pre-populate pages to reduce page fault latency
+    madvise(new_buffer, tensor_size, MADV_WILLNEED);
 #endif
 
-  tensor->data = new_buffer;
-  model->numa_buffers.emplace_back(new_buffer, tensor_size);
-  return true;
+    tensor->data = new_buffer;
+    model->numa_buffers.emplace_back(new_buffer, tensor_size);
+    return true;
 #endif
 }
 
@@ -681,58 +644,56 @@ static bool RebindTensorNumaInterleaved(struct ggml_tensor *tensor,
  * @param min_size_bytes Minimum tensor size threshold (skip smaller tensors)
  * @return True if tensor was successfully rebound
  */
-static bool RebindTensorNuma(struct ggml_tensor *tensor, int numa_node,
-                             TransformerModel *model,
+static bool RebindTensorNuma(struct ggml_tensor* tensor, int numa_node, TransformerModel* model,
                              size_t min_size_bytes = 1024 * 1024) {
-  if (!tensor || !tensor->data) {
-    return false;
-  }
+    if (!tensor || !tensor->data) {
+        return false;
+    }
 
-  const size_t tensor_size = ggml_nbytes(tensor);
-  if (tensor_size < min_size_bytes) {
-    return false; // Skip small tensors - overhead not worth it
-  }
+    const size_t tensor_size = ggml_nbytes(tensor);
+    if (tensor_size < min_size_bytes) {
+        return false;  // Skip small tensors - overhead not worth it
+    }
 
-  // Allocate NUMA-aware buffer
-  auto result =
-      densecore::NumaAllocator::AllocatePreferred(tensor_size, 64, numa_node);
+    // Allocate NUMA-aware buffer
+    auto result = densecore::NumaAllocator::AllocatePreferred(tensor_size, 64, numa_node);
 
-  if (!result.ptr) {
-    std::cerr << "[NUMA] Failed to allocate " << (tensor_size / 1024 / 1024)
-              << " MB on node " << numa_node << std::endl;
-    return false;
-  }
+    if (!result.ptr) {
+        std::cerr << "[NUMA] Failed to allocate " << (tensor_size / 1024 / 1024) << " MB on node "
+                  << numa_node << std::endl;
+        return false;
+    }
 
-  // =========================================================================
-  // CRITICAL: Copy data using thread pinned to target NUMA node
-  // =========================================================================
-  // This enforces first-touch policy: the physical memory pages are allocated
-  // on the NUMA node where the first write occurs. By pinning our copy thread
-  // to the target node, we ensure pages are allocated there.
-  // =========================================================================
-  const void *src_data = tensor->data;
-  void *dst_data = result.ptr;
+    // =========================================================================
+    // CRITICAL: Copy data using thread pinned to target NUMA node
+    // =========================================================================
+    // This enforces first-touch policy: the physical memory pages are allocated
+    // on the NUMA node where the first write occurs. By pinning our copy thread
+    // to the target node, we ensure pages are allocated there.
+    // =========================================================================
+    const void* src_data = tensor->data;
+    void* dst_data = result.ptr;
 
-  std::thread copy_thread([dst_data, src_data, tensor_size, numa_node]() {
-    // Pin this thread to the target NUMA node
-    densecore::HardwareTopology::GetInstance().PinCurrentThreadToNumaNode(
-        numa_node, densecore::PinningPolicy::SCATTER);
+    std::thread copy_thread([dst_data, src_data, tensor_size, numa_node]() {
+        // Pin this thread to the target NUMA node
+        densecore::HardwareTopology::GetInstance().PinCurrentThreadToNumaNode(
+            numa_node, densecore::PinningPolicy::SCATTER);
 
-    // Perform the copy - this triggers first-touch allocation
-    std::memcpy(dst_data, src_data, tensor_size);
-  });
+        // Perform the copy - this triggers first-touch allocation
+        std::memcpy(dst_data, src_data, tensor_size);
+    });
 
-  // MUST join to ensure copy completes before we use the tensor
-  copy_thread.join();
+    // MUST join to ensure copy completes before we use the tensor
+    copy_thread.join();
 
-  // Replace tensor data pointer
-  // NOTE: Original mmap data will be freed when ctx_gguf is freed
-  tensor->data = result.ptr;
+    // Replace tensor data pointer
+    // NOTE: Original mmap data will be freed when ctx_gguf is freed
+    tensor->data = result.ptr;
 
-  // Track allocation for cleanup in model destructor
-  model->numa_buffers.emplace_back(result.ptr, result.size);
+    // Track allocation for cleanup in model destructor
+    model->numa_buffers.emplace_back(result.ptr, result.size);
 
-  return true;
+    return true;
 }
 
 /**
@@ -740,11 +701,11 @@ static bool RebindTensorNuma(struct ggml_tensor *tensor, int numa_node,
  */
 static int GetNumaNodeCount() {
 #if defined(__linux__) && defined(DENSECORE_USE_HWLOC)
-  if (numa_available() >= 0) {
-    return numa_max_node() + 1;
-  }
+    if (numa_available() >= 0) {
+        return numa_max_node() + 1;
+    }
 #endif
-  return 1; // Single node fallback
+    return 1;  // Single node fallback
 }
 
 /**
@@ -769,141 +730,135 @@ static int GetNumaNodeCount() {
  * @param use_huge_pages Whether to request huge pages (TBD)
  * @return Loaded model with NUMA-optimized memory layout
  */
-TransformerModel *LoadGGUFModelNuma(const char *path, int numa_node,
-                                    bool use_huge_pages) {
-  // Step 1: Load model normally (mmap-based)
-  TransformerModel *model = LoadGGUFModel(path);
-  if (!model) {
-    return nullptr;
-  }
+TransformerModel* LoadGGUFModelNuma(const char* path, int numa_node, bool use_huge_pages) {
+    // Step 1: Load model normally (mmap-based)
+    TransformerModel* model = LoadGGUFModel(path);
+    if (!model) {
+        return nullptr;
+    }
 
-  // Step 2: Check if NUMA rebinding is available
-  bool numa_available = densecore::NumaAllocator::IsNumaAvailable();
-  int num_nodes = GetNumaNodeCount();
+    // Step 2: Check if NUMA rebinding is available
+    bool numa_available = densecore::NumaAllocator::IsNumaAvailable();
+    int num_nodes = GetNumaNodeCount();
 
-  if (!numa_available && numa_node < 0) {
-    std::cout << "[DenseCore] NUMA not available, using standard memory layout"
-              << std::endl;
+    if (!numa_available && numa_node < 0) {
+        std::cout << "[DenseCore] NUMA not available, using standard memory layout" << std::endl;
+        return model;
+    }
+
+    (void)use_huge_pages;  // TODO: implement huge page allocation path
+
+    // Determine allocation mode
+    enum class NumaMode { INTERLEAVED, ROUND_ROBIN, PINNED };
+    NumaMode mode;
+    const char* mode_name;
+
+    if (numa_node == -1) {
+        mode = NumaMode::INTERLEAVED;
+        mode_name = "INTERLEAVED";
+        std::cout << "[DenseCore] Using NUMA INTERLEAVED allocation "
+                  << "(spreading weights across " << num_nodes << " nodes)" << std::endl;
+    } else if (numa_node == -2) {
+        mode = NumaMode::ROUND_ROBIN;
+        mode_name = "ROUND-ROBIN";
+        std::cout << "[DenseCore] Using NUMA ROUND-ROBIN allocation "
+                  << "across " << num_nodes << " nodes" << std::endl;
+    } else {
+        mode = NumaMode::PINNED;
+        mode_name = "PINNED";
+        std::cout << "[DenseCore] PINNING all weights to NUMA node " << numa_node << std::endl;
+    }
+
+    // Step 3: Collect all large tensors to rebind
+    struct TensorInfo {
+        struct ggml_tensor* tensor;
+        std::string name;
+    };
+    std::vector<TensorInfo> tensors_to_rebind;
+
+    auto collect = [&](struct ggml_tensor* t, const char* name) {
+        if (t && t->data && ggml_nbytes(t) >= 1024 * 1024) {
+            tensors_to_rebind.push_back({t, name});
+        }
+    };
+
+    // Collect critical weight tensors
+    collect(model->tok_embeddings, "tok_embeddings");
+    collect(model->output, "output");
+    collect(model->output_norm, "output_norm");
+
+    // Collect layer weights
+    for (size_t i = 0; i < model->layers.size(); ++i) {
+        auto& layer = model->layers[i];
+        std::string prefix = "blk." + std::to_string(i) + ".";
+
+        collect(layer.wq, (prefix + "wq").c_str());
+        collect(layer.wk, (prefix + "wk").c_str());
+        collect(layer.wv, (prefix + "wv").c_str());
+        collect(layer.wo, (prefix + "wo").c_str());
+        collect(layer.w1, (prefix + "w1").c_str());
+        collect(layer.w2, (prefix + "w2").c_str());
+        collect(layer.w3, (prefix + "w3").c_str());
+        collect(layer.attention_norm, (prefix + "attn_norm").c_str());
+        collect(layer.ffn_norm, (prefix + "ffn_norm").c_str());
+    }
+
+    // Step 4: Rebind tensors based on mode
+    size_t rebound_bytes = 0;
+    int rebound_count = 0;
+    std::vector<int> node_distribution(num_nodes, 0);
+
+    for (size_t i = 0; i < tensors_to_rebind.size(); ++i) {
+        auto& info = tensors_to_rebind[i];
+        bool success = false;
+        int target_node = -1;
+
+        switch (mode) {
+        case NumaMode::INTERLEAVED:
+            success = RebindTensorNumaInterleaved(info.tensor, model);
+            break;
+
+        case NumaMode::ROUND_ROBIN:
+            target_node = static_cast<int>(i % num_nodes);
+            success = RebindTensorNuma(info.tensor, target_node, model);
+            if (success) {
+                node_distribution[target_node]++;
+            }
+            break;
+
+        case NumaMode::PINNED:
+            target_node = numa_node;
+            success = RebindTensorNuma(info.tensor, target_node, model);
+            break;
+        }
+
+        if (success) {
+            rebound_bytes += ggml_nbytes(info.tensor);
+            rebound_count++;
+        }
+    }
+
+    // Step 5: Print summary
+    std::cout << "[DenseCore] NUMA allocation complete (" << mode_name << "): " << rebound_count
+              << " tensors (" << (rebound_bytes / 1024 / 1024) << " MB)";
+
+    if (mode == NumaMode::ROUND_ROBIN) {
+        std::cout << " [Distribution:";
+        for (int n = 0; n < num_nodes; ++n) {
+            std::cout << " N" << n << "=" << node_distribution[n];
+        }
+        std::cout << "]";
+    } else if (mode == NumaMode::PINNED) {
+        std::cout << " to Node " << numa_node;
+    }
+    std::cout << std::endl;
+
+    // Optional: Verify placement for interleaved mode
+    if (mode == NumaMode::INTERLEAVED && model->tok_embeddings && rebound_count > 0) {
+        densecore::MemoryDiagnostics::PrintSystemTopologyReport(
+            model->tok_embeddings->data, ggml_nbytes(model->tok_embeddings), -1,
+            "tok_embeddings (interleaved sample)");
+    }
+
     return model;
-  }
-
-  (void)use_huge_pages; // TODO: implement huge page allocation path
-
-  // Determine allocation mode
-  enum class NumaMode { INTERLEAVED, ROUND_ROBIN, PINNED };
-  NumaMode mode;
-  const char *mode_name;
-
-  if (numa_node == -1) {
-    mode = NumaMode::INTERLEAVED;
-    mode_name = "INTERLEAVED";
-    std::cout << "[DenseCore] Using NUMA INTERLEAVED allocation "
-              << "(spreading weights across " << num_nodes << " nodes)"
-              << std::endl;
-  } else if (numa_node == -2) {
-    mode = NumaMode::ROUND_ROBIN;
-    mode_name = "ROUND-ROBIN";
-    std::cout << "[DenseCore] Using NUMA ROUND-ROBIN allocation "
-              << "across " << num_nodes << " nodes" << std::endl;
-  } else {
-    mode = NumaMode::PINNED;
-    mode_name = "PINNED";
-    std::cout << "[DenseCore] PINNING all weights to NUMA node " << numa_node
-              << std::endl;
-  }
-
-  // Step 3: Collect all large tensors to rebind
-  struct TensorInfo {
-    struct ggml_tensor *tensor;
-    std::string name;
-  };
-  std::vector<TensorInfo> tensors_to_rebind;
-
-  auto collect = [&](struct ggml_tensor *t, const char *name) {
-    if (t && t->data && ggml_nbytes(t) >= 1024 * 1024) {
-      tensors_to_rebind.push_back({t, name});
-    }
-  };
-
-  // Collect critical weight tensors
-  collect(model->tok_embeddings, "tok_embeddings");
-  collect(model->output, "output");
-  collect(model->output_norm, "output_norm");
-
-  // Collect layer weights
-  for (size_t i = 0; i < model->layers.size(); ++i) {
-    auto &layer = model->layers[i];
-    std::string prefix = "blk." + std::to_string(i) + ".";
-
-    collect(layer.wq, (prefix + "wq").c_str());
-    collect(layer.wk, (prefix + "wk").c_str());
-    collect(layer.wv, (prefix + "wv").c_str());
-    collect(layer.wo, (prefix + "wo").c_str());
-    collect(layer.w1, (prefix + "w1").c_str());
-    collect(layer.w2, (prefix + "w2").c_str());
-    collect(layer.w3, (prefix + "w3").c_str());
-    collect(layer.attention_norm, (prefix + "attn_norm").c_str());
-    collect(layer.ffn_norm, (prefix + "ffn_norm").c_str());
-  }
-
-  // Step 4: Rebind tensors based on mode
-  size_t rebound_bytes = 0;
-  int rebound_count = 0;
-  std::vector<int> node_distribution(num_nodes, 0);
-
-  for (size_t i = 0; i < tensors_to_rebind.size(); ++i) {
-    auto &info = tensors_to_rebind[i];
-    bool success = false;
-    int target_node = -1;
-
-    switch (mode) {
-    case NumaMode::INTERLEAVED:
-      success = RebindTensorNumaInterleaved(info.tensor, model);
-      break;
-
-    case NumaMode::ROUND_ROBIN:
-      target_node = static_cast<int>(i % num_nodes);
-      success = RebindTensorNuma(info.tensor, target_node, model);
-      if (success) {
-        node_distribution[target_node]++;
-      }
-      break;
-
-    case NumaMode::PINNED:
-      target_node = numa_node;
-      success = RebindTensorNuma(info.tensor, target_node, model);
-      break;
-    }
-
-    if (success) {
-      rebound_bytes += ggml_nbytes(info.tensor);
-      rebound_count++;
-    }
-  }
-
-  // Step 5: Print summary
-  std::cout << "[DenseCore] NUMA allocation complete (" << mode_name
-            << "): " << rebound_count << " tensors ("
-            << (rebound_bytes / 1024 / 1024) << " MB)";
-
-  if (mode == NumaMode::ROUND_ROBIN) {
-    std::cout << " [Distribution:";
-    for (int n = 0; n < num_nodes; ++n) {
-      std::cout << " N" << n << "=" << node_distribution[n];
-    }
-    std::cout << "]";
-  } else if (mode == NumaMode::PINNED) {
-    std::cout << " to Node " << numa_node;
-  }
-  std::cout << std::endl;
-
-  // Optional: Verify placement for interleaved mode
-  if (mode == NumaMode::INTERLEAVED && model->tok_embeddings &&
-      rebound_count > 0) {
-    densecore::MemoryDiagnostics::PrintSystemTopologyReport(
-        model->tok_embeddings->data, ggml_nbytes(model->tok_embeddings), -1,
-        "tok_embeddings (interleaved sample)");
-  }
-
-  return model;
 }
