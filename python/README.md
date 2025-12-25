@@ -1,10 +1,16 @@
 # DenseCore Python SDK
 
-The official Python client for DenseCore — **high-performance CPU inference for LLMs**.
+The official Python client for DenseCore — **high-performance CPU & Apple Silicon inference for LLMs**.
 
 [![PyPI](https://img.shields.io/pypi/v/densecore)](https://pypi.org/project/densecore/)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
+
+**Key Features:**
+- **Multi-Platform**: Intel (AVX-512), AMD (AVX2), Apple Silicon (Metal/ANE/AMX), AWS Graviton (SVE/DotProd)
+- **Production Ready**: Continuous Batching, OpenAI-compatible API
+- **LangChain Native**: First-class LangChain/LangGraph support with tool calling
+
 
 ---
 
