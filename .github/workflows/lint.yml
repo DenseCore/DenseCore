@@ -27,15 +27,11 @@ jobs:
 
       - name: Run Ruff
         working-directory: python
-        run: |
-          ruff check . --output-format=github || true
-        continue-on-error: true
+        run: ruff check . --output-format=github
 
       - name: Run Black
         working-directory: python
-        run: |
-          black --check --diff . || true
-        continue-on-error: true
+        run: black --check --diff .
 
   go-lint:
     name: Go Linting
@@ -56,7 +52,6 @@ jobs:
           version: latest
           working-directory: server
           args: --timeout=5m
-        continue-on-error: true
 
   cpp-lint:
     name: C++ Linting
