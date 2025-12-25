@@ -143,6 +143,26 @@ set(SOURCES
     # src/gguf.cpp is now provided by ggml library
 )
 
+# ==========================================================================
+# SIMD Dispatch Strategy
+# ==========================================================================
+# x86: Uses __attribute__((target(...))) for function-level SIMD enabling.
+# ARM: Uses file-level compile flags as GCC/Clang ARM doesn't fully support
+#      target attributes for SVE. This is safe because the dispatcher code
+#      doesn't use SVE intrinsics directly.
+# ==========================================================================
+if(NOT MSVC)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        # Enable SVE and DOTPROD for ARM kernels (safe: dispatcher is pure C++)
+        set_source_files_properties(
+            src/kernels/cpu_int4.cpp
+            PROPERTIES COMPILE_FLAGS
+            "-march=armv8.2-a+sve+dotprod+fp16"
+        )
+        message(STATUS "[DenseCore] cpu_int4.cpp: ARM (SVE/DotProd/FP16)")
+    endif()
+endif()
+
 # Create shared library
 add_library(densecore SHARED ${SOURCES})
 

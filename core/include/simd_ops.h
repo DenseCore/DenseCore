@@ -21,7 +21,8 @@
  * - AVX2 (Intel Haswell+, AMD Zen+)
  * - AVX (Intel Sandy Bridge+)
  * - SSE4.1 (Intel Penryn+)
- * - ARM NEON (Apple Silicon, ARM64)
+ * - ARM SVE (AWS Graviton 3/4, scalable 256-bit+ vectors)
+ * - ARM NEON (Apple Silicon, ARM64, fixed 128-bit vectors)
  *
  * Auto-detects best available SIMD and provides unified API.
  */
@@ -58,6 +59,10 @@
 #elif defined(__aarch64__) || defined(_M_ARM64)
 #define DENSECORE_ARM
 #include <arm_neon.h>
+// SVE (Scalable Vector Extension) for AWS Graviton 3/4 and other ARMv8.2+
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
 #endif
 
 // FP16 support from ggml
@@ -269,8 +274,9 @@ enum class SimdLevel {
   AVX = 2,
   AVX2 = 3,
   AVX512 = 4,
-  AMX = 5,  // Intel Advanced Matrix Extensions (Sapphire Rapids+)
-  NEON = 10 // ARM NEON (separate numbering for clarity)
+  AMX = 5,   // Intel Advanced Matrix Extensions (Sapphire Rapids+)
+  NEON = 10, // ARM NEON (fixed 128-bit vectors)
+  SVE = 11   // ARM SVE (scalable 256-bit+ vectors, Graviton 3/4)
 };
 
 inline SimdLevel DetectSimdLevel() {
@@ -352,7 +358,11 @@ inline SimdLevel DetectSimdLevel() {
 #endif
 
 #elif defined(DENSECORE_ARM)
+#if defined(__ARM_FEATURE_SVE)
+  return SimdLevel::SVE; // Graviton 3/4 with scalable vectors
+#else
   return SimdLevel::NEON;
+#endif
 #else
   return SimdLevel::NONE;
 #endif
@@ -372,6 +382,8 @@ inline const char *SimdLevelName(SimdLevel level) {
     return "SSE4.1";
   case SimdLevel::NEON:
     return "ARM NEON";
+  case SimdLevel::SVE:
+    return "ARM SVE";
   default:
     return "Scalar";
   }

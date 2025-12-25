@@ -347,6 +347,65 @@ public:
                                float *output, const int *positions,
                                int seq_len);
 
+  // ===========================================================================
+  // Dynamic Sequence Length Support (Bucketed Models)
+  // ===========================================================================
+
+  /**
+   * @brief Execute transformer layer with automatic bucket selection
+   *
+   * ANE requires fixed-shape models, but we can support variable sequence
+   * lengths by pre-compiling models at common "bucket" sizes (e.g., 1, 32,
+   * 128, 512, 1024, 2048, 4096). This method selects the appropriate bucket
+   * and pads/slices the input accordingly.
+   *
+   * @param layer_prefix Layer name prefix (e.g., "layer_0")
+   * @param input Hidden states [seq_len, hidden_dim]
+   * @param output Output hidden states [seq_len, hidden_dim]
+   * @param positions Token positions for RoPE [seq_len]
+   * @param seq_len Actual sequence length (may be smaller than bucket)
+   * @param hidden_dim Hidden dimension
+   * @return true if execution succeeded
+   *
+   * @note Buckets must be pre-compiled using `PrecompileBucketedModels()`
+   *       or manually with coremltools scripts.
+   */
+  bool ExecuteTransformerLayerDynamic(const std::string &layer_prefix,
+                                      const float *input, float *output,
+                                      const int *positions, int seq_len,
+                                      int hidden_dim);
+
+  /**
+   * @brief Get available bucket sizes for dynamic sequence support
+   * @return Vector of bucket sizes in ascending order
+   */
+  std::vector<int> GetBucketSizes() const;
+
+  /**
+   * @brief Set custom bucket sizes
+   *
+   * Override default bucket sizes for specific model requirements.
+   * Must be called before PrecompileBucketedModels().
+   *
+   * @param sizes Bucket sizes in ascending order
+   */
+  void SetBucketSizes(const std::vector<int> &sizes);
+
+  /**
+   * @brief Pre-compile models at all bucket sizes
+   *
+   * Generates CoreML models for each bucket size. This is a slow operation
+   * that should be done offline or during model initialization.
+   *
+   * @param layer_prefix Layer name prefix (e.g., "layer_0")
+   * @param config Layer configuration
+   * @param layer_weights Layer weight data
+   * @return Number of successfully compiled buckets
+   */
+  int PrecompileBucketedModels(const std::string &layer_prefix,
+                               const TransformerLayerConfig &config,
+                               const void *layer_weights);
+
   /**
    * @brief Get operation status
    * @param name Operation identifier
