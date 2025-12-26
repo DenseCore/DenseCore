@@ -1677,8 +1677,8 @@ inline void GemmInt4Fp32_AVX512(float* C, const float* A, const uint8_t* W_int4,
                     PROCESS_ROW(05);
                     PROCESS_ROW(06);
                     PROCESS_ROW(07);
-                    PROCESS_ROW(08);
-                    PROCESS_ROW(09);
+                    PROCESS_ROW(8);
+                    PROCESS_ROW(9);
                     PROCESS_ROW(10);
                     PROCESS_ROW(11);
                     PROCESS_ROW(12);
