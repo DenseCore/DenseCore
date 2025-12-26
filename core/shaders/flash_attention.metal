@@ -59,7 +59,7 @@ constant float NEG_INF = -1e9f;      // For masking
 // =============================================================================
 // Note: For models with head_dim > 128, the host code can override this
 // value at runtime using MTLFunctionConstantValues.
-constant uint MAX_HEAD_DIM [[function_constant(0)]] = 128;
+constant uint MAX_HEAD_DIM [[function_constant(0)]];
 
 // =============================================================================
 // Helper Structures

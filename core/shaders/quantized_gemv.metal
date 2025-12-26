@@ -39,10 +39,6 @@ constant uint QK4_0 = 32;   // Q4_0 block size
 constant uint QK4_1 = 32;   // Q4_1 block size
 constant uint QK8_0 = 32;   // Q8_0 block size
 
-// K-quant constants
-constant uint QK_K = 256;   // Super-block size for K-quants
-constant uint K_SCALE_SIZE = 12;  // Scales per super-block
-
 // Thread configuration
 constant uint THREADGROUP_SIZE = 256;
 
