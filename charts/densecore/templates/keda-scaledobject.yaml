@@ -31,18 +31,22 @@ spec:
               value: {{ .Values.keda.scaleUp.pods | default 2 }}
               periodSeconds: 30
   triggers:
+    {{- if .Values.keda.triggers.pendingRequests.enabled }}
     - type: prometheus
       metadata:
         serverAddress: {{ .Values.keda.prometheusServerAddress | quote }}
-        query: |
-          sum(densecore_pending_requests{app="{{ include "densecore.fullname" . }}"}) or vector(0)
-        threshold: {{ .Values.keda.pendingRequestsThreshold | default "5" | quote }}
+        {{- /* Build query with correct pod selector labels for this release */}}
+        query: 'sum(densecore_pending_requests{app_kubernetes_io_name="{{ include "densecore.name" . }}", app_kubernetes_io_instance="{{ .Release.Name }}"}) or vector(0)'
+        threshold: {{ .Values.keda.triggers.pendingRequests.threshold | default "5" | quote }}
         metricName: densecore_pending_requests
+    {{- end }}
+    {{- if .Values.keda.triggers.activeRequests.enabled }}
     - type: prometheus
       metadata:
         serverAddress: {{ .Values.keda.prometheusServerAddress | quote }}
-        query: |
-          sum(densecore_active_requests{app="{{ include "densecore.fullname" . }}"}) or vector(0)
-        threshold: {{ .Values.keda.activeRequestsThreshold | default "8" | quote }}
+        {{- /* Build query with correct pod selector labels for this release */}}
+        query: 'sum(densecore_active_requests{app_kubernetes_io_name="{{ include "densecore.name" . }}", app_kubernetes_io_instance="{{ .Release.Name }}"}) or vector(0)'
+        threshold: {{ .Values.keda.triggers.activeRequests.threshold | default "8" | quote }}
         metricName: densecore_active_requests
+    {{- end }}
 {{- end }}

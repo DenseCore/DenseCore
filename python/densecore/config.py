@@ -303,7 +303,7 @@ class SamplingParams:
     top_p: float = 1.0
     top_k: int = -1
     repetition_penalty: float = 1.0
-    stop: List[str] = field(default_factory=list)
+    stop: list[str] = field(default_factory=list)
 
     def to_generation_config(self) -> GenerationConfig:
         """Convert to GenerationConfig."""

@@ -8,7 +8,7 @@ metadata:
     {{- include "densecore.labels" . | nindent 4 }}
 spec:
   accessModes:
-    - ReadWriteMany
+    {{- .Values.model.pvc.accessModes | default (list "ReadWriteMany") | toYaml | nindent 4 }}
   {{- if .Values.model.pvc.storageClassName }}
   storageClassName: {{ .Values.model.pvc.storageClassName }}
   {{- end }}

@@ -364,12 +364,12 @@ void GemvInt4_AVX512_VNNI(float *output, const float *input,
                 __m256i w_hi = _mm256_unpackhi_epi8(lo_nibble, hi_nibble);
                 __m512i w_u8 = _mm512_inserti64x4(_mm512_castsi256_si512(w_lo), w_hi, 1);
 
+                // Load pre-quantized input (already INT8!)
+                __m512i a_s8 = _mm512_load_si512(reinterpret_cast<const __m512i*>(a_ptr + k));
+
                 // Input sum for zero-point correction
                 // dpbusd: u8 * s8 -> s32. Use 1 (u8) * a_s8 (s8) = a_s8
                 isum = _mm512_dpbusd_epi32(isum, _mm512_set1_epi8(1), a_s8);
-
-                // Load pre-quantized input (already INT8!)
-                __m512i a_s8 = _mm512_load_si512(reinterpret_cast<const __m512i*>(a_ptr + k));
 
                 // VNNI dot product: acc += u8 * s8
                 acc = _mm512_dpbusd_epi32(acc, w_u8, a_s8);
