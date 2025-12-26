@@ -295,18 +295,30 @@ if(APPLE)
 
     if(EXISTS ${METAL_SHADER_DIR})
         # Compile Metal shaders to metallib
+        # Note: metal -c cannot use -o with multiple input files,
+        # so we compile each .metal to .air separately, then link.
         set(METALLIB_OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/densecore.metallib)
+        set(AIR_FILES "")
+
+        foreach(SHADER ${METAL_SHADERS})
+            get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
+            set(AIR_FILE ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_NAME}.air)
+            list(APPEND AIR_FILES ${AIR_FILE})
+
+            add_custom_command(
+                OUTPUT ${AIR_FILE}
+                COMMAND xcrun -sdk macosx metal -c ${SHADER} -o ${AIR_FILE}
+                DEPENDS ${SHADER}
+                COMMENT "Compiling ${SHADER_NAME}.metal to AIR"
+                VERBATIM
+            )
+        endforeach()
 
         add_custom_command(
             OUTPUT ${METALLIB_OUTPUT}
-            COMMAND xcrun -sdk macosx metal
-                    -c ${METAL_SHADERS}
-                    -o ${CMAKE_CURRENT_BINARY_DIR}/densecore.air
-            COMMAND xcrun -sdk macosx metallib
-                    ${CMAKE_CURRENT_BINARY_DIR}/densecore.air
-                    -o ${METALLIB_OUTPUT}
-            DEPENDS ${METAL_SHADERS}
-            COMMENT "Compiling Metal shaders to metallib"
+            COMMAND xcrun -sdk macosx metallib ${AIR_FILES} -o ${METALLIB_OUTPUT}
+            DEPENDS ${AIR_FILES}
+            COMMENT "Linking Metal shaders into metallib"
             VERBATIM
         )
 
