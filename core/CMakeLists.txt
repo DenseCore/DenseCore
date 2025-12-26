@@ -628,6 +628,7 @@ if(DENSECORE_BUILD_TESTS)
         ${GGML_DIR}/include
         ${GGML_DIR}/src
         ${GGML_DIR}/src/ggml-cpu
+        ${simde_SOURCE_DIR}  # SIMDe for simd_platform.h
     )
 
     # Link dependencies directly (do NOT link densecore shared lib to avoid symbol conflicts/hiding)
