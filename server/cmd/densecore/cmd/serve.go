@@ -18,16 +18,19 @@ This mode emits structured JSON logs and handles proper signal handling for Kube
 Examples:
   densecore serve --model ./models/qwen2.5-0.5b-instruct-q4_k_m.gguf
   densecore serve --port 9090 --model /path/to/model.gguf
-  AUTH_ENABLED=true API_KEYS=sk-xxx:user1:enterprise densecore serve`,
+  densecore serve --auth --model ./model.gguf`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		auth, _ := cmd.Flags().GetBool("auth")
+		
 		opts := &server.Options{
-			Host:       viper.GetString("host"),
-			Port:       viper.GetInt("port"),
-			Verbose:    viper.GetBool("verbose"),
-			ModelPath:  viper.GetString("model"),
-			LogOutput:  os.Stdout, // Production mode: log to stdout
-			ShowBanner: true,      // Show ASCII banner
-			Background: false,     // Block and wait for signals
+			Host:        viper.GetString("host"),
+			Port:        viper.GetInt("port"),
+			Verbose:     viper.GetBool("verbose"),
+			ModelPath:   viper.GetString("model"),
+			LogOutput:   os.Stdout,
+			ShowBanner:  true,
+			Background:  false,
+			AuthEnabled: auth, // Pass directly, env var fallback handled in server.Start()
 		}
 		return server.Run(opts)
 	},
@@ -36,17 +39,10 @@ Examples:
 func init() {
 	serveCmd.Flags().StringP("model", "m", "", "Path to GGUF model file")
 	serveCmd.Flags().IntP("threads", "t", 0, "Number of inference threads (0 = auto-detect)")
-	serveCmd.Flags().Bool("auth", false, "Enable API Key authentication (sets AUTH_ENABLED=true)")
+	serveCmd.Flags().Bool("auth", false, "Enable API Key authentication")
 
 	viper.BindPFlag("model", serveCmd.Flags().Lookup("model"))
 	viper.BindPFlag("threads", serveCmd.Flags().Lookup("threads"))
-
-	// Handle --auth flag
-	serveCmd.PreRun = func(cmd *cobra.Command, args []string) {
-		if auth, _ := cmd.Flags().GetBool("auth"); auth {
-			os.Setenv("AUTH_ENABLED", "true")
-		}
-	}
 
 	rootCmd.AddCommand(serveCmd)
 }

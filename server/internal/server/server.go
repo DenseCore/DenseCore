@@ -42,10 +42,11 @@ type Options struct {
 	Port         int
 	ModelPath    string
 	Verbose      bool
-	LogOutput    io.Writer // If nil, defaults to os.Stdout. Use io.Discard to silence logs.
-	ShowBanner   bool      // Whether to print the ASCII banner
-	Background   bool      // If true, don't wait for shutdown signals (caller manages lifecycle)
+	LogOutput    io.Writer     // If nil, defaults to os.Stdout. Use io.Discard to silence logs.
+	ShowBanner   bool          // Whether to print the ASCII banner
+	Background   bool          // If true, don't wait for shutdown signals (caller manages lifecycle)
 	ShutdownChan chan struct{} // Channel to signal shutdown in background mode
+	AuthEnabled  bool          // Enable API key authentication
 }
 
 // ServerInstance represents a running server instance for external control
@@ -182,7 +183,8 @@ func Start(opts *Options) (*ServerInstance, error) {
 
 	// Initialize API key store
 	var apiKeyStore middleware.APIKeyStore
-	authEnabled := os.Getenv("AUTH_ENABLED") == envTrue
+	// Support both Options.AuthEnabled and environment variable fallback
+	authEnabled := opts.AuthEnabled || os.Getenv("AUTH_ENABLED") == envTrue
 
 	if authEnabled {
 		slog.Info("authentication enabled")
@@ -241,7 +243,13 @@ func Start(opts *Options) (*ServerInstance, error) {
 
 		if redisURL != "" && redisRateLimitEnabled {
 			redisDBStr := getEnvOrDefault("REDIS_DB", "0")
-			redisDB, _ := strconv.Atoi(redisDBStr)
+			redisDB, err := strconv.Atoi(redisDBStr)
+			if err != nil {
+				slog.Warn("invalid value for REDIS_DB, using default 0",
+					slog.String("value", redisDBStr),
+					slog.String("error", err.Error()))
+				redisDB = 0
+			}
 
 			redisRateLimiter, err := middleware.NewRedisRateLimiter(middleware.RedisRateLimiterConfig{
 				RedisURL:          redisURL,

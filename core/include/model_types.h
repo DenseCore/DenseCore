@@ -166,9 +166,17 @@ struct TransformerModel {
 };
 
 // Engine handle (DEPRECATED - use TransformerModel + PagedKVCache directly)
+// Suppress deprecated-declarations warning for intentional deprecated-to-deprecated usage
+#ifdef __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
 struct [[deprecated("Use TransformerModel with PagedKVCache directly")]] DenseCoreHandle_t {
     TransformerModel* model;
-    KVCache* kv_cache;  // Uses deprecated KVCache
+    KVCache* kv_cache;  // Uses deprecated KVCache (intentional)
 };
+#ifdef __GNUC__
+#pragma GCC diagnostic pop
+#endif
 
 #endif  // DENSECORE_MODEL_TYPES_H

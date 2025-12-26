@@ -41,7 +41,7 @@ var runCmd = &cobra.Command{
 			port = 8080
 		}
 
-		// UI 프로그램 실행
+		// Run the TUI program
 		p := tea.NewProgram(initialModel(modelName, filename, port), tea.WithAltScreen())
 		if _, err := p.Run(); err != nil {
 			fmt.Printf("Error: %v\n", err)

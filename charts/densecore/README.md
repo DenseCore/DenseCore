@@ -61,10 +61,25 @@ model:
 
 For production, use a PVC to avoid repeated downloads:
 
+```bash
+# Deploy with existing PVC - specify the exact filename in your PVC
+helm install densecore ./charts/densecore \
+  --set model.source="pvc" \
+  --set model.existingClaim="my-models-pvc" \
+  --set model.filename="llama-2-7b-chat.Q4_K_M.gguf"
+```
+
+> **Important**: `model.filename` must match the actual filename inside your PVC.  
+> The full path will be `{model.path}/{model.filename}` (default: `/models/llama-2-7b-chat.Q4_K_M.gguf`).
+
 ```yaml
+# values.yaml example
 model:
   source: pvc
-  existingClaim: "my-models-pvc"  # Pre-existing PVC
+  existingClaim: "my-models-pvc"  # Pre-existing PVC with your model
+  filename: "my-custom-model.gguf"  # Required: exact filename in PVC
+  path: "/models"  # Mount path (default)
+  
   # Or create a new PVC:
   pvc:
     storageClassName: "gp3"
@@ -79,6 +94,7 @@ model:
 model:
   source: hostPath
   hostPath: "/mnt/models"
+  filename: "my-model.gguf"  # Required: exact filename in hostPath
 ```
 
 ## Parameters

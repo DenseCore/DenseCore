@@ -107,7 +107,11 @@ spec:
             - name: PORT
               value: "8080"
             - name: MAIN_MODEL_PATH
+              {{- if eq .Values.model.source "huggingface" }}
               value: "/models/main_model.gguf"
+              {{- else }}
+              value: "{{ .Values.model.path }}/{{ .Values.model.filename }}"
+              {{- end }}
             - name: LOG_FORMAT
               value: {{ .Values.config.logFormat | quote }}
             - name: READ_TIMEOUT

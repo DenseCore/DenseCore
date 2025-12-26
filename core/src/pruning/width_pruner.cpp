@@ -35,7 +35,7 @@ std::vector<float> WidthPruner::ComputeDimensionImportance(const TransformerMode
 
     for (const auto& layer : model.layers) {
         // Process attention weights (wq, wk, wv output dimension)
-        auto process_weight = [&](const ggml_tensor* tensor, const char* name) {
+        auto process_weight = [&](const ggml_tensor* tensor, [[maybe_unused]] const char* name) {
             if (!tensor || !tensor->data)
                 return;
 
