@@ -36,12 +36,44 @@ This directory contains CI/CD workflows for automated testing, building, and dep
 **Triggers:** Version tags (`v*`), manual dispatch
 
 **Jobs:**
--  **create-release**: Generate changelog and create GitHub release
+- **create-release**: Generate changelog and create GitHub release
 - **build-artifacts**: Build binaries for Linux and macOS
-- **publish-python**: Publish Python package to PyPI
 
 **Required Secrets:**
-- `PYPI_API_TOKEN`
+- None (uses `GITHUB_TOKEN` automatically)
+
+### 📦 PyPI Workflow (`pypi-publish.yml`)
+
+**Triggers:** Version tags (`v*`), manual dispatch
+
+**Features:**
+- Multi-platform wheels via `cibuildwheel`:
+  - Linux x86_64 (manylinux)
+  - Linux ARM64 (AWS Graviton, manylinux_aarch64)
+  - macOS x86_64 (Intel)
+  - macOS ARM64 (Apple Silicon)
+- Python 3.9, 3.10, 3.11, 3.12
+- Trusted Publishing (no API token needed)
+
+**Required Secrets:**
+- None (uses PyPI Trusted Publishing)
+
+### ⎈ Helm Workflow (`helm-publish.yml`)
+
+**Triggers:** Version tags (`v*`), manual dispatch
+
+**Features:**
+- Automatic version extraction from git tag
+- Helm lint and template validation
+- Publish to GitHub Container Registry (OCI)
+
+**Usage:**
+```bash
+helm install densecore oci://ghcr.io/jake-network/charts/densecore --version 0.3.0
+```
+
+**Required Secrets:**
+- None (uses `GITHUB_TOKEN` automatically)
 
 ### ✅ Code Quality Workflow (`lint.yml`)
 
