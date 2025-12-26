@@ -2196,8 +2196,8 @@ void MetalBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor
     // ==========================================================================
     // CPU Fallback: Naive O(N^2) attention when GPU pipelines unavailable
     // ==========================================================================
-    std::cerr << "[MetalBackend] Warning: FlashAttention falling back to CPU. "
-              << "seq_q=" << seq_q << std::endl;
+    std::cerr << "[MetalBackend] Warning: FlashAttention falling back to CPU. seq_q=" << seq_q
+              << std::endl;
 
     const int n_rep = n_head / n_head_kv;  // GQA repetition factor
 

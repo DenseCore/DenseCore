@@ -21,8 +21,8 @@ struct ggml_tensor* SliceTensor(struct ggml_context* ctx, struct ggml_tensor* sr
 
     // Only allow F32 and F16 - pruning should happen before quantization
     if (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) {
-        std::cerr << "[TensorUtils] Error: SliceTensor only supports F32/F16. "
-                  << "Got type " << src->type << ". Prune before quantization." << std::endl;
+        std::cerr << "[TensorUtils] Error: SliceTensor only supports F32/F16. Got type "
+                  << src->type << ". Prune before quantization." << std::endl;
         return nullptr;
     }
 
@@ -33,13 +33,13 @@ struct ggml_tensor* SliceTensor(struct ggml_context* ctx, struct ggml_tensor* sr
     // Validate indices
     for (int idx : indices) {
         if (dim == AXIS_ROWS && (idx < 0 || idx >= src_rows)) {
-            std::cerr << "[TensorUtils] Error: Row index " << idx << " out of bounds "
-                      << "[0, " << src_rows << ")" << std::endl;
+            std::cerr << "[TensorUtils] Error: Row index " << idx << " out of bounds [0, "
+                      << src_rows << ")" << std::endl;
             return nullptr;
         }
         if (dim == AXIS_COLS && (idx < 0 || idx >= src_cols)) {
-            std::cerr << "[TensorUtils] Error: Col index " << idx << " out of bounds "
-                      << "[0, " << src_cols << ")" << std::endl;
+            std::cerr << "[TensorUtils] Error: Col index " << idx << " out of bounds [0, "
+                      << src_cols << ")" << std::endl;
             return nullptr;
         }
     }
@@ -129,8 +129,8 @@ struct ggml_tensor* Slice1DTensor(struct ggml_context* ctx, struct ggml_tensor* 
 
     // Only allow F32 and F16
     if (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) {
-        std::cerr << "[TensorUtils] Error: Slice1DTensor only supports F32/F16. "
-                  << "Got type " << src->type << std::endl;
+        std::cerr << "[TensorUtils] Error: Slice1DTensor only supports F32/F16. Got type "
+                  << src->type << std::endl;
         return nullptr;
     }
 
@@ -140,8 +140,8 @@ struct ggml_tensor* Slice1DTensor(struct ggml_context* ctx, struct ggml_tensor* 
     // Validate indices
     for (int idx : indices) {
         if (idx < 0 || idx >= src_size) {
-            std::cerr << "[TensorUtils] Error: Index " << idx << " out of bounds "
-                      << "[0, " << src_size << ")" << std::endl;
+            std::cerr << "[TensorUtils] Error: Index " << idx << " out of bounds [0, " << src_size
+                      << ")" << std::endl;
             return nullptr;
         }
     }
