@@ -1583,16 +1583,16 @@ inline void GemmInt4Fp32_AVX512(float* C, const float* A, const uint8_t* W_int4,
         int n = 0;
         for (; n + 16 <= N; n += 16) {
             // 16 accumulators for 16 output elements
-            __m512 acc00 = _mm512_setzero_ps();
-            __m512 acc01 = _mm512_setzero_ps();
-            __m512 acc02 = _mm512_setzero_ps();
-            __m512 acc03 = _mm512_setzero_ps();
-            __m512 acc04 = _mm512_setzero_ps();
-            __m512 acc05 = _mm512_setzero_ps();
-            __m512 acc06 = _mm512_setzero_ps();
-            __m512 acc07 = _mm512_setzero_ps();
-            __m512 acc08 = _mm512_setzero_ps();
-            __m512 acc09 = _mm512_setzero_ps();
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            __m512 acc2 = _mm512_setzero_ps();
+            __m512 acc3 = _mm512_setzero_ps();
+            __m512 acc4 = _mm512_setzero_ps();
+            __m512 acc5 = _mm512_setzero_ps();
+            __m512 acc6 = _mm512_setzero_ps();
+            __m512 acc7 = _mm512_setzero_ps();
+            __m512 acc8 = _mm512_setzero_ps();
+            __m512 acc9 = _mm512_setzero_ps();
             __m512 acc10 = _mm512_setzero_ps();
             __m512 acc11 = _mm512_setzero_ps();
             __m512 acc12 = _mm512_setzero_ps();
@@ -1669,14 +1669,14 @@ inline void GemmInt4Fp32_AVX512(float* C, const float* A, const uint8_t* W_int4,
         acc##idx = _mm512_fmadd_ps(a1, wf1, acc##idx);                                   \
     } while (0)
 
-                    PROCESS_ROW(00);
-                    PROCESS_ROW(01);
-                    PROCESS_ROW(02);
-                    PROCESS_ROW(03);
-                    PROCESS_ROW(04);
-                    PROCESS_ROW(05);
-                    PROCESS_ROW(06);
-                    PROCESS_ROW(07);
+                    PROCESS_ROW(0);
+                    PROCESS_ROW(1);
+                    PROCESS_ROW(2);
+                    PROCESS_ROW(3);
+                    PROCESS_ROW(4);
+                    PROCESS_ROW(5);
+                    PROCESS_ROW(6);
+                    PROCESS_ROW(7);
                     PROCESS_ROW(8);
                     PROCESS_ROW(9);
                     PROCESS_ROW(10);
@@ -1691,16 +1691,16 @@ inline void GemmInt4Fp32_AVX512(float* C, const float* A, const uint8_t* W_int4,
             }
 
             // Horizontal reduction and store results
-            C[m * N + n + 0] = _mm512_reduce_add_ps(acc00);
-            C[m * N + n + 1] = _mm512_reduce_add_ps(acc01);
-            C[m * N + n + 2] = _mm512_reduce_add_ps(acc02);
-            C[m * N + n + 3] = _mm512_reduce_add_ps(acc03);
-            C[m * N + n + 4] = _mm512_reduce_add_ps(acc04);
-            C[m * N + n + 5] = _mm512_reduce_add_ps(acc05);
-            C[m * N + n + 6] = _mm512_reduce_add_ps(acc06);
-            C[m * N + n + 7] = _mm512_reduce_add_ps(acc07);
-            C[m * N + n + 8] = _mm512_reduce_add_ps(acc08);
-            C[m * N + n + 9] = _mm512_reduce_add_ps(acc09);
+            C[m * N + n + 0] = _mm512_reduce_add_ps(acc0);
+            C[m * N + n + 1] = _mm512_reduce_add_ps(acc1);
+            C[m * N + n + 2] = _mm512_reduce_add_ps(acc2);
+            C[m * N + n + 3] = _mm512_reduce_add_ps(acc3);
+            C[m * N + n + 4] = _mm512_reduce_add_ps(acc4);
+            C[m * N + n + 5] = _mm512_reduce_add_ps(acc5);
+            C[m * N + n + 6] = _mm512_reduce_add_ps(acc6);
+            C[m * N + n + 7] = _mm512_reduce_add_ps(acc7);
+            C[m * N + n + 8] = _mm512_reduce_add_ps(acc8);
+            C[m * N + n + 9] = _mm512_reduce_add_ps(acc9);
             C[m * N + n + 10] = _mm512_reduce_add_ps(acc10);
             C[m * N + n + 11] = _mm512_reduce_add_ps(acc11);
             C[m * N + n + 12] = _mm512_reduce_add_ps(acc12);
