@@ -136,7 +136,6 @@ set(SOURCES
     src/cpu_backend_opt.cpp
     # Kernels (optimized SIMD implementations)
     src/kernels/cpu_int4.cpp
-    src/kernels/cpu_int4_avx512.cpp
     src/kernels/cpu_amx.cpp
     # Quantization module
     src/quantizer.cpp
