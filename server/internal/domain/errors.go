@@ -9,13 +9,13 @@ import "fmt"
 type ErrorCode string
 
 const (
-	ErrCodeInvalidRequest   ErrorCode = "invalid_request_error"
-	ErrCodeAuthentication   ErrorCode = "authentication_error"
-	ErrCodePermission       ErrorCode = "permission_error"
-	ErrCodeRateLimit        ErrorCode = "rate_limit_error"
-	ErrCodeModelNotLoaded   ErrorCode = "model_not_loaded"
-	ErrCodeOutOfMemory      ErrorCode = "out_of_memory"
-	ErrCodeInternalError    ErrorCode = "internal_error"
+	ErrCodeInvalidRequest     ErrorCode = "invalid_request_error"
+	ErrCodeAuthentication     ErrorCode = "authentication_error"
+	ErrCodePermission         ErrorCode = "permission_error"
+	ErrCodeRateLimit          ErrorCode = "rate_limit_error"
+	ErrCodeModelNotLoaded     ErrorCode = "model_not_loaded"
+	ErrCodeOutOfMemory        ErrorCode = "out_of_memory"
+	ErrCodeInternalError      ErrorCode = "internal_error"
 	ErrCodeServiceUnavailable ErrorCode = "service_unavailable"
 )
 
@@ -28,7 +28,7 @@ type AppError struct {
 	StatusCode int       `json:"-"` // HTTP status code (not serialized)
 	RequestID  string    `json:"request_id,omitempty"`
 	Param      string    `json:"param,omitempty"` // Parameter that caused error
-	Cause      error     `json:"-"` // Underlying error (not serialized)
+	Cause      error     `json:"-"`               // Underlying error (not serialized)
 }
 
 /**

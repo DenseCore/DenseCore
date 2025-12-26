@@ -9,66 +9,67 @@
 #ifndef DENSECORE_KERNEL_CONTEXT_H
 #define DENSECORE_KERNEL_CONTEXT_H
 
-#include "aligned_allocator.h"
 #include <cstddef>
 #include <cstdint>
+
+#include "aligned_allocator.h"
 
 namespace densecore {
 
 class KernelContext {
 public:
-  /**
-   * @brief Create context with initial scratchpad size
-   * @param scratchpad_bytes Initial size of scratchpad memory (default: 64KB)
-   */
-  explicit KernelContext(size_t scratchpad_bytes = 64 * 1024);
-  ~KernelContext();
+    /**
+     * @brief Create context with initial scratchpad size
+     * @param scratchpad_bytes Initial size of scratchpad memory (default: 64KB)
+     */
+    explicit KernelContext(size_t scratchpad_bytes = 64 * 1024);
+    ~KernelContext();
 
-  // Prevent copying (hardware state is non-copyable)
-  KernelContext(const KernelContext &) = delete;
-  KernelContext &operator=(const KernelContext &) = delete;
+    // Prevent copying (hardware state is non-copyable)
+    KernelContext(const KernelContext&) = delete;
+    KernelContext& operator=(const KernelContext&) = delete;
 
-  // Move semantics
-  KernelContext(KernelContext &&) noexcept;
-  KernelContext &operator=(KernelContext &&) noexcept;
+    // Move semantics
+    KernelContext(KernelContext&&) noexcept;
+    KernelContext& operator=(KernelContext&&) noexcept;
 
-  /**
-   * @brief Configure AMX tiles for matrix multiplication
-   *
-   * Sets up 2D register tiles (palette 1) for TMUL operations.
-   * This operation is expensive (requires syscall or intense setup), so
-   * we only re-configure if parameters change.
-   *
-   * @param rows Number of rows (tile height)
-   * @param cols Number of columns (tile width in bytes)
-   */
-  void ConfigureAMX(int rows, int cols);
+    /**
+     * @brief Configure AMX tiles for matrix multiplication
+     *
+     * Sets up 2D register tiles (palette 1) for TMUL operations.
+     * This operation is expensive (requires syscall or intense setup), so
+     * we only re-configure if parameters change.
+     *
+     * @param rows Number of rows (tile height)
+     * @param cols Number of columns (tile width in bytes)
+     */
+    void ConfigureAMX(int rows, int cols);
 
-  /**
-   * @brief Get pointer to aligned scratchpad memory
-   */
-  void *ScratchpadData() { return scratchpad_.get(); }
+    /**
+     * @brief Get pointer to aligned scratchpad memory
+     */
+    void* ScratchpadData() { return scratchpad_.get(); }
 
-  /**
-   * @brief Get current scratchpad size
-   */
-  size_t ScratchpadSize() const { return scratchpad_size_; }
+    /**
+     * @brief Get current scratchpad size
+     */
+    size_t ScratchpadSize() const { return scratchpad_size_; }
 
-  /**
-   * @brief Resize scratchpad (preserves content not guaranteed)
-   */
-  void ResizeScratchpad(size_t new_size);
+    /**
+     * @brief Resize scratchpad (preserves content not guaranteed)
+     */
+    void ResizeScratchpad(size_t new_size);
 
 private:
-  AlignedPtr<uint8_t> scratchpad_;
-  size_t scratchpad_size_ = 0;
+    AlignedPtr<uint8_t> scratchpad_;
+    size_t scratchpad_size_ = 0;
 
-  // AMX State caching
-  bool amx_configured_ = false;
-  int cached_rows_ = 0;
-  int cached_cols_ = 0;
+    // AMX State caching
+    bool amx_configured_ = false;
+    int cached_rows_ = 0;
+    int cached_cols_ = 0;
 };
 
-} // namespace densecore
+}  // namespace densecore
 
-#endif // DENSECORE_KERNEL_CONTEXT_H
+#endif  // DENSECORE_KERNEL_CONTEXT_H

@@ -12,15 +12,13 @@ import platform
 import queue
 import threading
 import warnings
-from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     Any,
-    AsyncIterator,
     Callable,
-    Iterator,
     List,
     Optional,
     TypeVar,
@@ -35,8 +33,7 @@ except ImportError:
     HUGGINGFACE_HUB_AVAILABLE = False
 
 from .config import GenerationConfig, ModelConfig
-from .lora import LoRAManager, is_lora_adapter_repo, download_lora_adapter
-
+from .lora import LoRAManager
 
 # ==============================================================================
 # GIL Release Architecture

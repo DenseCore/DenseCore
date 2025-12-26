@@ -264,7 +264,7 @@ def from_pretrained(
         >>> model = densecore.from_pretrained("./models/llama.gguf")
     """
     from .engine import DenseCore
-    from .lora import is_lora_adapter_repo, download_lora_adapter
+    from .lora import download_lora_adapter, is_lora_adapter_repo
 
     # Check if this is a LoRA adapter repository
     lora_adapter_path = None

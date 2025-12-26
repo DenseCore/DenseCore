@@ -190,7 +190,7 @@ If configuration doesn't match reality:
 #include "numa_allocator.h"
 
 // Verify allocation placement
-densecore::MemoryDiagnostics::DiagResult result = 
+densecore::MemoryDiagnostics::DiagResult result =
     densecore::MemoryDiagnostics::PrintSystemTopologyReport(
         ptr,           // Memory pointer
         size,          // Size in bytes

@@ -39,24 +39,23 @@ constexpr size_t DEFAULT_ALIGNMENT = 64;
  * @param alignment Required alignment (must be power of 2, >= sizeof(void*))
  * @return Pointer to aligned memory, nullptr on failure
  */
-inline void *aligned_alloc_raw(size_t size,
-                               size_t alignment = DEFAULT_ALIGNMENT) {
-  if (size == 0)
-    return nullptr;
+inline void* aligned_alloc_raw(size_t size, size_t alignment = DEFAULT_ALIGNMENT) {
+    if (size == 0)
+        return nullptr;
 
-  // Ensure alignment is at least sizeof(void*) and power of 2
-  if (alignment < sizeof(void *)) {
-    alignment = sizeof(void *);
-  }
+    // Ensure alignment is at least sizeof(void*) and power of 2
+    if (alignment < sizeof(void*)) {
+        alignment = sizeof(void*);
+    }
 
 #ifdef _WIN32
-  return _aligned_malloc(size, alignment);
+    return _aligned_malloc(size, alignment);
 #else
-  void *ptr = nullptr;
-  if (posix_memalign(&ptr, alignment, size) != 0) {
-    return nullptr;
-  }
-  return ptr;
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, size) != 0) {
+        return nullptr;
+    }
+    return ptr;
 #endif
 }
 
@@ -64,14 +63,14 @@ inline void *aligned_alloc_raw(size_t size,
  * @brief Free aligned memory
  * @param ptr Pointer previously returned by aligned_alloc_raw
  */
-inline void aligned_free(void *ptr) noexcept {
-  if (!ptr)
-    return;
+inline void aligned_free(void* ptr) noexcept {
+    if (!ptr)
+        return;
 
 #ifdef _WIN32
-  _aligned_free(ptr);
+    _aligned_free(ptr);
 #else
-  free(ptr);
+    free(ptr);
 #endif
 }
 
@@ -88,8 +87,8 @@ inline void aligned_free(void *ptr) noexcept {
  * @return Pointer to aligned array, nullptr on failure
  */
 template <typename T>
-T *aligned_alloc(size_t count, size_t alignment = DEFAULT_ALIGNMENT) {
-  return static_cast<T *>(aligned_alloc_raw(count * sizeof(T), alignment));
+T* aligned_alloc(size_t count, size_t alignment = DEFAULT_ALIGNMENT) {
+    return static_cast<T*>(aligned_alloc_raw(count * sizeof(T), alignment));
 }
 
 // =============================================================================
@@ -100,8 +99,9 @@ T *aligned_alloc(size_t count, size_t alignment = DEFAULT_ALIGNMENT) {
  * @brief Custom deleter for aligned memory (use with std::unique_ptr<T[],
  * AlignedDeleter<T>>)
  */
-template <typename T> struct AlignedDeleter {
-  void operator()(T *ptr) const noexcept { aligned_free(ptr); }
+template <typename T>
+struct AlignedDeleter {
+    void operator()(T* ptr) const noexcept { aligned_free(ptr); }
 };
 
 /**
@@ -125,11 +125,11 @@ using AlignedPtr = std::unique_ptr<T[], AlignedDeleter<T>>;
  */
 template <typename T>
 AlignedPtr<T> make_aligned(size_t count, size_t alignment = DEFAULT_ALIGNMENT) {
-  T *ptr = aligned_alloc<T>(count, alignment);
-  if (!ptr && count > 0) {
-    throw std::bad_alloc();
-  }
-  return AlignedPtr<T>(ptr);
+    T* ptr = aligned_alloc<T>(count, alignment);
+    if (!ptr && count > 0) {
+        throw std::bad_alloc();
+    }
+    return AlignedPtr<T>(ptr);
 }
 
 class DeviceAllocator {
@@ -154,52 +154,51 @@ class DeviceAllocator {
 template <typename T, size_t Alignment = DEFAULT_ALIGNMENT>
 class AlignedAllocator {
 public:
-  using value_type = T;
-  using size_type = std::size_t;
-  using difference_type = std::ptrdiff_t;
-  using propagate_on_container_move_assignment = std::true_type;
-  using is_always_equal = std::true_type;
+    using value_type = T;
+    using size_type = std::size_t;
+    using difference_type = std::ptrdiff_t;
+    using propagate_on_container_move_assignment = std::true_type;
+    using is_always_equal = std::true_type;
 
-  constexpr AlignedAllocator() noexcept = default;
+    constexpr AlignedAllocator() noexcept = default;
 
-  template <typename U>
-  constexpr AlignedAllocator(const AlignedAllocator<U, Alignment> &) noexcept {}
+    template <typename U>
+    constexpr AlignedAllocator(const AlignedAllocator<U, Alignment>&) noexcept {}
 
-  [[nodiscard]] T *allocate(size_type n) {
-    if (n == 0)
-      return nullptr;
+    [[nodiscard]] T* allocate(size_type n) {
+        if (n == 0)
+            return nullptr;
 
-    // Check for overflow
-    if (n > static_cast<size_type>(-1) / sizeof(T)) {
-      throw std::bad_alloc();
+        // Check for overflow
+        if (n > static_cast<size_type>(-1) / sizeof(T)) {
+            throw std::bad_alloc();
+        }
+
+        T* ptr = aligned_alloc<T>(n, Alignment);
+        if (!ptr) {
+            throw std::bad_alloc();
+        }
+        return ptr;
     }
 
-    T *ptr = aligned_alloc<T>(n, Alignment);
-    if (!ptr) {
-      throw std::bad_alloc();
-    }
-    return ptr;
-  }
+    void deallocate(T* ptr, size_type /*n*/) noexcept { aligned_free(ptr); }
 
-  void deallocate(T *ptr, size_type /*n*/) noexcept { aligned_free(ptr); }
-
-  // Rebind for containers that allocate auxiliary nodes (e.g., std::list)
-  template <typename U> struct rebind {
-    using other = AlignedAllocator<U, Alignment>;
-  };
+    // Rebind for containers that allocate auxiliary nodes (e.g., std::list)
+    template <typename U>
+    struct rebind {
+        using other = AlignedAllocator<U, Alignment>;
+    };
 };
 
 // Allocator comparison operators
 template <typename T, typename U, size_t A>
-bool operator==(const AlignedAllocator<T, A> &,
-                const AlignedAllocator<U, A> &) noexcept {
-  return true;
+bool operator==(const AlignedAllocator<T, A>&, const AlignedAllocator<U, A>&) noexcept {
+    return true;
 }
 
 template <typename T, typename U, size_t A>
-bool operator!=(const AlignedAllocator<T, A> &,
-                const AlignedAllocator<U, A> &) noexcept {
-  return false;
+bool operator!=(const AlignedAllocator<T, A>&, const AlignedAllocator<U, A>&) noexcept {
+    return false;
 }
 
 // =============================================================================
@@ -210,6 +209,6 @@ bool operator!=(const AlignedAllocator<T, A> &,
 template <typename T>
 using AlignedVector = std::vector<T, AlignedAllocator<T, DEFAULT_ALIGNMENT>>;
 
-} // namespace densecore
+}  // namespace densecore
 
-#endif // DENSECORE_ALIGNED_ALLOCATOR_H
+#endif  // DENSECORE_ALIGNED_ALLOCATOR_H

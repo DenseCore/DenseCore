@@ -9,25 +9,22 @@ namespace densecore {
 // Uses magnitude-based importance scoring
 class DepthPruner : public Pruner {
 public:
-  explicit DepthPruner(const PruneConfig &config) : Pruner(config) {}
+    explicit DepthPruner(const PruneConfig& config) : Pruner(config) {}
 
-  std::vector<float>
-  ComputeImportanceScores(const TransformerModel &model) override;
-  void PruneModel(TransformerModel *model) override;
+    std::vector<float> ComputeImportanceScores(const TransformerModel& model) override;
+    void PruneModel(TransformerModel* model) override;
 
 private:
-  // Compute importance score for a single layer
-  float ComputeLayerImportance(const TransformerLayer &layer);
+    // Compute importance score for a single layer
+    float ComputeLayerImportance(const TransformerLayer& layer);
 
-  // Select layers to remove based on importance scores
-  std::vector<int> SelectLayersToRemove(const std::vector<float> &scores,
-                                        int target_count);
+    // Select layers to remove based on importance scores
+    std::vector<int> SelectLayersToRemove(const std::vector<float>& scores, int target_count);
 
-  // Remove specified layers from model
-  void RemoveLayers(TransformerModel *model,
-                    const std::vector<int> &layers_to_remove);
+    // Remove specified layers from model
+    void RemoveLayers(TransformerModel* model, const std::vector<int>& layers_to_remove);
 };
 
-} // namespace densecore
+}  // namespace densecore
 
-#endif // DENSECORE_DEPTH_PRUNER_H
+#endif  // DENSECORE_DEPTH_PRUNER_H

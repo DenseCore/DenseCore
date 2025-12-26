@@ -2,6 +2,7 @@
 #define DENSECORE_TENSOR_UTILS_H
 
 #include <ggml.h>
+
 #include <vector>
 
 namespace densecore {
@@ -44,9 +45,8 @@ int AlignToMultiple(int val, int multiple);
  *   // Slice rows 0, 2, 4 from a [8, 1024] tensor -> [3, 1024] tensor
  *   auto sliced = SliceTensor(ctx, weight, {0, 2, 4}, AXIS_ROWS);
  */
-struct ggml_tensor *SliceTensor(struct ggml_context *ctx,
-                                struct ggml_tensor *src,
-                                const std::vector<int> &indices, int dim);
+struct ggml_tensor* SliceTensor(struct ggml_context* ctx, struct ggml_tensor* src,
+                                const std::vector<int>& indices, int dim);
 
 /**
  * @brief Slice a 1D tensor (e.g., layer norms, biases).
@@ -58,11 +58,10 @@ struct ggml_tensor *SliceTensor(struct ggml_context *ctx,
  * @param indices Indices to keep
  * @return Pointer to new sliced 1D tensor, or nullptr on error.
  */
-struct ggml_tensor *Slice1DTensor(struct ggml_context *ctx,
-                                  struct ggml_tensor *src,
-                                  const std::vector<int> &indices);
+struct ggml_tensor* Slice1DTensor(struct ggml_context* ctx, struct ggml_tensor* src,
+                                  const std::vector<int>& indices);
 
-} // namespace TensorUtils
-} // namespace densecore
+}  // namespace TensorUtils
+}  // namespace densecore
 
-#endif // DENSECORE_TENSOR_UTILS_H
+#endif  // DENSECORE_TENSOR_UTILS_H

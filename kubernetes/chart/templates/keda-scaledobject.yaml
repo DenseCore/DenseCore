@@ -24,15 +24,15 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: {{ include "densecore.fullname" . }}
-  
+
   # Scaling bounds
   minReplicaCount: {{ .Values.autoscaling.minReplicas }}
   maxReplicaCount: {{ .Values.autoscaling.maxReplicas }}
-  
+
   # Cooldown periods (seconds)
   cooldownPeriod: {{ .Values.autoscaling.keda.cooldownPeriod }}
   pollingInterval: {{ .Values.autoscaling.keda.pollingInterval }}
-  
+
   # Advanced settings
   advanced:
     restoreToOriginalReplicaCount: false
@@ -50,7 +50,7 @@ spec:
             - type: Pods
               value: 2
               periodSeconds: 30
-  
+
   # Triggers - Prometheus metrics
   triggers:
     {{- if .Values.autoscaling.keda.triggers.pendingRequests.enabled }}
@@ -64,7 +64,7 @@ spec:
         threshold: {{ .Values.autoscaling.keda.triggers.pendingRequests.threshold | quote }}
         metricName: {{ include "densecore.fullname" . }}_pending_requests
     {{- end }}
-    
+
     {{- if .Values.autoscaling.keda.triggers.activeRequests.enabled }}
     # Secondary: Active requests (for burst handling)
     - type: prometheus

@@ -151,7 +151,7 @@ struct QuantConfig {
     int block_size;               // 32, 64, or 128
     bool skip_output_layer;       // Keep lm_head in FP16
     bool skip_embeddings;         // Keep embeddings in FP16
-    
+
     bool IsCustomFormat() const;  // Returns true for INT4_BLOCKWISE
 };
 ```
@@ -163,7 +163,7 @@ struct TensorInt4 {
     void *q_data;         // Packed INT4 weights [N × K/2]
     float *scales;        // Per-block scales [N × NumGroups]
     float *zero_points;   // Per-block zeros [N × NumGroups]
-    
+
     int group_size;       // Block size (32, 64, 128)
     int num_blocks;       // Total blocks (N × NumGroups)
     int64_t ne[4];        // Original tensor dimensions
@@ -224,7 +224,7 @@ Reduction: 7× less memory traffic
 ```
 Asymmetric block-wise quantization:
   q = round((w - zero_point) / scale)
-  
+
 Where:
   scale = (max - min) / 15
   zero_point = round(-min / scale) - 8

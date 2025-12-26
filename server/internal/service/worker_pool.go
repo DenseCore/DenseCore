@@ -46,7 +46,7 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 		// 1. Dequeue request (blocks until available)
 		req, ok := p.queue.Dequeue(ctx)
 		if !ok {
-			// Queue closed or context cancelled
+			// Queue closed or context canceled
 			slog.Debug("worker stopping", slog.Int("worker_id", workerID))
 			return
 		}
@@ -56,7 +56,6 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 			slog.String("req_id", req.ID),
 			slog.String("priority", fmtPriority(req.Priority)),
 		)
-
 
 		// 2. Prepare channels
 		// workerChan: receives tokens from Engine (C++)
@@ -85,7 +84,7 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 
 		if err != nil {
 			slog.Error("engine submission failed", slog.String("req_id", req.ID), slog.String("error", err.Error()))
-			
+
 			// Send error to ChatService
 			select {
 			case req.ResultChan <- err:
@@ -107,7 +106,8 @@ func (p *QueueProcessor) workerLoop(workerID int) {
 			// We just drain and exit.
 			// context cancellation handled by engine
 			go func() {
-				for range workerChan {}
+				for range workerChan {
+				}
 			}()
 			close(userChan)
 		}

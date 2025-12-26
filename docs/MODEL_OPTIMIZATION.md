@@ -30,18 +30,18 @@ DenseCore supports two primary model optimization techniques:
 ```mermaid
 graph TD
     Start[Need to optimize model?] --> Size{Primary goal?}
-    
+
     Size -->|Reduce size| Quant[Quantization]
     Size -->|Reduce latency| Both[Quantization + Pruning]
     Size -->|Balance both| Quant2[Start with Quantization]
-    
+
     Quant --> Q4K[Use Q4_K_M for 4x compression]
     Quant2 --> Test[Test quality]
     Test -->|Good enough| Done[Deploy]
     Test -->|Quality loss| Prune[Add Pruning]
-    
+
     Both --> Q8[Use Q8_0 + Depth Pruning]
-    
+
     style Quant fill:#e1f5ff
     style Prune fill:#ffe1f5
     style Q4K fill:#e1ffe1
@@ -208,7 +208,7 @@ test_prompts = [
 for prompt in test_prompts:
     orig_response = original.generate(prompt, max_tokens=50)
     quant_response = quantized.generate(prompt, max_tokens=50)
-    
+
     print(f"Prompt: {prompt}")
     print(f"Original:  {orig_response[:100]}...")
     print(f"Quantized: {quant_response[:100]}...")
@@ -303,7 +303,7 @@ prune_model("model.gguf", "model-pruned.gguf", DEPTH_PRUNE_25_CFG)
 
 ### Quantization Performance
 
-**Model:** Qwen2.5-7B  
+**Model:** Qwen2.5-7B
 **Hardware:** Intel i7-10870H (8 cores), 16GB RAM
 
 | Format | Size | TPS (Short) | TPS (Long) | Perplexity ↑ |
@@ -321,7 +321,7 @@ prune_model("model.gguf", "model-pruned.gguf", DEPTH_PRUNE_25_CFG)
 
 ### Pruning Performance
 
-**Model:** Llama-2-7B (32 layers)  
+**Model:** Llama-2-7B (32 layers)
 **Method:** Depth pruning (magnitude-based)
 
 | Config | Layers | Size | TPS | Perplexity ↑ |
@@ -332,7 +332,7 @@ prune_model("model.gguf", "model-pruned.gguf", DEPTH_PRUNE_25_CFG)
 
 ### Combined Optimization
 
-**Model:** Llama-2-7B  
+**Model:** Llama-2-7B
 **Strategy:** Depth pruning 50% + Q4_K_M quantization
 
 | Metric | Original | Optimized | Change |
@@ -364,12 +364,12 @@ Generic benchmarks (perplexity, MMLU) may not reflect your use case:
 def evaluate_on_task(model_path):
     model = DenseCore(model_path)
     scores = []
-    
+
     for example in your_test_set:
         response = model.generate(example.prompt)
         score = compute_task_metric(response, example.expected)
         scores.append(score)
-    
+
     return sum(scores) / len(scores)
 
 # Compare

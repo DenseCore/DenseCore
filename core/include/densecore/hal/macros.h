@@ -121,4 +121,4 @@
 // Interface helper
 #define DENSECORE_INTERFACE struct
 
-#endif // DENSECORE_HAL_MACROS_H
+#endif  // DENSECORE_HAL_MACROS_H

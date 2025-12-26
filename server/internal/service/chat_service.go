@@ -51,13 +51,13 @@ func (s *ChatService) GenerateStream(ctx context.Context, req domain.ChatComplet
 
 	// Create QueuedRequest
 	queuedReq := &queue.QueuedRequest{
-		ID:          uuid.New().String(),
-		Priority:    queue.RequestPriority(0),     // Default priority
-		MaxTokens:   req.MaxTokens,
-		Prompt:      prompt,
-		JSONMode:    jsonMode,
-		Context:     ctx,
-		ResultChan:  make(chan interface{}, 1),
+		ID:         uuid.New().String(),
+		Priority:   queue.RequestPriority(0), // Default priority
+		MaxTokens:  req.MaxTokens,
+		Prompt:     prompt,
+		JSONMode:   jsonMode,
+		Context:    ctx,
+		ResultChan: make(chan interface{}, 1),
 	}
 
 	// Enqueue with backpressure

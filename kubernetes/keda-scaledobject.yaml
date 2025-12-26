@@ -22,15 +22,15 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: densecore
-  
+
   # Scaling bounds
   minReplicaCount: 1
   maxReplicaCount: 10
-  
+
   # Cooldown periods (seconds)
   cooldownPeriod: 60           # Wait 60s after last trigger before scale-down
   pollingInterval: 15          # Check metrics every 15s
-  
+
   # Advanced settings
   advanced:
     restoreToOriginalReplicaCount: false  # Don't restore on ScaledObject delete
@@ -48,7 +48,7 @@ spec:
             - type: Pods
               value: 2         # Add max 2 pods at a time
               periodSeconds: 30
-  
+
   # Triggers - Queue depth from Prometheus
   triggers:
     # Primary: Pending request queue depth
@@ -59,7 +59,7 @@ spec:
           sum(densecore_pending_requests{app="densecore"}) or vector(0)
         threshold: "5"         # Target: 5 pending requests per replica
         metricName: densecore_pending_requests
-    
+
     # Secondary: Active requests (for burst handling)
     - type: prometheus
       metadata:

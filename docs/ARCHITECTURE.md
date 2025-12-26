@@ -27,32 +27,32 @@ graph TB
         GoServer[Go REST Server]
         CLI[CLI Tools]
     end
-    
+
     subgraph "Layer 2: Inference Engine (C++)"
         Scheduler[Request Scheduler]
         Worker[Inference Worker]
         KVCache[Paged KV Cache]
         ModelMgr[Model Manager]
     end
-    
+
     subgraph "Layer 3: Compute Backend"
         GGML[GGML Tensor Ops]
         Quant[Quantization]
         SIMD[SIMD Kernels AVX2/AVX-512]
     end
-    
+
     PySDK --> |ctypes FFI| Scheduler
     GoServer --> |CGO| Scheduler
     CLI --> |Direct Link| Scheduler
-    
+
     Scheduler --> Worker
     Worker --> KVCache
     Worker --> ModelMgr
     Worker --> GGML
-    
+
     GGML --> Quant
     GGML --> SIMD
-    
+
     style PySDK fill:#e1f5ff
     style GoServer fill:#e1ffe1
     style Worker fill:#fff4e1
@@ -196,15 +196,15 @@ from densecore.bindings import libdensecore, DenseCoreHandle
 class DenseCore:
     async def stream_async(self, prompt: str, **kwargs):
         queue = asyncio.Queue()
-        
+
         def callback(token: str, is_finished: int, user_data):
             asyncio.create_task(queue.put((token, is_finished)))
-        
+
         # Submit to C++ engine (non-blocking)
         request_id = libdensecore.SubmitRequest(
             self._handle, prompt, callback, None
         )
-        
+
         # Yield tokens as they arrive
         while True:
             token, is_finished = await queue.get()
@@ -288,14 +288,14 @@ The scheduler attempts to batch compatible requests:
 // Pseudo-code from worker.cpp
 while (true) {
     std::vector<Request*> batch;
-    
+
     // Collect up to max_batch_size requests
     while (batch.size() < max_batch_size && !pending_requests_.empty()) {
         auto req = pending_requests_.front();
         pending_requests_.pop();
         batch.push_back(req);
     }
-    
+
     // Process batch
     ProcessBatch(batch);
 }
@@ -338,9 +338,9 @@ Loop until stopping condition:
         - Execute graph → logits
         - Sample next token
         - Append to KV cache
-    
+
     2. Invoke callback with new token
-    
+
     3. Check stopping:
         - max_tokens reached?
         - EOS token generated?
@@ -378,7 +378,7 @@ Traditional KV cache pre-allocates contiguous memory for max sequence length:
 ```
 ✅ Paged: [Block 0] → [Block 1] → [Block 2] → ...
            16 tokens   16 tokens   16 tokens
-           
+
 Only allocate blocks as needed!
 ```
 
@@ -393,12 +393,12 @@ Only allocate blocks as needed!
 class PagedKVCache {
     std::vector<KVBlock> free_blocks_;  // Available blocks
     std::unordered_map<int, std::vector<int>> seq_to_blocks_;  // seq_id → block_ids
-    
+
 public:
     std::vector<int> AllocateBlocks(int seq_id, int num_tokens) {
         int num_blocks = (num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE;
         std::vector<int> allocated;
-        
+
         for (int i = 0; i < num_blocks; i++) {
             if (free_blocks_.empty()) {
                 EvictLRU();  // Evict least recently used sequence
@@ -406,7 +406,7 @@ public:
             allocated.push_back(free_blocks_.back().id);
             free_blocks_.pop_back();
         }
-        
+
         seq_to_blocks_[seq_id] = allocated;
         return allocated;
     }
@@ -477,13 +477,13 @@ GGML automatically selects optimal kernels for your CPU:
 // Matrix multiplication with AVX2 (8 floats at once)
 void ggml_vec_dot_f32(int n, float* result, const float* a, const float* b) {
     __m256 sum = _mm256_setzero_ps();
-    
+
     for (int i = 0; i < n; i += 8) {
         __m256 va = _mm256_loadu_ps(a + i);
         __m256 vb = _mm256_loadu_ps(b + i);
         sum = _mm256_fmadd_ps(va, vb, sum);  // Fused multiply-add
     }
-    
+
     // Horizontal sum
     *result = _mm256_reduce_add_ps(sum);
 }

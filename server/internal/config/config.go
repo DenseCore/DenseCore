@@ -9,6 +9,9 @@ import (
 	"time"
 )
 
+// Environment value constants to avoid magic strings
+const envValueTrue = "true"
+
 // ServerConfig holds all server configuration
 type ServerConfig struct {
 	// Server settings
@@ -48,7 +51,6 @@ type ServerConfig struct {
 	// Metrics
 	MetricsEnabled bool   `json:"metrics_enabled"`
 	MetricsPath    string `json:"metrics_path"`
-
 }
 
 // DefaultConfig returns config with sensible defaults for production
@@ -81,7 +83,6 @@ func DefaultConfig() *ServerConfig {
 
 		MetricsEnabled: true,
 		MetricsPath:    "/metrics",
-
 	}
 }
 
@@ -116,7 +117,7 @@ func LoadFromEnv() (*ServerConfig, error) {
 
 	// Rate Limiting
 	if v := os.Getenv("RATE_LIMIT_ENABLED"); v != "" {
-		cfg.RateLimitEnabled = strings.ToLower(v) == "true" || v == "1"
+		cfg.RateLimitEnabled = strings.ToLower(v) == envValueTrue || v == "1"
 	}
 	if v := os.Getenv("RATE_LIMIT_RPS"); v != "" {
 		if rps, err := strconv.Atoi(v); err == nil {
@@ -145,7 +146,7 @@ func LoadFromEnv() (*ServerConfig, error) {
 
 	// CPU Optimization
 	if v := os.Getenv("CPU_AFFINITY"); v != "" {
-		cfg.EnableCPUAffinity = strings.ToLower(v) == "true" || v == "1"
+		cfg.EnableCPUAffinity = strings.ToLower(v) == envValueTrue || v == "1"
 	}
 	if v := os.Getenv("MAX_CONCURRENCY"); v != "" {
 		if conc, err := strconv.Atoi(v); err == nil {
@@ -155,7 +156,7 @@ func LoadFromEnv() (*ServerConfig, error) {
 
 	// CORS
 	if v := os.Getenv("CORS_ENABLED"); v != "" {
-		cfg.CORSEnabled = strings.ToLower(v) == "true" || v == "1"
+		cfg.CORSEnabled = strings.ToLower(v) == envValueTrue || v == "1"
 	}
 	if v := os.Getenv("CORS_ORIGINS"); v != "" {
 		cfg.CORSAllowedOrigins = strings.Split(v, ",")
@@ -168,8 +169,6 @@ func LoadFromEnv() (*ServerConfig, error) {
 	if v := os.Getenv("LOG_FORMAT"); v != "" {
 		cfg.LogFormat = v
 	}
-
-
 
 	return cfg, nil
 }

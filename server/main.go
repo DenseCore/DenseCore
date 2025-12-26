@@ -89,15 +89,13 @@ func main() {
 		slog.Info("no model path specified, use /v1/models/load to load a model")
 	}
 
-
-
 	// Initialize Request Queue and Worker Pool
 	// queueSize 1024 allows buffering bursts of traffic
 	requestQueue := queue.NewRequestQueue(1024)
-	
+
 	// Start Worker Pool
-	// We use 'threads' as the number of concurrent workers. 
-	// This ensures we don't oversubscribe the CPU if the engine handles concurrency, 
+	// We use 'threads' as the number of concurrent workers.
+	// This ensures we don't oversubscribe the CPU if the engine handles concurrency,
 	// or we process N requests in parallel.
 	workerPool := service.NewQueueProcessor(requestQueue, modelService)
 	workerPool.Start(threads)
@@ -256,13 +254,15 @@ func main() {
 		// Attempt graceful shutdown
 		if err := server.Shutdown(ctx); err != nil {
 			slog.Error("graceful shutdown failed, forcing close", slog.String("error", err.Error()))
-			server.Close()
+			if closeErr := server.Close(); closeErr != nil {
+				slog.Error("failed to close server", slog.String("error", closeErr.Error()))
+			}
 		}
 
 		// Cleanup resources
 		slog.Info("stopping worker pool")
 		workerPool.Stop()
-		
+
 		slog.Info("unloading model")
 		if err := modelService.UnloadModel(); err != nil {
 			slog.Error("failed to unload model", slog.String("error", err.Error()))
@@ -281,11 +281,11 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	authEnabled := os.Getenv("AUTH_ENABLED") == "true"
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"name":            "DenseCore API Server",
-		"version":         version,
-		"description":     "Cloud-native CPU inference engine with OpenAI-compatible API",
-		"authentication":  authEnabled,
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"name":           "DenseCore API Server",
+		"version":        version,
+		"description":    "Cloud-native CPU inference engine with OpenAI-compatible API",
+		"authentication": authEnabled,
 		"endpoints": map[string]string{
 			"chat":       "/v1/chat/completions",
 			"embeddings": "/v1/embeddings",
@@ -324,5 +324,3 @@ func loadAPIKeys(store *middleware.InMemoryKeyStore, apiKeysEnv string) {
 		slog.Info("loaded API key", slog.String("user_id", userID), slog.String("tier", tier))
 	}
 }
-
-

@@ -9,7 +9,7 @@ option(DENSECORE_COMMERCIAL "Enable commercial features (Graviton/Enterprise)" O
 if(DENSECORE_COMMERCIAL)
     message(STATUS "[DenseCore] Commercial build ENABLED")
     add_compile_definitions(DENSECORE_COMMERCIAL)
-    
+
     # Check for proprietary source directory
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/proprietary/CMakeLists.txt")
         add_subdirectory(src/proprietary)
@@ -213,7 +213,7 @@ if(APPLE)
     enable_language(OBJCXX)
     set(CMAKE_OBJCXX_STANDARD 17)
     set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
-    
+
     # Metal source files (Objective-C++)
     set(METAL_SOURCES
         src/metal_backend.mm
@@ -221,10 +221,10 @@ if(APPLE)
         src/ane_backend.mm
         src/hybrid_scheduler.mm
     )
-    
+
     # Add Metal sources to the main source list
     list(APPEND SOURCES ${METAL_SOURCES})
-    
+
     # Set Objective-C++ flags for .mm files
     set_source_files_properties(${METAL_SOURCES} PROPERTIES
         COMPILE_FLAGS "-fobjc-arc"
@@ -249,20 +249,20 @@ if(APPLE)
     find_library(FOUNDATION_FRAMEWORK Foundation)
     find_library(COREML_FRAMEWORK CoreML)
     find_library(IOKIT_FRAMEWORK IOKit)
-    
+
     if(METAL_FRAMEWORK)
         # Consolidate all Apple framework linking into a single call.
         # find_library sets variables to ...-NOTFOUND if not found,
         # and target_link_libraries ignores such values safely.
-        target_link_libraries(densecore PRIVATE 
+        target_link_libraries(densecore PRIVATE
             ${METAL_FRAMEWORK}
             ${FOUNDATION_FRAMEWORK}
             ${METALPERFORMANCESHADERS_FRAMEWORK}
             ${COREML_FRAMEWORK}
             ${IOKIT_FRAMEWORK}
         )
-        
-        target_compile_definitions(densecore PRIVATE 
+
+        target_compile_definitions(densecore PRIVATE
             DENSECORE_USE_METAL
             DENSECORE_USE_ANE
             GGML_USE_METAL
@@ -282,14 +282,14 @@ if(APPLE)
         ${METAL_SHADER_DIR}/quantized_gemv.metal
     )
 
-    
+
     if(EXISTS ${METAL_SHADER_DIR})
         # Compile Metal shaders to metallib
         set(METALLIB_OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/densecore.metallib)
-        
+
         add_custom_command(
             OUTPUT ${METALLIB_OUTPUT}
-            COMMAND xcrun -sdk macosx metal 
+            COMMAND xcrun -sdk macosx metal
                     -c ${METAL_SHADERS}
                     -o ${CMAKE_CURRENT_BINARY_DIR}/densecore.air
             COMMAND xcrun -sdk macosx metallib
@@ -299,13 +299,13 @@ if(APPLE)
             COMMENT "Compiling Metal shaders to metallib"
             VERBATIM
         )
-        
+
         add_custom_target(metal_shaders ALL DEPENDS ${METALLIB_OUTPUT})
         add_dependencies(densecore metal_shaders)
-        
+
         # Install metallib alongside the library
         install(FILES ${METALLIB_OUTPUT} DESTINATION lib)
-        
+
         message(STATUS "Metal shaders will be compiled from: ${METAL_SHADER_DIR}")
     endif()
 
@@ -314,20 +314,20 @@ if(APPLE)
     # ==========================================================================
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
         message(STATUS "Apple Silicon detected - enabling ARM NEON and Metal optimizations")
-        target_compile_options(densecore PRIVATE 
+        target_compile_options(densecore PRIVATE
             -mcpu=apple-m1
             -ffast-math
             -ffp-contract=fast
         )
-        target_compile_definitions(densecore PRIVATE 
+        target_compile_definitions(densecore PRIVATE
             DENSECORE_APPLE_SILICON
-            GGML_USE_CPU 
+            GGML_USE_CPU
             GGML_USE_ACCELERATE
         )
     else()
         # Intel Mac
-        target_compile_definitions(densecore PRIVATE 
-            GGML_USE_CPU 
+        target_compile_definitions(densecore PRIVATE
+            GGML_USE_CPU
             GGML_USE_ACCELERATE
         )
     endif()
@@ -359,7 +359,7 @@ else()
     # Check CPU capabilities for AVX-512 (cross-platform approach)
     # We use a compile-and-run test to detect actual CPU support
     set(CPU_HAS_AVX512 FALSE)
-    
+
     if(NOT MSVC)
         # For GCC/Clang: Try to compile and run an AVX-512 test program
         # This detects actual runtime CPU support, not just compiler support
@@ -374,7 +374,7 @@ else()
             }
         " AVX512_RUNTIME_SUPPORTED)
         unset(CMAKE_REQUIRED_FLAGS)
-        
+
         if(AVX512_RUNTIME_SUPPORTED)
             set(CPU_HAS_AVX512 TRUE)
             message(STATUS "AVX-512 runtime support detected")
@@ -463,11 +463,11 @@ find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
     pkg_check_modules(HWLOC QUIET hwloc)
     pkg_check_modules(NUMA QUIET numa)
-    
+
     if(HWLOC_FOUND AND NUMA_FOUND)
-        target_include_directories(densecore PRIVATE 
+        target_include_directories(densecore PRIVATE
             ${HWLOC_INCLUDE_DIRS} ${NUMA_INCLUDE_DIRS})
-        target_link_libraries(densecore PRIVATE 
+        target_link_libraries(densecore PRIVATE
             ${HWLOC_LIBRARIES} ${NUMA_LIBRARIES})
         target_compile_definitions(densecore PRIVATE DENSECORE_USE_HWLOC)
         message(STATUS "NUMA support enabled: hwloc ${HWLOC_VERSION}, numa ${NUMA_VERSION}")
@@ -597,7 +597,7 @@ if(DENSECORE_BUILD_TESTS)
         GTest::gtest_main
         Threads::Threads
     )
-    
+
     if(USE_ACCELERATE)
         target_link_libraries(densecore_tests PRIVATE ${ACCELERATE_FRAMEWORK})
     endif()
@@ -615,7 +615,7 @@ if(DENSECORE_BUILD_TESTS)
     else()
         target_compile_definitions(densecore_tests PRIVATE GGML_USE_CPU)
     endif()
-    
+
     if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
         target_compile_options(densecore_tests PRIVATE -mcpu=apple-m1)
     endif()
@@ -635,4 +635,3 @@ message(STATUS "System: ${CMAKE_SYSTEM_NAME}")
 message(STATUS "Processor: ${CMAKE_SYSTEM_PROCESSOR}")
 message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "==========================================")
-

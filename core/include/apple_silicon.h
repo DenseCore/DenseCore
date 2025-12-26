@@ -52,29 +52,29 @@ namespace apple {
  * bandwidth.
  */
 enum class ChipGeneration {
-  Unknown = 0, ///< Unable to detect (pre-M1 or unsupported)
+    Unknown = 0,  ///< Unable to detect (pre-M1 or unsupported)
 
-  // M1 Family (November 2020)
-  M1 = 1,       ///< 8-core (4P+4E), 7-8 GPU, 11 TOPS ANE
-  M1_Pro = 2,   ///< 10-core (8P+2E), 14-16 GPU
-  M1_Max = 3,   ///< 10-core (8P+2E), 24-32 GPU
-  M1_Ultra = 4, ///< 20-core (16P+4E), 48-64 GPU
+    // M1 Family (November 2020)
+    M1 = 1,        ///< 8-core (4P+4E), 7-8 GPU, 11 TOPS ANE
+    M1_Pro = 2,    ///< 10-core (8P+2E), 14-16 GPU
+    M1_Max = 3,    ///< 10-core (8P+2E), 24-32 GPU
+    M1_Ultra = 4,  ///< 20-core (16P+4E), 48-64 GPU
 
-  // M2 Family (June 2022)
-  M2 = 5,       ///< 8-core (4P+4E), 8-10 GPU, 15.8 TOPS ANE
-  M2_Pro = 6,   ///< 10-12 core, 16-19 GPU
-  M2_Max = 7,   ///< 12-core (8P+4E), 30-38 GPU
-  M2_Ultra = 8, ///< 24-core, 60-76 GPU
+    // M2 Family (June 2022)
+    M2 = 5,        ///< 8-core (4P+4E), 8-10 GPU, 15.8 TOPS ANE
+    M2_Pro = 6,    ///< 10-12 core, 16-19 GPU
+    M2_Max = 7,    ///< 12-core (8P+4E), 30-38 GPU
+    M2_Ultra = 8,  ///< 24-core, 60-76 GPU
 
-  // M3 Family (October 2023)
-  M3 = 9,      ///< 8-core (4P+4E), 8-10 GPU, 18 TOPS ANE, 3nm
-  M3_Pro = 10, ///< 11-12 core, 14-18 GPU
-  M3_Max = 11, ///< 14-16 core, 30-40 GPU
+    // M3 Family (October 2023)
+    M3 = 9,       ///< 8-core (4P+4E), 8-10 GPU, 18 TOPS ANE, 3nm
+    M3_Pro = 10,  ///< 11-12 core, 14-18 GPU
+    M3_Max = 11,  ///< 14-16 core, 30-40 GPU
 
-  // M4 Family (November 2024)
-  M4 = 12,     ///< 10-core (4P+6E), 10 GPU, 38 TOPS ANE, 3nm
-  M4_Pro = 13, ///< 12-14 core, 16-20 GPU
-  M4_Max = 14, ///< 16 core, 40 GPU (projected)
+    // M4 Family (November 2024)
+    M4 = 12,      ///< 10-core (4P+6E), 10 GPU, 38 TOPS ANE, 3nm
+    M4_Pro = 13,  ///< 12-14 core, 16-20 GPU
+    M4_Max = 14,  ///< 16 core, 40 GPU (projected)
 };
 
 /**
@@ -93,34 +93,34 @@ ChipGeneration DetectChipGeneration();
  * @param gen ChipGeneration enum value
  * @return String like "M1", "M2 Pro", "M4", etc.
  */
-const char *ChipGenerationName(ChipGeneration gen);
+const char* ChipGenerationName(ChipGeneration gen);
 
 /**
  * @brief Check if the chip is part of the M1 family
  */
 inline bool IsM1Family(ChipGeneration gen) {
-  return gen >= ChipGeneration::M1 && gen <= ChipGeneration::M1_Ultra;
+    return gen >= ChipGeneration::M1 && gen <= ChipGeneration::M1_Ultra;
 }
 
 /**
  * @brief Check if the chip is part of the M2 family
  */
 inline bool IsM2Family(ChipGeneration gen) {
-  return gen >= ChipGeneration::M2 && gen <= ChipGeneration::M2_Ultra;
+    return gen >= ChipGeneration::M2 && gen <= ChipGeneration::M2_Ultra;
 }
 
 /**
  * @brief Check if the chip is part of the M3 family
  */
 inline bool IsM3Family(ChipGeneration gen) {
-  return gen >= ChipGeneration::M3 && gen <= ChipGeneration::M3_Max;
+    return gen >= ChipGeneration::M3 && gen <= ChipGeneration::M3_Max;
 }
 
 /**
  * @brief Check if the chip is part of the M4 family
  */
 inline bool IsM4Family(ChipGeneration gen) {
-  return gen >= ChipGeneration::M4 && gen <= ChipGeneration::M4_Max;
+    return gen >= ChipGeneration::M4 && gen <= ChipGeneration::M4_Max;
 }
 
 // ============================================================================
@@ -152,7 +152,7 @@ int GetEfficiencyCoreCount();
  * @return P-cores + E-cores
  */
 inline int GetTotalCoreCount() {
-  return GetPerformanceCoreCount() + GetEfficiencyCoreCount();
+    return GetPerformanceCoreCount() + GetEfficiencyCoreCount();
 }
 
 /**
@@ -226,8 +226,7 @@ int GetAMXBlockSize();
  * @param M Number of output elements
  * @param K Input dimension
  */
-void GemvAccelerate(float *output, const float *input, const float *weight,
-                    int M, int K);
+void GemvAccelerate(float* output, const float* input, const float* weight, int M, int K);
 
 /**
  * @brief AMX-accelerated GEMM using Accelerate.framework
@@ -243,8 +242,7 @@ void GemvAccelerate(float *output, const float *input, const float *weight,
  * @param N Columns of B and C
  * @param K Columns of A, rows of B
  */
-void GemmAccelerate(float *C, const float *A, const float *B, int M, int N,
-                    int K);
+void GemmAccelerate(float* C, const float* A, const float* B, int M, int N, int K);
 
 // ============================================================================
 // Memory Information
@@ -254,9 +252,9 @@ void GemmAccelerate(float *C, const float *A, const float *B, int M, int N,
  * @brief Memory bandwidth and capacity information
  */
 struct MemoryInfo {
-  uint64_t total_bytes;     ///< Total unified memory in bytes
-  uint64_t available_bytes; ///< Currently available memory
-  float bandwidth_gbps;     ///< Memory bandwidth in GB/s
+    uint64_t total_bytes;      ///< Total unified memory in bytes
+    uint64_t available_bytes;  ///< Currently available memory
+    float bandwidth_gbps;      ///< Memory bandwidth in GB/s
 };
 
 /**
@@ -282,11 +280,11 @@ float GetMemoryBandwidth(ChipGeneration gen);
  * @brief Neural Engine capabilities
  */
 struct NeuralEngineInfo {
-  bool available;     ///< Whether ANE is available via CoreML
-  int tops;           ///< Compute power in Trillion Operations Per Second
-  int cores;          ///< Number of Neural Engine cores (typically 16)
-  bool supports_int8; ///< INT8 quantization support
-  bool supports_fp16; ///< FP16 support
+    bool available;      ///< Whether ANE is available via CoreML
+    int tops;            ///< Compute power in Trillion Operations Per Second
+    int cores;           ///< Number of Neural Engine cores (typically 16)
+    bool supports_int8;  ///< INT8 quantization support
+    bool supports_fp16;  ///< FP16 support
 };
 
 /**
@@ -320,10 +318,10 @@ int GetNeuralEngineTOPS();
  * @brief Current thermal state
  */
 enum class ThermalState {
-  Nominal = 0,  ///< Normal operation
-  Fair = 1,     ///< Slightly elevated temperature
-  Serious = 2,  ///< Approaching thermal limit
-  Critical = 3, ///< Performance throttling active
+    Nominal = 0,   ///< Normal operation
+    Fair = 1,      ///< Slightly elevated temperature
+    Serious = 2,   ///< Approaching thermal limit
+    Critical = 3,  ///< Performance throttling active
 };
 
 /**
@@ -339,9 +337,9 @@ ThermalState GetThermalState();
  * @brief Power mode preference
  */
 enum class PowerMode {
-  LowPower = 0,  ///< Prefer efficiency over performance
-  Automatic = 1, ///< System-managed (default)
-  HighPower = 2, ///< Prefer performance over efficiency
+    LowPower = 0,   ///< Prefer efficiency over performance
+    Automatic = 1,  ///< System-managed (default)
+    HighPower = 2,  ///< Prefer performance over efficiency
 };
 
 /**
@@ -390,9 +388,9 @@ int GetMacOSVersion();
  */
 bool MacOSVersionAtLeast(int major, int minor = 0);
 
-} // namespace apple
-} // namespace densecore
+}  // namespace apple
+}  // namespace densecore
 
-#endif // __APPLE__
+#endif  // __APPLE__
 
-#endif // DENSECORE_APPLE_SILICON_H
+#endif  // DENSECORE_APPLE_SILICON_H

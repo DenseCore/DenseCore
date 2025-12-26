@@ -113,7 +113,7 @@ func RateLimitWithInterface(limiter RateLimiterInterface) func(http.Handler) htt
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("Retry-After", "1")
 				w.WriteHeader(http.StatusTooManyRequests)
-				json.NewEncoder(w).Encode(map[string]interface{}{
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
 					"error": map[string]string{
 						"message": "Rate limit exceeded",
 						"type":    "rate_limit_error",
@@ -150,7 +150,7 @@ func Recovery() func(http.Handler) http.Handler {
 
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusInternalServerError)
-					json.NewEncoder(w).Encode(map[string]interface{}{
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{
 						"error": map[string]string{
 							"message": "Internal server error",
 							"type":    "internal_error",
@@ -269,11 +269,12 @@ func Logging(logFormat string) func(http.Handler) http.Handler {
 			}
 
 			// Log at appropriate level based on status code
-			if wrapped.statusCode >= 500 {
+			switch {
+			case wrapped.statusCode >= 500:
 				Logger.Error("request completed", attrs...)
-			} else if wrapped.statusCode >= 400 {
+			case wrapped.statusCode >= 400:
 				Logger.Warn("request completed", attrs...)
-			} else {
+			default:
 				Logger.Info("request completed", attrs...)
 			}
 		})
@@ -291,7 +292,7 @@ func MaxBodySize(maxBytes int64) func(http.Handler) http.Handler {
 			if r.ContentLength > maxBytes {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusRequestEntityTooLarge)
-				json.NewEncoder(w).Encode(map[string]interface{}{
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
 					"error": map[string]string{
 						"message": "Request body too large",
 						"type":    "invalid_request_error",

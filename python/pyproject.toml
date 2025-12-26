@@ -96,8 +96,10 @@ densecore = ["*.so", "*.dylib", "*.dll", "py.typed"]
 [tool.ruff]
 line-length = 100
 target-version = "py39"
-select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
-ignore = ["E501"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B", "C4"]
+ignore = ["E501", "F401", "F841", "B904"]  # E501: line length, F401/F841: unused, B904: raise from
 
 [tool.black]
 line-length = 100

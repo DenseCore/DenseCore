@@ -46,7 +46,7 @@ model:
 persistence:
   # Storage type: "emptyDir", "pvc", or "hostPath"
   type: "emptyDir"
-  
+
   # --------------------------------------------------------------------------
   # emptyDir Configuration (ephemeral storage)
   # --------------------------------------------------------------------------
@@ -55,7 +55,7 @@ persistence:
     sizeLimit: "20Gi"
     # Use memory-backed storage for faster access (consumes RAM)
     medium: ""  # Set to "Memory" for tmpfs
-  
+
   # --------------------------------------------------------------------------
   # PVC Configuration (persistent, shareable storage)
   # --------------------------------------------------------------------------
@@ -64,27 +64,27 @@ persistence:
   pvc:
     # Use an existing PVC (if set, chart won't create one)
     existingClaim: ""
-    
+
     # Storage class (leave empty for cluster default)
     # Examples: "gp3" (AWS EBS), "efs-sc" (AWS EFS), "standard" (GKE), "nfs"
     storageClassName: ""
-    
+
     # Access modes - ReadWriteMany recommended for shared model cache
     # - ReadWriteOnce: Single node read-write (EBS, standard PD)
     # - ReadOnlyMany: Multi-node read-only (after initial populate)
     # - ReadWriteMany: Multi-node read-write (NFS, EFS, Azure Files)
     accessModes:
       - ReadWriteMany
-    
+
     # Requested storage size
     size: "50Gi"
-    
+
     # Volume binding mode annotations (optional)
     annotations: {}
-    
+
     # Selector for binding to specific PVs (optional)
     selector: {}
-  
+
   # --------------------------------------------------------------------------
   # HostPath Configuration (node-local caching)
   # --------------------------------------------------------------------------
@@ -95,14 +95,14 @@ persistence:
   hostPath:
     # Path on the host node for model cache
     path: "/var/cache/densecore-models"
-    
+
     # Type: DirectoryOrCreate (creates if missing), Directory (must exist)
     type: "DirectoryOrCreate"
-    
+
     # Enable SHA256 verification of cached model files
     # Init container will re-download if hash mismatches
     verifyIntegrity: true
-    
+
     # Expected SHA256 hash of the model file (optional)
     # Leave empty to skip verification (first download sets baseline)
     expectedSha256: ""
@@ -118,14 +118,14 @@ persistence:
 autoscaling:
   # Set to false to disable autoscaling entirely
   enabled: true
-  
+
   # Autoscaler type: "hpa" or "keda"
   type: "hpa"
-  
+
   # Common settings for all autoscaler types
   minReplicas: 1
   maxReplicas: 10
-  
+
   # ==========================================================================
   # HPA-specific configuration (used when type: "hpa")
   # ==========================================================================
@@ -142,26 +142,26 @@ autoscaling:
     scaleUpStabilizationSeconds: 0
     # Maximum pods to add per scale-up event
     scaleUpMaxPods: 4
-  
+
   # ==========================================================================
   # KEDA-specific configuration (used when type: "keda")
   # ==========================================================================
   keda:
     # Enable KEDA ScaledObject (set to true to disable HPA and use KEDA instead)
     enabled: false
-    
+
     # Prometheus server address
     prometheusServerAddress: "http://prometheus-server.monitoring.svc.cluster.local:80"
-    
+
     # Polling interval for metrics (seconds)
     pollingInterval: 15
-    
+
     # Cooldown period before scale-down (seconds)
     cooldownPeriod: 60
-    
+
     # Scale-down stabilization window (seconds)
     scaleDownStabilizationSeconds: 120
-    
+
     # Triggers configuration
     triggers:
       pendingRequests:
@@ -171,7 +171,7 @@ autoscaling:
         # PromQL query template (uses release labels automatically)
         # Available template variables: {{ .Release.Name }}, {{ include "densecore.fullname" . }}
         query: 'sum(densecore_pending_requests{app="{{ .Release.Name }}"}) or vector(0)'
-      
+
       activeRequests:
         enabled: true
         # Target active requests per replica

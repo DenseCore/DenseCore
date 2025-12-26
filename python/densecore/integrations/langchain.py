@@ -11,12 +11,10 @@ Features:
 - with_structured_output(): Force structured JSON output
 """
 
-import asyncio
-import copy
 import json
 import logging
 import re
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator
 from typing import Any, Optional
 
 try:
@@ -58,8 +56,8 @@ try:
 except ImportError:
     PydanticBaseModel = None  # type: ignore
 
-from ..engine import DenseCore, GenerationOutput
 from ..config import GenerationConfig, ModelConfig
+from ..engine import DenseCore, GenerationOutput
 
 logger = logging.getLogger(__name__)
 
@@ -1199,7 +1197,5 @@ class DenseCoreEmbeddings(Embeddings):
 
     def __repr__(self) -> str:
         return (
-            f"DenseCoreEmbeddings("
-            f"dim={self._model.dimension}, "
-            f"normalize={self._normalize})"
+            f"DenseCoreEmbeddings(" f"dim={self._model.dimension}, " f"normalize={self._normalize})"
         )

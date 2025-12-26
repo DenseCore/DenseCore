@@ -4,14 +4,14 @@ DenseCore Pruning Module
 Provides pruning utilities for model compression inspired by NVIDIA Minitron.
 Supports depth, width, attention, and combined pruning strategies.
 """
+
 import ctypes
 import json
 import os
-from dataclasses import dataclass, asdict
-from typing import Literal, Optional, Callable
+from dataclasses import asdict, dataclass
+from typing import Callable, Literal, Optional
 
 import densecore.engine as engine_mod
-
 
 # Load library
 try:
@@ -20,7 +20,7 @@ except Exception:
     _lib = None
 
 # Define C signatures
-if _lib is not None and hasattr(_lib, 'PruneModel'):
+if _lib is not None and hasattr(_lib, "PruneModel"):
     _lib.PruneModel.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
     _lib.PruneModel.restype = ctypes.c_int
 
@@ -40,7 +40,7 @@ _ERROR_CODES = {
 class PruneConfig:
     """
     Pruning configuration.
-    
+
     Args:
         strategy: Pruning strategy
             - 'depth': Remove entire transformer layers
@@ -52,11 +52,12 @@ class PruneConfig:
         target_hidden_size: Target hidden dimension (for width pruning)
         target_n_heads: Target number of attention heads (for attention pruning)
         target_ffn_hidden_size: Target FFN hidden size (for width pruning)
-    
+
     Example:
         >>> config = PruneConfig(strategy="depth", target_n_layer=16)
         >>> prune_model("model.gguf", "model-pruned.gguf", config)
     """
+
     strategy: Literal["depth", "width", "attention", "combined"] = "depth"
     importance_method: Literal["magnitude", "l2_norm", "activation"] = "magnitude"
     target_n_layer: int = 0
@@ -73,32 +74,32 @@ def prune_model(
 ) -> None:
     """
     Prune a GGUF model.
-    
+
     Args:
         input_path: Input GGUF model path
         output_path: Output GGUF model path
         config: Pruning configuration
         progress_callback: Optional callback(current, total, message) for progress
-    
+
     Raises:
         FileNotFoundError: If input model doesn't exist
         RuntimeError: If pruning fails
-    
+
     Example:
         >>> from densecore.prune import prune_model, DEPTH_PRUNE_50_CFG
         >>> prune_model("llama-7b.gguf", "llama-7b-pruned.gguf", DEPTH_PRUNE_50_CFG)
     """
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Model file not found: {input_path}")
-    
+
     # Ensure output directory exists
     output_dir = os.path.dirname(output_path)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
-    
+
     config_dict = asdict(config)
     config_json = json.dumps(config_dict)
-    
+
     print(f"Pruning '{input_path}' -> '{output_path}'")
     print(f"  Strategy: {config.strategy}")
     print(f"  Importance: {config.importance_method}")
@@ -108,23 +109,21 @@ def prune_model(
         print(f"  Target hidden: {config.target_hidden_size}")
     if config.target_n_heads > 0:
         print(f"  Target heads: {config.target_n_heads}")
-    
-    if _lib is None or not hasattr(_lib, 'PruneModel'):
+
+    if _lib is None or not hasattr(_lib, "PruneModel"):
         raise RuntimeError(
             "DenseCore C++ library not available. "
             "Please rebuild with: cd core && mkdir -p build && cd build && cmake .. && make"
         )
 
     ret = _lib.PruneModel(
-        input_path.encode('utf-8'),
-        output_path.encode('utf-8'),
-        config_json.encode('utf-8')
+        input_path.encode("utf-8"), output_path.encode("utf-8"), config_json.encode("utf-8")
     )
-    
+
     if ret != 0:
         error_msg = _ERROR_CODES.get(ret, f"Unknown error code: {ret}")
         raise RuntimeError(f"Pruning failed: {error_msg}")
-    
+
     print(f"Pruning successful! Output saved to: {output_path}")
 
 
@@ -171,4 +170,3 @@ __all__ = [
     "ATTENTION_PRUNE_50_CFG",
     "COMBINED_PRUNE_CFG",
 ]
-

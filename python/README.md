@@ -188,7 +188,7 @@ Full API docs: [API Reference](../docs/API_REFERENCE.md)
 ### "Memory allocation failed"
 Use a quantized model: `Qwen3-0.6B-Q8_0.gguf` instead of FP16
 
-### "Illegal instruction"  
+### "Illegal instruction"
 Your CPU doesn't support AVX2. Rebuild with `cmake -DDENSECORE_AVX2=OFF`
 
 ### "Garbage output"

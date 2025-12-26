@@ -7,20 +7,19 @@ for users migrating from HuggingFace Transformers.
 
 from __future__ import annotations
 
+from unittest.mock import Mock, patch
+
 import pytest
-from typing import TYPE_CHECKING
-from unittest.mock import Mock, patch, MagicMock
 
 # Test imports work
 import densecore
 from densecore import (
-    GenerationConfig,
+    EosTokenCriteria,
     GenerateOutput,
-    StoppingCriteria,
-    StoppingCriteriaList,
+    GenerationConfig,
     MaxLengthCriteria,
     MaxNewTokensCriteria,
-    EosTokenCriteria,
+    StoppingCriteriaList,
 )
 from densecore.generate_output import StopStringCriteria
 
@@ -327,8 +326,9 @@ class TestGenerateMethodHFCompat:
 
     def test_generate_output_type_hints(self):
         """Test that generate() return type includes GenerateOutput."""
-        from densecore.engine import DenseCore
         import inspect
+
+        from densecore.engine import DenseCore
 
         sig = inspect.signature(DenseCore.generate)
         return_annotation = sig.return_annotation
@@ -338,8 +338,9 @@ class TestGenerateMethodHFCompat:
 
     def test_generate_signature_has_hf_params(self):
         """Test that generate() accepts HuggingFace-style parameters."""
-        from densecore.engine import DenseCore
         import inspect
+
+        from densecore.engine import DenseCore
 
         sig = inspect.signature(DenseCore.generate)
         params = list(sig.parameters.keys())

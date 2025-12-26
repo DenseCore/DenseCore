@@ -15,8 +15,11 @@
  *
  * @section example_usage Example Usage
  * @code
- * // Initialize engine
+ * // Initialize engine (basic usage)
  * DenseCoreHandle engine = InitEngine("model.gguf", NULL, 4);
+ *
+ * // Initialize engine with NUMA control (advanced)
+ * DenseCoreHandle engine = InitEngineEx("model.gguf", NULL, 4, 0, 0);
  *
  * // Generate text with streaming
  * void callback(const char *token, int is_finished, void *user_data) {
@@ -68,13 +71,13 @@ extern "C" {
  * @brief Version information structure
  */
 typedef struct {
-  int major;              ///< Major version number
-  int minor;              ///< Minor version number
-  int patch;              ///< Patch version number
-  const char *version;    ///< Version string "X.Y.Z"
-  const char *commit;     ///< Git commit hash (short)
-  const char *build_time; ///< Build timestamp (ISO 8601)
-  const char *full;       ///< Full version "X.Y.Z (commit)"
+    int major;               ///< Major version number
+    int minor;               ///< Minor version number
+    int patch;               ///< Patch version number
+    const char* version;     ///< Version string "X.Y.Z"
+    const char* commit;      ///< Git commit hash (short)
+    const char* build_time;  ///< Build timestamp (ISO 8601)
+    const char* full;        ///< Full version "X.Y.Z (commit)"
 } DenseCoreVersionInfo;
 
 /**
@@ -90,17 +93,17 @@ typedef struct {
  * printf("DenseCore %s (commit: %s)\n", ver->version, ver->commit);
  * @endcode
  */
-DENSECORE_API const DenseCoreVersionInfo *GetLibraryVersion(void);
+DENSECORE_API const DenseCoreVersionInfo* GetLibraryVersion(void);
 
 /**
  * @brief Get the library version as a simple string
  *
  * @return Version string "X.Y.Z" (static, never NULL)
  */
-DENSECORE_API const char *GetLibraryVersionString(void);
+DENSECORE_API const char* GetLibraryVersionString(void);
 
 /// Opaque handle to the DenseCore engine
-typedef void *DenseCoreHandle;
+typedef void* DenseCoreHandle;
 
 /**
  * @brief Structured token result for callbacks
@@ -110,10 +113,9 @@ typedef void *DenseCoreHandle;
  * token_id for accurate decoding.
  */
 typedef struct {
-  int token_id; ///< Token ID for external tokenizer decoding
-  const char
-      *text; ///< Pre-decoded text (may be empty if using external tokenizer)
-  int is_finished; ///< 1 if generation is complete, 0 otherwise
+    int token_id;      ///< Token ID for external tokenizer decoding
+    const char* text;  ///< Pre-decoded text (may be empty if using external tokenizer)
+    int is_finished;   ///< 1 if generation is complete, 0 otherwise
 } TokenResult;
 
 /**
@@ -129,8 +131,7 @@ typedef struct {
  * @note The token pointer is only valid during the callback execution.
  *       Copy the string if you need to retain it.
  */
-typedef void (*TokenCallback)(const char *token, int is_finished,
-                              void *user_data);
+typedef void (*TokenCallback)(const char* token, int is_finished, void* user_data);
 
 /**
  * @brief Callback function for structured token results
@@ -140,7 +141,7 @@ typedef void (*TokenCallback)(const char *token, int is_finished,
  * @param result Pointer to TokenResult structure
  * @param user_data User-provided pointer
  */
-typedef void (*TokenResultCallback)(const TokenResult *result, void *user_data);
+typedef void (*TokenResultCallback)(const TokenResult* result, void* user_data);
 
 /**
  * @brief Callback function for returning embeddings
@@ -152,23 +153,56 @@ typedef void (*TokenResultCallback)(const TokenResult *result, void *user_data);
  * @note The embedding pointer is only valid during the callback execution.
  *       Copy the data if you need to retain it.
  */
-typedef void (*EmbeddingCallback)(const float *embedding, int size,
-                                  void *user_data);
+typedef void (*EmbeddingCallback)(const float* embedding, int size, void* user_data);
 
 /**
- * @brief Initialize the DenseCore inference engine
+ * @brief Initialize the DenseCore inference engine (simplified API)
  *
- * Loads a GGUF model and initializes the inference engine with the specified
- * configuration. This is a blocking operation that may take several seconds
- * for large models.
+ * Loads a GGUF model and initializes the inference engine with default
+ * NUMA and thread pinning settings. This is the recommended entry point
+ * for most applications.
+ *
+ * For advanced control over NUMA topology and thread pinning, use
+ * InitEngineEx() instead.
  *
  * @param model_path Path to the GGUF model file (required)
  * @param reserved Reserved for future use (pass NULL)
  * @param threads Number of CPU threads to use (0 for auto-detect)
- * @param numa_node_id NUMA node to bind memory and threads (-1 for
- * auto/default)
+ * @return Handle to the initialized engine, or NULL on failure
+ *
+ * @note The engine must be freed with FreeEngine() when no longer needed.
+ *
+ * @see InitEngineEx() for advanced NUMA and thread pinning control
+ * @see FreeEngine()
+ *
+ * Example:
+ * @code
+ * DenseCoreHandle engine = InitEngine("model.gguf", NULL, 4);
+ * if (!engine) {
+ *     fprintf(stderr, "Failed to initialize engine\n");
+ *     return 1;
+ * }
+ * // ... use engine ...
+ * FreeEngine(engine);
+ * @endcode
+ */
+DENSECORE_API DenseCoreHandle InitEngine(const char* model_path, const char* reserved, int threads);
+
+/**
+ * @brief Initialize the DenseCore inference engine (extended API)
+ *
+ * Loads a GGUF model and initializes the inference engine with full control
+ * over NUMA topology and thread pinning. This is a blocking operation that
+ * may take several seconds for large models.
+ *
+ * @param model_path Path to the GGUF model file (required)
+ * @param reserved Reserved for future use (pass NULL)
+ * @param threads Number of CPU threads to use (0 for auto-detect)
+ * @param numa_node_id NUMA node to bind memory and threads:
+ *        - -1 = Auto/default (no explicit binding)
+ *        - 0+ = Specific NUMA node ID
  * @param pinning_policy Thread pinning policy for compute threads:
- *        - 0 = SCATTER (default): Distribute threads across physical cores,
+ *        - 0 = SCATTER: Distribute threads across physical cores,
  *          maximizes L3 cache and memory bandwidth. Best for latency-sensitive
  *          single-user workloads.
  *        - 1 = COMPACT: Pack threads on adjacent cores, shares L2 cache.
@@ -180,19 +214,24 @@ typedef void (*EmbeddingCallback)(const float *embedding, int size,
  * @note For multi-socket servers, specifying numa_node_id can significantly
  *       improve performance by reducing cross-socket memory access.
  *
+ * @see InitEngine() for simplified initialization
  * @see FreeEngine()
  *
  * Example:
  * @code
  * // Auto-detect NUMA with SCATTER pinning (default)
- * DenseCoreHandle engine = InitEngine("model.gguf", NULL, 4, -1, 0);
+ * DenseCoreHandle engine = InitEngineEx("model.gguf", NULL, 4, -1, 0);
  *
  * // NUMA node 0 with COMPACT pinning for batch throughput
- * DenseCoreHandle engine = InitEngine("model.gguf", NULL, 4, 0, 1);
+ * DenseCoreHandle engine = InitEngineEx("model.gguf", NULL, 8, 0, 1);
+ *
+ * // Multi-socket server: one engine per NUMA node
+ * DenseCoreHandle engine_node0 = InitEngineEx("model.gguf", NULL, 16, 0, 0);
+ * DenseCoreHandle engine_node1 = InitEngineEx("model.gguf", NULL, 16, 1, 0);
  * @endcode
  */
-DENSECORE_API DenseCoreHandle InitEngine(const char *model_path,
-                                         const char *reserved, int threads);
+DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* reserved,
+                                           int threads, int numa_node_id, int pinning_policy);
 
 /**
  * Submit a request to the DenseCore engine (Non-blocking)
@@ -204,9 +243,8 @@ DENSECORE_API DenseCoreHandle InitEngine(const char *model_path,
  * @param user_data User data to pass to the callback
  * @return Request ID (positive integer) on success, or negative error code
  */
-DENSECORE_API int SubmitRequest(DenseCoreHandle handle, const char *prompt,
-                                int max_tokens, TokenCallback callback,
-                                void *user_data);
+DENSECORE_API int SubmitRequest(DenseCoreHandle handle, const char* prompt, int max_tokens,
+                                TokenCallback callback, void* user_data);
 
 /**
  * Submit a request with pre-tokenized input (Non-blocking)
@@ -219,9 +257,8 @@ DENSECORE_API int SubmitRequest(DenseCoreHandle handle, const char *prompt,
  * @param user_data User data to pass to the callback
  * @return Request ID (positive integer) on success, or negative error code
  */
-DENSECORE_API int SubmitRequestIds(DenseCoreHandle handle, const int *tokens,
-                                   int n_tokens, int max_tokens,
-                                   TokenCallback callback, void *user_data);
+DENSECORE_API int SubmitRequestIds(DenseCoreHandle handle, const int* tokens, int n_tokens,
+                                   int max_tokens, TokenCallback callback, void* user_data);
 
 /**
  * Submit a request with response format specification (Non-blocking)
@@ -234,10 +271,9 @@ DENSECORE_API int SubmitRequestIds(DenseCoreHandle handle, const int *tokens,
  * @param user_data User data to pass to the callback
  * @return Request ID (positive integer) on success, or negative error code
  */
-DENSECORE_API int SubmitRequestWithFormat(DenseCoreHandle handle,
-                                          const char *prompt, int max_tokens,
-                                          int json_mode, TokenCallback callback,
-                                          void *user_data);
+DENSECORE_API int SubmitRequestWithFormat(DenseCoreHandle handle, const char* prompt,
+                                          int max_tokens, int json_mode, TokenCallback callback,
+                                          void* user_data);
 
 /**
  * Submit an embedding request (Non-blocking)
@@ -248,10 +284,8 @@ DENSECORE_API int SubmitRequestWithFormat(DenseCoreHandle handle,
  * @param user_data User data
  * @return Request ID
  */
-DENSECORE_API int SubmitEmbeddingRequest(DenseCoreHandle handle,
-                                         const char *prompt,
-                                         EmbeddingCallback callback,
-                                         void *user_data);
+DENSECORE_API int SubmitEmbeddingRequest(DenseCoreHandle handle, const char* prompt,
+                                         EmbeddingCallback callback, void* user_data);
 
 /**
  * Submit an embedding request with options (Non-blocking)
@@ -264,11 +298,9 @@ DENSECORE_API int SubmitEmbeddingRequest(DenseCoreHandle handle,
  * @param user_data User data
  * @return Request ID
  */
-DENSECORE_API int SubmitEmbeddingRequestEx(DenseCoreHandle handle,
-                                           const char *prompt, int pooling_type,
-                                           int normalize,
-                                           EmbeddingCallback callback,
-                                           void *user_data);
+DENSECORE_API int SubmitEmbeddingRequestEx(DenseCoreHandle handle, const char* prompt,
+                                           int pooling_type, int normalize,
+                                           EmbeddingCallback callback, void* user_data);
 
 /**
  * Submit a batch embedding request (Non-blocking)
@@ -282,10 +314,9 @@ DENSECORE_API int SubmitEmbeddingRequestEx(DenseCoreHandle handle,
  * @param user_data User data
  * @return Request ID for the batch
  */
-DENSECORE_API int
-SubmitBatchEmbeddingRequest(DenseCoreHandle handle, const char **prompts,
-                            int num_prompts, int pooling_type, int normalize,
-                            EmbeddingCallback callback, void *user_data);
+DENSECORE_API int SubmitBatchEmbeddingRequest(DenseCoreHandle handle, const char** prompts,
+                                              int num_prompts, int pooling_type, int normalize,
+                                              EmbeddingCallback callback, void* user_data);
 
 /**
  * Get the embedding dimension of the loaded model
@@ -313,52 +344,52 @@ DENSECORE_API void FreeEngine(DenseCoreHandle handle);
 
 // Metrics API
 typedef struct {
-  float requests_per_second;
-  float tokens_per_second;
-  int active_requests;
-  long total_tokens_generated;
+    float requests_per_second;
+    float tokens_per_second;
+    int active_requests;
+    long total_tokens_generated;
 } DenseCoreMetrics;
 
 // Detailed Metrics API
 typedef struct {
-  // Request metrics
-  int active_requests;
-  long total_requests;
-  long completed_requests;
-  long failed_requests;
-  int pending_requests;
+    // Request metrics
+    int active_requests;
+    long total_requests;
+    long completed_requests;
+    long failed_requests;
+    int pending_requests;
 
-  // Token metrics
-  long total_tokens_generated;
-  long total_prompt_tokens;
-  float tokens_per_second;
+    // Token metrics
+    long total_tokens_generated;
+    long total_prompt_tokens;
+    float tokens_per_second;
 
-  // Latency metrics (milliseconds)
-  float avg_time_to_first_token;
-  float p50_time_to_first_token;
-  float p90_time_to_first_token;
-  float p99_time_to_first_token;
+    // Latency metrics (milliseconds)
+    float avg_time_to_first_token;
+    float p50_time_to_first_token;
+    float p90_time_to_first_token;
+    float p99_time_to_first_token;
 
-  float avg_inter_token_latency;
-  float p50_inter_token_latency;
-  float p90_inter_token_latency;
-  float p99_inter_token_latency;
+    float avg_inter_token_latency;
+    float p50_inter_token_latency;
+    float p90_inter_token_latency;
+    float p99_inter_token_latency;
 
-  float avg_queue_wait_time;
-  float p99_queue_wait_time;
+    float avg_queue_wait_time;
+    float p99_queue_wait_time;
 
-  // KV Cache metrics
-  int kv_cache_usage_blocks;
-  int kv_cache_total_blocks;
-  float kv_cache_usage_percent;
+    // KV Cache metrics
+    int kv_cache_usage_blocks;
+    int kv_cache_total_blocks;
+    float kv_cache_usage_percent;
 
-  // Batch metrics
-  float avg_batch_size;
-  int current_batch_size;
+    // Batch metrics
+    float avg_batch_size;
+    int current_batch_size;
 
-  // Error metrics
-  int oom_errors;
-  int timeout_errors;
+    // Error metrics
+    int oom_errors;
+    int timeout_errors;
 } DetailedMetrics;
 
 /**
@@ -385,8 +416,8 @@ DENSECORE_API DetailedMetrics GetDetailedMetrics(DenseCoreHandle handle);
  * @param threads Number of threads (0 for default)
  * @return 0 on success, negative on failure
  */
-DENSECORE_API int LoadModel(DenseCoreHandle handle, const char *model_id,
-                            const char *model_path, int threads);
+DENSECORE_API int LoadModel(DenseCoreHandle handle, const char* model_id, const char* model_path,
+                            int threads);
 
 /**
  * Unload a model from the engine pool
@@ -394,7 +425,7 @@ DENSECORE_API int LoadModel(DenseCoreHandle handle, const char *model_id,
  * @param model_id Model identifier to unload
  * @return 0 on success, negative on failure
  */
-DENSECORE_API int UnloadModel(DenseCoreHandle handle, const char *model_id);
+DENSECORE_API int UnloadModel(DenseCoreHandle handle, const char* model_id);
 
 /**
  * List all loaded models
@@ -403,8 +434,7 @@ DENSECORE_API int UnloadModel(DenseCoreHandle handle, const char *model_id);
  * @param buffer_size Size of output buffer
  * @return Number of models, or negative on error
  */
-DENSECORE_API int ListModels(DenseCoreHandle handle, char *out_models,
-                             int buffer_size);
+DENSECORE_API int ListModels(DenseCoreHandle handle, char* out_models, int buffer_size);
 
 /**
  * Set the default model for requests
@@ -412,7 +442,7 @@ DENSECORE_API int ListModels(DenseCoreHandle handle, char *out_models,
  * @param model_id Model identifier to set as default
  * @return 0 on success, negative on failure
  */
-DENSECORE_API int SetDefaultModel(DenseCoreHandle handle, const char *model_id);
+DENSECORE_API int SetDefaultModel(DenseCoreHandle handle, const char* model_id);
 
 /**
  * Quantize a model (Offline)
@@ -421,8 +451,8 @@ DENSECORE_API int SetDefaultModel(DenseCoreHandle handle, const char *model_id);
  * @param config_json JSON string with quantization config (format, algo, etc.)
  * @return 0 on success, negative on error
  */
-DENSECORE_API int QuantizeModel(const char *model_path, const char *output_path,
-                                const char *config_json);
+DENSECORE_API int QuantizeModel(const char* model_path, const char* output_path,
+                                const char* config_json);
 
 /**
  * Prune a model (Offline)
@@ -431,8 +461,8 @@ DENSECORE_API int QuantizeModel(const char *model_path, const char *output_path,
  * @param config_json JSON string with pruning config (target layers/dim, etc.)
  * @return 0 on success, negative on error
  */
-DENSECORE_API int PruneModel(const char *model_path, const char *output_path,
-                             const char *config_json);
+DENSECORE_API int PruneModel(const char* model_path, const char* output_path,
+                             const char* config_json);
 
 // =============================================================================
 // LoRA Adapter Runtime API
@@ -447,8 +477,8 @@ DENSECORE_API int PruneModel(const char *model_path, const char *output_path,
  * @param name Unique identifier for this adapter
  * @return 0 on success, negative on error
  */
-DENSECORE_API int LoadLoraAdapter(DenseCoreHandle handle, const char *path,
-                                  float scale, const char *name);
+DENSECORE_API int LoadLoraAdapter(DenseCoreHandle handle, const char* path, float scale,
+                                  const char* name);
 
 /**
  * Activate a loaded LoRA adapter
@@ -457,7 +487,7 @@ DENSECORE_API int LoadLoraAdapter(DenseCoreHandle handle, const char *path,
  * @param name Identifier of the adapter to activate
  * @return 0 on success, negative on error
  */
-DENSECORE_API int ActivateLoraAdapter(DenseCoreHandle handle, const char *name);
+DENSECORE_API int ActivateLoraAdapter(DenseCoreHandle handle, const char* name);
 
 /**
  * Deactivate all LoRA adapters (use base model only)
@@ -474,10 +504,10 @@ DENSECORE_API int DeactivateLoraAdapters(DenseCoreHandle handle);
  * @param name Identifier of the adapter to unload
  * @return 0 on success, negative on error
  */
-DENSECORE_API int UnloadLoraAdapter(DenseCoreHandle handle, const char *name);
+DENSECORE_API int UnloadLoraAdapter(DenseCoreHandle handle, const char* name);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // DENSECORE_H
+#endif  // DENSECORE_H

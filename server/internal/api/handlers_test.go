@@ -86,7 +86,7 @@ func (m *MockModelService) UnloadModel() error {
 func makeRequest(method, url string, body interface{}) *http.Request {
 	var buf bytes.Buffer
 	if body != nil {
-		json.NewEncoder(&buf).Encode(body)
+		_ = json.NewEncoder(&buf).Encode(body)
 	}
 	req := httptest.NewRequest(method, url, &buf)
 	req.Header.Set("Content-Type", "application/json")
@@ -258,7 +258,7 @@ func TestEmbeddingsHandler(t *testing.T) {
 			q := queue.NewRequestQueue(10)
 			// Worker not needed for embeddings (yet, unless embeddings are also queued? ChatService.GetEmbeddings calls engine directly in current implementation)
 			// Checking chat_service.go: GetEmbeddings uses s.modelService.GetEngine().GetEmbeddings() directly. Correct.
-			
+
 			chatService := service.NewChatService(mockModelService, q)
 			handler := NewHandler(chatService, mockModelService)
 
@@ -293,7 +293,7 @@ func TestModelsHandler(t *testing.T) {
 	}
 
 	var resp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 
 	if resp["object"] != "list" {
 		t.Errorf("Expected object='list', got %v", resp["object"])
@@ -329,7 +329,7 @@ func TestHealthHandlers(t *testing.T) {
 			}
 
 			var resp map[string]interface{}
-			json.Unmarshal(w.Body.Bytes(), &resp)
+			_ = json.Unmarshal(w.Body.Bytes(), &resp)
 
 			if resp["status"] != "ok" && resp["status"] != "healthy" {
 				t.Errorf("Expected status 'ok' or 'healthy', got %v", resp["status"])

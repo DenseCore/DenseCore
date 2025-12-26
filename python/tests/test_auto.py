@@ -5,8 +5,9 @@ These tests verify that AutoModel, AutoModelForCausalLM, and AutoTokenizer
 provide the expected API compatibility with HuggingFace Transformers.
 """
 
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock
 
 
 class TestAutoModel:
@@ -123,11 +124,11 @@ class TestAutoTokenizer:
 
     def test_from_pretrained_raises_without_transformers(self):
         """AutoTokenizer should raise ImportError if transformers not installed."""
-        from densecore.auto import AutoTokenizer
 
         with patch.dict("sys.modules", {"transformers": None}):
             # Force reimport to trigger ImportError
             import importlib
+
             import densecore.auto
 
             importlib.reload(densecore.auto)

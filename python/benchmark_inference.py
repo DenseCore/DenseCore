@@ -1,6 +1,8 @@
-import time
 import argparse
+import time
+
 import densecore
+
 
 def run_benchmark(model_id, duration_seconds=10):
     print(f"Benchmarking model: {model_id}")
@@ -17,7 +19,7 @@ def run_benchmark(model_id, duration_seconds=10):
 
     print("Warming up...")
     try:
-        result1 = model.generate("Hello", max_tokens=24) # Warmup
+        result1 = model.generate("Hello", max_tokens=24)  # Warmup
         print(result1)
     except Exception as e:
         print(f"Warmup warning: {e}")
@@ -26,7 +28,7 @@ def run_benchmark(model_id, duration_seconds=10):
     prompt = "Write a long essay about the history of computing."
     start_time = time.time()
     token_count = 0
-    
+
     try:
         # Use generate for reliable token counting
         result = model.generate(prompt, max_tokens=32)
@@ -45,9 +47,12 @@ def run_benchmark(model_id, duration_seconds=10):
     print(f"\nGenerated {token_count} tokens in {elapsed:.2f} seconds")
     print(f"TPS: {tps:.2f}")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-GGUF", help="Model to benchmark")
+    parser.add_argument(
+        "--model", type=str, default="Qwen/Qwen3-4B-GGUF", help="Model to benchmark"
+    )
     args = parser.parse_args()
-    
+
     run_benchmark(args.model)

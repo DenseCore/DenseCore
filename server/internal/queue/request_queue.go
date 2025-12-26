@@ -129,7 +129,7 @@ func (q *RequestQueue) Enqueue(req *QueuedRequest) bool {
 }
 
 // Dequeue removes and returns the highest priority request.
-// Blocks until a request is available or context is cancelled.
+// Blocks until a request is available or context is canceled.
 // Uses select for zero-latency context cancellation handling.
 func (q *RequestQueue) Dequeue(ctx context.Context) (*QueuedRequest, bool) {
 	for {

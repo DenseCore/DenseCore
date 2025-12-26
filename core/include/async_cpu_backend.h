@@ -7,7 +7,7 @@
 #define DENSECORE_ASYNC_CPU_BACKEND_H
 
 #include "async_backend.h"
-#include "cpu_backend.h" // Existing synchronous backend
+#include "cpu_backend.h"  // Existing synchronous backend
 
 namespace densecore {
 
@@ -18,21 +18,20 @@ namespace densecore {
  */
 class AsyncCpuBackend : public AsyncBackend {
 public:
-  AsyncCpuBackend();
-  ~AsyncCpuBackend() override = default;
+    AsyncCpuBackend();
+    ~AsyncCpuBackend() override = default;
 
-  const char *Name() const override { return "AsyncCPU"; }
+    const char* Name() const override { return "AsyncCPU"; }
 
-  std::future<void> MatMulAsync(KernelContext &ctx, const TensorView &A,
-                                const TensorView &B, TensorView &C) override;
+    std::future<void> MatMulAsync(KernelContext& ctx, const TensorView& A, const TensorView& B,
+                                  TensorView& C) override;
 
 private:
-  // Helper to convert TensorView to Tensor for legacy CpuBackend compatibility
-  // TODO: Refactor CpuBackend to use TensorView natively
-  void ConvertAndCallMatMul(const TensorView &A, const TensorView &B,
-                            TensorView &C);
+    // Helper to convert TensorView to Tensor for legacy CpuBackend compatibility
+    // TODO: Refactor CpuBackend to use TensorView natively
+    void ConvertAndCallMatMul(const TensorView& A, const TensorView& B, TensorView& C);
 };
 
-} // namespace densecore
+}  // namespace densecore
 
-#endif // DENSECORE_ASYNC_CPU_BACKEND_H
+#endif  // DENSECORE_ASYNC_CPU_BACKEND_H

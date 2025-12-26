@@ -2,7 +2,7 @@
 # DenseCore Production Dockerfile
 # Multi-stage build with optimized layer caching
 # ============================================
-# 
+#
 # Cache Optimization Strategy:
 # 1. Copy dependency files (ggml, CMake) first
 # 2. Build ggml (slow, but rarely changes)

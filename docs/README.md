@@ -42,7 +42,7 @@ for token in model.generate("Hello, world!", max_tokens=64, stream=True):
 ## 🗂️ Documentation Map
 
 | I want to... | Read this |
-|--------------|-----------| 
+|--------------|-----------|
 | Get started quickly | [Python SDK](../python/README.md) |
 | See benchmark results | [Benchmarks](BENCHMARKS.md) |
 | Use with LangChain | [LangChain Guide](../python/docs/LANGCHAIN_GUIDE.md) |

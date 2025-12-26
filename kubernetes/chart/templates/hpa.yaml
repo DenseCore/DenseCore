@@ -17,10 +17,10 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: {{ include "densecore.fullname" . }}
-  
+
   minReplicas: {{ .Values.autoscaling.minReplicas }}
   maxReplicas: {{ .Values.autoscaling.maxReplicas }}
-  
+
   metrics:
     # Scale based on CPU utilization
     - type: Resource
@@ -36,7 +36,7 @@ spec:
         target:
           type: Utilization
           averageUtilization: {{ .Values.autoscaling.hpa.memoryTargetUtilization }}
-  
+
   behavior:
     scaleDown:
       # Prevent flapping by waiting before scale-down

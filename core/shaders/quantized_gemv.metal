@@ -52,7 +52,7 @@ constant uint THREADGROUP_SIZE = 256;
 
 /**
  * @brief Q4_0 block: 32 values quantized to 4 bits
- * 
+ *
  * Memory layout:
  * - scale: 2 bytes (FP16)
  * - quants: 16 bytes (32 x 4-bit values packed)
@@ -115,15 +115,15 @@ inline uint8_t extract_q4_unsigned(uint8_t packed, uint idx) {
 /**
  * @brief Dequantize Q4_0 block to float
  */
-inline void dequantize_q4_0(device const block_q4_0* block, 
-                            thread float* output, 
+inline void dequantize_q4_0(device const block_q4_0* block,
+                            thread float* output,
                             uint count) {
     float scale = float(block->scale);
-    
+
     for (uint i = 0; i < count; i += 2) {
         uint byte_idx = i / 2;
         uint8_t packed = block->quants[byte_idx];
-        
+
         output[i] = float(extract_q4(packed, 0)) * scale;
         if (i + 1 < count) {
             output[i + 1] = float(extract_q4(packed, 1)) * scale;
@@ -139,11 +139,11 @@ inline void dequantize_q4_1(device const block_q4_1* block,
                             uint count) {
     float scale = float(block->scale);
     float min_val = float(block->min);
-    
+
     for (uint i = 0; i < count; i += 2) {
         uint byte_idx = i / 2;
         uint8_t packed = block->quants[byte_idx];
-        
+
         output[i] = float(extract_q4_unsigned(packed, 0)) * scale + min_val;
         if (i + 1 < count) {
             output[i + 1] = float(extract_q4_unsigned(packed, 1)) * scale + min_val;
@@ -158,7 +158,7 @@ inline void dequantize_q8_0(device const block_q8_0* block,
                             thread float* output,
                             uint count) {
     float scale = float(block->scale);
-    
+
     for (uint i = 0; i < count; ++i) {
         output[i] = float(block->quants[i]) * scale;
     }
@@ -189,47 +189,47 @@ kernel void gemv_q4_0(
 {
     uint row = tgid;
     if (row >= M) return;
-    
+
     // Shared memory for parallel reduction
     threadgroup float shared_sum[THREADGROUP_SIZE];
-    
+
     // Number of blocks per row
     uint blocks_per_row = K / QK4_0;
-    
+
     // Each thread handles multiple blocks
     float sum = 0.0f;
-    
+
     for (uint block_idx = tid; block_idx < blocks_per_row; block_idx += tg_size) {
         // Get block for this row
         device const block_q4_0* block = &weight[row * blocks_per_row + block_idx];
-        
+
         float scale = float(block->scale);
         uint k_start = block_idx * QK4_0;
-        
+
         // Dequantize and compute dot product
         for (uint i = 0; i < QK4_0; i += 2) {
             uint byte_idx = i / 2;
             uint8_t packed = block->quants[byte_idx];
-            
+
             float w0 = float(extract_q4(packed, 0)) * scale;
             float w1 = float(extract_q4(packed, 1)) * scale;
-            
+
             sum = fma(w0, input[k_start + i], sum);
             sum = fma(w1, input[k_start + i + 1], sum);
         }
     }
-    
+
     // Reduction
     shared_sum[tid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
             shared_sum[tid] += shared_sum[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     if (tid == 0) {
         output[row] = shared_sum[0];
     }
@@ -251,41 +251,41 @@ kernel void gemv_q4_1(
 {
     uint row = tgid;
     if (row >= M) return;
-    
+
     threadgroup float shared_sum[THREADGROUP_SIZE];
-    
+
     uint blocks_per_row = K / QK4_1;
     float sum = 0.0f;
-    
+
     for (uint block_idx = tid; block_idx < blocks_per_row; block_idx += tg_size) {
         device const block_q4_1* block = &weight[row * blocks_per_row + block_idx];
-        
+
         float scale = float(block->scale);
         float min_val = float(block->min);
         uint k_start = block_idx * QK4_1;
-        
+
         for (uint i = 0; i < QK4_1; i += 2) {
             uint byte_idx = i / 2;
             uint8_t packed = block->quants[byte_idx];
-            
+
             float w0 = float(extract_q4_unsigned(packed, 0)) * scale + min_val;
             float w1 = float(extract_q4_unsigned(packed, 1)) * scale + min_val;
-            
+
             sum = fma(w0, input[k_start + i], sum);
             sum = fma(w1, input[k_start + i + 1], sum);
         }
     }
-    
+
     shared_sum[tid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
             shared_sum[tid] += shared_sum[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     if (tid == 0) {
         output[row] = shared_sum[0];
     }
@@ -307,34 +307,34 @@ kernel void gemv_q8_0(
 {
     uint row = tgid;
     if (row >= M) return;
-    
+
     threadgroup float shared_sum[THREADGROUP_SIZE];
-    
+
     uint blocks_per_row = K / QK8_0;
     float sum = 0.0f;
-    
+
     for (uint block_idx = tid; block_idx < blocks_per_row; block_idx += tg_size) {
         device const block_q8_0* block = &weight[row * blocks_per_row + block_idx];
-        
+
         float scale = float(block->scale);
         uint k_start = block_idx * QK8_0;
-        
+
         for (uint i = 0; i < QK8_0; ++i) {
             float w = float(block->quants[i]) * scale;
             sum = fma(w, input[k_start + i], sum);
         }
     }
-    
+
     shared_sum[tid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
             shared_sum[tid] += shared_sum[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     if (tid == 0) {
         output[row] = shared_sum[0];
     }
@@ -360,45 +360,45 @@ kernel void gemv_q4_0_batched(
 {
     uint batch_idx = tgid.y;
     uint row = tgid.x;
-    
+
     if (batch_idx >= batch || row >= M) return;
-    
+
     threadgroup float shared_sum[THREADGROUP_SIZE];
-    
+
     device const float* input_batch = input + batch_idx * K;
     device float* output_batch = output + batch_idx * M;
-    
+
     uint blocks_per_row = K / QK4_0;
     float sum = 0.0f;
-    
+
     for (uint block_idx = tid; block_idx < blocks_per_row; block_idx += tg_size) {
         device const block_q4_0* block = &weight[row * blocks_per_row + block_idx];
-        
+
         float scale = float(block->scale);
         uint k_start = block_idx * QK4_0;
-        
+
         for (uint i = 0; i < QK4_0; i += 2) {
             uint byte_idx = i / 2;
             uint8_t packed = block->quants[byte_idx];
-            
+
             float w0 = float(extract_q4(packed, 0)) * scale;
             float w1 = float(extract_q4(packed, 1)) * scale;
-            
+
             sum = fma(w0, input_batch[k_start + i], sum);
             sum = fma(w1, input_batch[k_start + i + 1], sum);
         }
     }
-    
+
     shared_sum[tid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
             shared_sum[tid] += shared_sum[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     if (tid == 0) {
         output_batch[row] = shared_sum[0];
     }
@@ -426,49 +426,49 @@ kernel void gemv_q4_0_fp16(
 {
     uint row = tgid;
     if (row >= M) return;
-    
+
     threadgroup float shared_sum[THREADGROUP_SIZE];
-    
+
     uint blocks_per_row = K / QK4_0;
     float sum = 0.0f;
-    
+
     for (uint block_idx = tid; block_idx < blocks_per_row; block_idx += tg_size) {
         device const block_q4_0* block = &weight[row * blocks_per_row + block_idx];
-        
+
         half scale_h = block->scale;
         uint k_start = block_idx * QK4_0;
-        
+
         // Process 4 elements at a time using half4
         for (uint i = 0; i < QK4_0; i += 4) {
             uint byte_idx = i / 2;
             uint8_t packed0 = block->quants[byte_idx];
             uint8_t packed1 = block->quants[byte_idx + 1];
-            
+
             half4 w;
             w.x = half(extract_q4(packed0, 0)) * scale_h;
             w.y = half(extract_q4(packed0, 1)) * scale_h;
             w.z = half(extract_q4(packed1, 0)) * scale_h;
             w.w = half(extract_q4(packed1, 1)) * scale_h;
-            
-            half4 x = half4(input[k_start + i], 
+
+            half4 x = half4(input[k_start + i],
                            input[k_start + i + 1],
                            input[k_start + i + 2],
                            input[k_start + i + 3]);
-            
+
             sum += float(dot(w, x));
         }
     }
-    
+
     shared_sum[tid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     for (uint stride = tg_size / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
             shared_sum[tid] += shared_sum[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     if (tid == 0) {
         output[row] = half(shared_sum[0]);
     }
