@@ -206,7 +206,7 @@ class DenseCoreLLM(LLM):
         arbitrary_types_allowed = True
 
     @root_validator(pre=False, skip_on_failure=True)
-    def validate_environment(self, values: dict[str, Any]) -> dict[str, Any]:
+    def validate_environment(cls, values: dict[str, Any]) -> dict[str, Any]:
         """Validate that model path or repo ID is provided."""
         if not values.get("model_path") and not values.get("hf_repo_id"):
             raise ValueError("Either model_path or hf_repo_id must be provided")
@@ -490,7 +490,7 @@ class DenseCoreChatModel(BaseChatModel):
         arbitrary_types_allowed = True
 
     @root_validator(pre=False, skip_on_failure=True)
-    def validate_environment(self, values: dict) -> dict:
+    def validate_environment(cls, values: dict) -> dict:
         """Validate that model path or repo ID is provided."""
         if not values.get("model_path") and not values.get("hf_repo_id"):
             raise ValueError("Either model_path or hf_repo_id must be provided")

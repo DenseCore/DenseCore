@@ -291,23 +291,45 @@ redis:
 # =============================================================================
 # Node Scheduling
 # =============================================================================
+# Label your nodes with custom labels for portable scheduling:
+#   kubectl label nodes <node-name> workload-type=compute-optimized
+#
+# Cloud-specific alternatives (uncomment and modify affinity below):
+# - AWS:   node.kubernetes.io/instance-type: c7i.xlarge, c7g.2xlarge, m7i.xlarge
+# - GKE:   cloud.google.com/machine-family: c3, cloud.google.com/gke-accelerator: <type>
+# - AKS:   kubernetes.azure.com/agentpool: <pool-name>, node.kubernetes.io/instance-type: Standard_D4s_v5
+# - On-Prem: Use custom labels like workload-type=compute-optimized
+# =============================================================================
 nodeSelector: {}
 
 tolerations: []
 
 affinity:
+  # Default: Uses generic workload-type label for cross-cloud portability.
+  # To use cloud-specific instance types, replace the matchExpressions below.
   nodeAffinity:
     preferredDuringSchedulingIgnoredDuringExecution:
       - weight: 100
         preference:
           matchExpressions:
-            - key: node.kubernetes.io/instance-type
+            # Generic label - apply to your compute-optimized nodes:
+            #   kubectl label nodes <node-name> workload-type=compute-optimized
+            - key: workload-type
               operator: In
               values:
-                - c7i.xlarge
-                - c7i.2xlarge
-                - c7g.xlarge
-                - c7g.2xlarge
+                - compute-optimized
+                - memory-optimized
+      # Uncomment below for AWS-specific scheduling:
+      # - weight: 80
+      #   preference:
+      #     matchExpressions:
+      #       - key: node.kubernetes.io/instance-type
+      #         operator: In
+      #         values:
+      #           - c7i.xlarge
+      #           - c7i.2xlarge
+      #           - c7g.xlarge
+      #           - c7g.2xlarge
   podAntiAffinity:
     preferredDuringSchedulingIgnoredDuringExecution:
       - weight: 100
