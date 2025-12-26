@@ -46,16 +46,23 @@ classifiers = [
 dependencies = [
     "huggingface-hub>=0.20.0",
     "numpy>=2.0.2",
-    "torch>=2.5.1",
-    "transformers>=4.46.3",
     "typing-extensions>=4.0.0;python_version<'3.10'",
 ]
 
 [project.optional-dependencies]
+# Full dependencies including PyTorch (will install CUDA by default)
 full = [
-    "transformers>=4.35.0",
+    "torch>=2.5.1",
+    "transformers>=4.46.3",
     "tokenizers>=0.15.0",
-    "numpy>=1.20.0",
+]
+# CPU-only PyTorch (no CUDA) - use this for lightweight installation
+# Install with: pip install densecore[cpu]
+# Note: User must install pytorch-cpu manually or via:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+cpu = [
+    "transformers>=4.46.3",
+    "tokenizers>=0.15.0",
 ]
 langchain = [
     "langchain-core>=0.1.0",
