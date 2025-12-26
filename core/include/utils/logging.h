@@ -55,9 +55,8 @@ public:
         std::ostringstream oss;
 
         // Format: [LEVEL] [timestamp] [function:line] message
-        oss << "[" << levelToString(level) << "] "
-            << "[" << getTimestamp() << "] "
-            << "[" << func << ":" << line << "] ";
+        oss << "[" << levelToString(level) << "] [" << getTimestamp() << "] [" << func << ":"
+            << line << "] ";
 
         // Concatenate all arguments
         (oss << ... << args);

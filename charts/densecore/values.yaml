@@ -1,145 +1,263 @@
-# Default values for densecore.
-# This is a YAML-formatted file.
-# Declare variables to be passed into your templates.
+# =============================================================================
+# DenseCore Helm Chart - Production Values
+# =============================================================================
+# Default configuration values for DenseCore deployment.
+# Override these values by providing a custom values.yaml file:
+#   helm install densecore ./charts/densecore -f custom-values.yaml
+# =============================================================================
 
 replicaCount: 1
 
+# =============================================================================
+# Image Configuration
+# =============================================================================
 image:
   repository: densecore/densecore
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
   tag: ""
 
+# Init container for model downloading
+downloaderImage:
+  repository: python
+  tag: "3.11-slim"
+  pullPolicy: IfNotPresent
+
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
+# =============================================================================
+# Service Account
+# =============================================================================
 serviceAccount:
-  # Specifies whether a service account should be created
   create: true
-  # Annotations to add to the service account
   annotations: {}
-  # The name of the service account to use.
-  # If not set and create is true, a name is generated using the fullname template
+  # For AWS IRSA: eks.amazonaws.com/role-arn: arn:aws:iam::xxx:role/densecore
   name: ""
 
+# =============================================================================
+# Pod Configuration
+# =============================================================================
 podAnnotations:
   prometheus.io/scrape: "true"
   prometheus.io/port: "8080"
   prometheus.io/path: "/metrics"
 
-podSecurityContext: {}
-  # fsGroup: 2000
+podLabels: {}
 
-securityContext: {}
-  # capabilities:
-  #   drop:
-  #   - ALL
-  # readOnlyRootFilesystem: true
-  # runAsNonRoot: true
-  # runAsUser: 1000
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
 
+securityContext:
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: false
+  allowPrivilegeEscalation: false
+
+# Graceful shutdown configuration
+terminationGracePeriodSeconds: 60
+
+# =============================================================================
+# Service Configuration
+# =============================================================================
 service:
   type: ClusterIP
-  port: 8080
+  port: 80
+  targetPort: 8080
+  annotations: {}
 
+# =============================================================================
+# Ingress Configuration
+# =============================================================================
 ingress:
   enabled: false
   className: ""
   annotations: {}
     # kubernetes.io/ingress.class: nginx
-    # kubernetes.io/tls-acme: "true"
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
   hosts:
     - host: densecore.local
       paths:
         - path: /
-          pathType: ImplementationSpecific
+          pathType: Prefix
   tls: []
-  #  - secretName: chart-example-tls
+  #  - secretName: densecore-tls
   #    hosts:
-  #      - chart-example.local
+  #      - densecore.local
 
+# =============================================================================
+# Resource Configuration
+# =============================================================================
 resources:
-  # Optimal for c7i.large equivalent
-  limits:
-    cpu: 4
-    memory: 8Gi
   requests:
-    cpu: 2
-    memory: 4Gi
+    cpu: "2"
+    memory: "4Gi"
+  limits:
+    cpu: "8"
+    memory: "16Gi"
 
-autoscaling:
-  enabled: false
-  minReplicas: 1
-  maxReplicas: 10
-  targetCPUUtilizationPercentage: 80
-  # targetMemoryUtilizationPercentage: 80
+# =============================================================================
+# Probes Configuration
+# =============================================================================
+probes:
+  liveness:
+    path: /health/live
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    path: /health/ready
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+  startup:
+    path: /health/startup
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 5
+    failureThreshold: 60  # Allow up to 5 minutes for model loading
 
-nodeSelector: {}
-
-tolerations: []
-
-affinity:
-  nodeAffinity:
-    preferredDuringSchedulingIgnoredDuringExecution:
-      - weight: 100
-        preference:
-          matchExpressions:
-            - key: instance-type
-              operator: In
-              values:
-                - compute-optimized
-                - cpu-optimized
-
+# =============================================================================
 # Model Configuration
+# =============================================================================
 model:
-  # 'huggingface' to download at startup, 'pvc' to use existing volume, 'hostPath' for local testing
+  # Storage source: 'huggingface', 'pvc', 'hostPath', 'emptyDir'
   source: huggingface
 
-  # For huggingface source
+  # Hugging Face configuration (for source: huggingface)
   repoId: "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
   filename: "qwen2.5-0.5b-instruct-q4_k_m.gguf"
-  hfTokenSecret: "" # Name of secret containing HF_TOKEN key
+  hfTokenSecret: ""  # Name of secret containing HF_TOKEN key
 
-  # For pvc/hostPath source
+  # Path where the model is mounted inside the container
   path: "/models"
-  existingClaim: "" # For pvc
-  hostPath: "" # For hostPath
 
+  # For source: pvc
+  existingClaim: ""
+  pvc:
+    # Storage class (leave empty for cluster default)
+    # Examples: "gp3" (AWS EBS), "efs-sc" (AWS EFS), "standard" (GKE)
+    storageClassName: ""
+    # Requested storage size
+    size: "50Gi"
+    # Access modes - ReadWriteMany recommended for shared model cache
+    accessModes:
+      - ReadWriteMany
+    # Selector for binding to specific PVs (optional)
+    selector: {}
+
+  # For source: hostPath
+  hostPath: ""
+  hostPathType: "DirectoryOrCreate"
+
+  # For source: emptyDir
+  emptyDir:
+    sizeLimit: "20Gi"
+    medium: ""  # Set to "Memory" for tmpfs
+
+# =============================================================================
 # Application Configuration
+# =============================================================================
 config:
   logFormat: "json"
+  logLevel: "info"
   readTimeout: "30s"
   writeTimeout: "120s"
   shutdownTimeout: "30s"
+
   rateLimit:
     enabled: true
     rps: 100
     burst: 200
+
   auth:
     enabled: false
-    # apiKeysSecret: Name of secret containing API_KEYS key
+    # Name of secret containing API_KEYS key
+    apiKeysSecret: ""
 
-# ============================================
-# Cloud-Native Features
-# ============================================
+# =============================================================================
+# Autoscaling Configuration
+# =============================================================================
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  
+  # HPA settings (standard Kubernetes)
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  
+  # Advanced HPA behavior
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 60
 
-# Pod Disruption Budget - ensures minimum availability during node maintenance
+# =============================================================================
+# KEDA Configuration (Advanced Autoscaling)
+# =============================================================================
+# Scales based on pending/active requests instead of CPU (leading indicator)
+# Requires: KEDA installed (helm install keda kedacore/keda -n keda-system)
+keda:
+  enabled: false
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  pollingInterval: 15
+  cooldownPeriod: 60
+  
+  prometheusServerAddress: "http://prometheus-server.monitoring.svc.cluster.local:80"
+  
+  triggers:
+    pendingRequests:
+      enabled: true
+      threshold: "5"
+    activeRequests:
+      enabled: true
+      threshold: "8"
+
+  scaleDown:
+    stabilizationWindowSeconds: 120
+    percent: 25
+  scaleUp:
+    pods: 2
+
+# =============================================================================
+# Pod Disruption Budget
+# =============================================================================
 podDisruptionBudget:
   enabled: false
   minAvailable: 1
   # maxUnavailable: 1  # Alternative to minAvailable
 
-# ServiceMonitor for Prometheus Operator
-# Requires: Prometheus Operator installed in cluster
+# =============================================================================
+# ServiceMonitor (Prometheus Operator)
+# =============================================================================
 serviceMonitor:
   enabled: false
   interval: 15s
   scrapeTimeout: 10s
   labels: {}
     # release: prometheus
+  honorLabels: true
 
-# Network Policy for pod isolation
+# =============================================================================
+# Network Policy
+# =============================================================================
 networkPolicy:
   enabled: false
   allowIngressController: true
@@ -148,25 +266,79 @@ networkPolicy:
   additionalIngressRules: []
   egressRules: []
 
-# KEDA ScaledObject for queue-based autoscaling
-# Scales based on pending/active requests instead of CPU (leading vs lagging indicator)
-# Requires: KEDA installed (helm install keda kedacore/keda -n keda)
-keda:
+# =============================================================================
+# Redis Configuration (Distributed State)
+# =============================================================================
+# Enables distributed rate limiting and API key storage for multi-replica deployments
+redis:
   enabled: false
-  minReplicaCount: 1
-  maxReplicaCount: 10
-  cooldownPeriod: 60
-  pollingInterval: 15
-  prometheusServerAddress: "http://prometheus-server.monitoring.svc.cluster.local:80"
-  pendingRequestsThreshold: "5"
-  activeRequestsThreshold: "8"
-  scaleDown:
-    stabilizationWindowSeconds: 120
-    percent: 25
-  scaleUp:
-    pods: 2
+  url: "redis://redis:6379"
+  password: ""
+  existingSecret: ""
+  existingSecretKey: "redis-password"
+  db: 0
 
-# Topology spread for zone-aware scheduling
+  rateLimit:
+    enabled: true
+    failureThreshold: 3
+    resetTimeout: "30s"
+
+  keyStore:
+    enabled: true
+    cacheTTL: "5m"
+    cacheSize: 1000
+
+# =============================================================================
+# Node Scheduling
+# =============================================================================
+# Label your nodes with custom labels for portable scheduling:
+#   kubectl label nodes <node-name> workload-type=compute-optimized
+#
+# Cloud-specific alternatives (uncomment and modify affinity below):
+# - AWS:   node.kubernetes.io/instance-type: c7i.xlarge, c7g.2xlarge, m7i.xlarge
+# - GKE:   cloud.google.com/machine-family: c3, cloud.google.com/gke-accelerator: <type>
+# - AKS:   kubernetes.azure.com/agentpool: <pool-name>, node.kubernetes.io/instance-type: Standard_D4s_v5
+# - On-Prem: Use custom labels like workload-type=compute-optimized
+# =============================================================================
+nodeSelector: {}
+
+tolerations: []
+
+affinity:
+  # Default: Uses generic workload-type label for cross-cloud portability.
+  # To use cloud-specific instance types, replace the matchExpressions below.
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+            # Generic label - apply to your compute-optimized nodes:
+            #   kubectl label nodes <node-name> workload-type=compute-optimized
+            - key: workload-type
+              operator: In
+              values:
+                - compute-optimized
+                - memory-optimized
+      # Uncomment below for AWS-specific scheduling:
+      # - weight: 80
+      #   preference:
+      #     matchExpressions:
+      #       - key: node.kubernetes.io/instance-type
+      #         operator: In
+      #         values:
+      #           - c7i.xlarge
+      #           - c7i.2xlarge
+      #           - c7g.xlarge
+      #           - c7g.2xlarge
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: densecore
+          topologyKey: kubernetes.io/hostname
+
 topologySpreadConstraints: []
   # - maxSkew: 1
   #   topologyKey: topology.kubernetes.io/zone
@@ -174,37 +346,3 @@ topologySpreadConstraints: []
   #   labelSelector:
   #     matchLabels:
   #       app.kubernetes.io/name: densecore
-
-# Graceful shutdown configuration
-terminationGracePeriodSeconds: 60
-
-# ============================================
-# Redis Configuration (Distributed State)
-# ============================================
-# Enables distributed rate limiting and API key storage
-# for multi-replica deployments
-redis:
-  enabled: false
-  # Connection URL (redis:// or rediss:// for TLS)
-  url: "redis://redis:6379"
-  # Password (recommended: use existingSecret instead)
-  password: ""
-  # Use existing secret for Redis password
-  existingSecret: ""
-  existingSecretKey: "redis-password"
-  # Redis database number
-  db: 0
-
-  # Rate Limiter settings
-  rateLimit:
-    enabled: true
-    # Circuit breaker settings
-    failureThreshold: 3
-    resetTimeout: "30s"
-
-  # API Key Store settings
-  keyStore:
-    enabled: true
-    # Local LRU cache settings
-    cacheTTL: "5m"
-    cacheSize: 1000

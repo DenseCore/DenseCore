@@ -96,45 +96,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  publish-python:
-    name: Publish Python Package
-    needs: build-artifacts
-    runs-on: ubuntu-latest
+  # Note: Python package publishing is handled by pypi-publish.yml workflow
+  # which uses cibuildwheel for multi-platform wheel builds
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Build C++ library
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake build-essential
-          make lib
-
-      - name: Copy library to Python package
-        run: |
-          cp build/libdensecore.so* python/densecore/
-
-      - name: Install build tools
-        run: |
-          python -m pip install --upgrade pip
-          pip install build twine
-
-      - name: Build Python package
-        working-directory: python
-        run: |
-          python -m build
-
-      - name: Publish to PyPI
-        if: startsWith(github.ref, 'refs/tags/')
-        working-directory: python
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          twine upload dist/*

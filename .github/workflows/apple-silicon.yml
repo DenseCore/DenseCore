@@ -37,9 +37,10 @@ jobs:
           submodules: recursive
 
       # [Optimization] Install Ninja & CCache
+      # Note: CMake 4.x + Ninja OBJCXX bug is now fixed in CMakeLists.txt
+      # by enabling OBJCXX at project() declaration time.
       - name: Install Build Tools
-        run: |
-          brew install ninja ccache
+        run: brew install ninja ccache
 
       - name: Setup Python
         uses: actions/setup-python@v5

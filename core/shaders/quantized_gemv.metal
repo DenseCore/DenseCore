@@ -39,10 +39,6 @@ constant uint QK4_0 = 32;   // Q4_0 block size
 constant uint QK4_1 = 32;   // Q4_1 block size
 constant uint QK8_0 = 32;   // Q8_0 block size
 
-// K-quant constants
-constant uint QK_K = 256;   // Super-block size for K-quants
-constant uint K_SCALE_SIZE = 12;  // Scales per super-block
-
 // Thread configuration
 constant uint THREADGROUP_SIZE = 256;
 
@@ -356,8 +352,9 @@ kernel void gemv_q4_0_batched(
     constant uint& K [[buffer(5)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint2 tg_dim [[threads_per_threadgroup]])
 {
+    uint tg_size = tg_dim.x;
     uint batch_idx = tgid.y;
     uint row = tgid.x;
 

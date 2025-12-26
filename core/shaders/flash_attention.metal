@@ -44,20 +44,18 @@ constant uint BLOCK_K = 16;          // Keys per block
 constant float NEG_INF = -1e9f;      // For masking
 
 // =============================================================================
-// Configurable Constants (Function Constants)
+// Constants for Array Sizing
 // =============================================================================
-// MAX_HEAD_DIM can be configured at pipeline creation via MTLFunctionConstantValues.
-// This allows support for models with head_dim > 128 (e.g., Llama 3 uses 128,
-// but future models may use larger dimensions).
+// MAX_HEAD_DIM is a compile-time constant used for static array allocation.
+// Set to 256 to support head dimensions up to 256 (covers 64, 128, and future models).
+// Metal requires compile-time constants for array sizes in threadgroup/thread memory.
 //
-// Host code example:
-//   MTLFunctionConstantValues* constants = [[MTLFunctionConstantValues alloc] init];
-//   uint maxHeadDim = 256;
-//   [constants setConstantValue:&maxHeadDim type:MTLDataTypeUInt atIndex:0];
-//   id<MTLFunction> fn = [library newFunctionWithName:@"flash_attention_decode"
-//                                      constantValues:constants error:nil];
+// Common head dimensions:
+// - GPT-2/3: 64
+// - Llama/Llama2: 128  
+// - Llama3/future models: up to 256
 // =============================================================================
-constant uint MAX_HEAD_DIM [[function_constant(0)]] = 128;
+constant uint MAX_HEAD_DIM = 256;
 
 // =============================================================================
 // Helper Structures
@@ -315,8 +313,9 @@ kernel void flash_attention_decode(
     constant uint& n_kv_heads [[buffer(8)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint3 tg_dim [[threads_per_threadgroup]])
 {
+    uint tg_size = tg_dim.x;
     uint batch_idx = tgid.z;
     uint head_idx = tgid.x;
     uint kv_head_idx = head_idx / (n_heads / n_kv_heads);

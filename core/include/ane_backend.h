@@ -56,13 +56,9 @@
 
 #include "densecore/hal/compute_backend.h"
 
-namespace densecore {
-
 // =============================================================================
-// Forward Declarations
+// Forward Declarations (must be at global scope for Objective-C)
 // =============================================================================
-
-// CoreML types (opaque to C++)
 #ifdef __OBJC__
 @class MLModel;
 @class MLMultiArray;
@@ -72,6 +68,8 @@ typedef void* MLModel;
 typedef void* MLMultiArray;
 typedef void* MLModelConfiguration;
 #endif
+
+namespace densecore {
 
 // =============================================================================
 // ANE Operation Types

@@ -1,0 +1,23 @@
+{{- if eq .Values.model.source "pvc" }}
+{{- if not .Values.model.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "densecore.fullname" . }}-models
+  labels:
+    {{- include "densecore.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- .Values.model.pvc.accessModes | default (list "ReadWriteMany") | toYaml | nindent 4 }}
+  {{- if .Values.model.pvc.storageClassName }}
+  storageClassName: {{ .Values.model.pvc.storageClassName }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.model.pvc.size | default "50Gi" }}
+  {{- with .Values.model.pvc.selector }}
+  selector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

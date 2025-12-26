@@ -34,8 +34,6 @@ Features:
 
 from typing import TYPE_CHECKING
 
-print("[DEBUG] densecore package init start")
-
 # Core exports
 from .auto import AutoModel, AutoModelForCausalLM, AutoTokenizer
 from .config import GenerationConfig, ModelConfig, SamplingParams
@@ -54,6 +52,9 @@ from .generate_output import (
 from .hub import download_model, from_pretrained, list_gguf_files
 from .lora import LoRAAdapterInfo, LoRAConfig, LoRAManager
 from .smart_loader import get_system_resources, recommend_quantization, smart_load
+
+# Debug init (placed after imports to avoid E402)
+print("[DEBUG] densecore package init start")
 
 # Version info
 __version__ = "2.0.0"

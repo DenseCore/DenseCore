@@ -22,6 +22,7 @@
 
 #ifdef __APPLE__
 
+#import <Accelerate/Accelerate.h>  // For cblas_sgemm
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
@@ -1135,13 +1136,14 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
         }
 
         // Fall back to runtime compilation
+        MTLCompileOptions* compileOptions = [[MTLCompileOptions alloc] init];
+        compileOptions.fastMathEnabled = YES;
+
         if (impl_->shaderLibrary == nil) {
             NSString* source = [NSString stringWithUTF8String:kMetalShaderSource];
-            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
-            options.fastMathEnabled = YES;
 
             impl_->shaderLibrary = [impl_->device newLibraryWithSource:source
-                                                               options:options
+                                                               options:compileOptions
                                                                  error:&error];
             if (impl_->shaderLibrary == nil) {
                 throw std::runtime_error("Failed to compile Metal shaders: " +
@@ -1210,7 +1212,7 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
                       << std::endl;
             NSString* flashAttnSource = [NSString stringWithUTF8String:kFlashAttentionShaderSource];
             id<MTLLibrary> flashAttnLib = [impl_->device newLibraryWithSource:flashAttnSource
-                                                                      options:options
+                                                                      options:compileOptions
                                                                         error:&error];
             if (flashAttnLib) {
                 id<MTLFunction> flashAttnDecodeFunction =
@@ -1238,7 +1240,7 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
                 [NSString stringWithUTF8String:kFlashAttentionPrefillSource];
             id<MTLLibrary> flashAttnPrefillLib =
                 [impl_->device newLibraryWithSource:flashAttnPrefillSource
-                                            options:options
+                                            options:compileOptions
                                               error:&error];
             if (flashAttnPrefillLib) {
                 id<MTLFunction> flashAttnPrefillFunction =
@@ -1263,7 +1265,7 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
         // Compile quantized GEMV kernels (Q4_0, Q4_1, Q8_0)
         NSString* quantizedGemvSource = [NSString stringWithUTF8String:kQuantizedGemvShaderSource];
         id<MTLLibrary> quantizedGemvLib = [impl_->device newLibraryWithSource:quantizedGemvSource
-                                                                      options:options
+                                                                      options:compileOptions
                                                                         error:&error];
         if (quantizedGemvLib) {
             id<MTLFunction> gemvQ4_0Function = [quantizedGemvLib newFunctionWithName:@"gemv_q4_0"];
@@ -1314,7 +1316,7 @@ MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {
         // Compile Fused QKV kernel
         NSString* fusedQKVSource = [NSString stringWithUTF8String:kFusedQKVShaderSource];
         id<MTLLibrary> fusedQKVLib = [impl_->device newLibraryWithSource:fusedQKVSource
-                                                                 options:options
+                                                                 options:compileOptions
                                                                    error:&error];
         if (fusedQKVLib) {
             id<MTLFunction> fusedQKVFunction = [fusedQKVLib newFunctionWithName:@"fused_qkv_gemv"];
@@ -2196,8 +2198,8 @@ void MetalBackend::FlashAttention(const Tensor& Q, const Tensor& K, const Tensor
     // ==========================================================================
     // CPU Fallback: Naive O(N^2) attention when GPU pipelines unavailable
     // ==========================================================================
-    std::cerr << "[MetalBackend] Warning: FlashAttention falling back to CPU. "
-              << "seq_q=" << seq_q << std::endl;
+    std::cerr << "[MetalBackend] Warning: FlashAttention falling back to CPU. seq_q=" << seq_q
+              << std::endl;
 
     const int n_rep = n_head / n_head_kv;  // GQA repetition factor
 

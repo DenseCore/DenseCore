@@ -230,10 +230,10 @@ class EmbeddingModel:
                 result_queue.put(np.zeros(self._dimension, dtype=np.float32))
 
         # Create callback
-        CALLBACK_TYPE = ctypes.CFUNCTYPE(
+        callback_type = ctypes.CFUNCTYPE(
             None, ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_void_p
         )
-        c_callback = CALLBACK_TYPE(callback)
+        c_callback = callback_type(callback)
 
         # Submit request
         ret = self._lib.SubmitEmbeddingRequestEx(

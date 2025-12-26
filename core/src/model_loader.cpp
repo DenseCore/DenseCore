@@ -246,14 +246,11 @@ TransformerModel* LoadGGUFModel(const char* path) {
         model->bos_token_id = -1;
     }
 
-    std::cout << "[DenseCore] Model params: "
-              << "n_vocab=" << model->hparams.n_vocab << ", "
-              << "n_embd=" << model->hparams.n_embd << ", "
-              << "n_layer=" << model->hparams.n_layer << ", "
-              << "n_head=" << model->hparams.n_head << ", "
-              << "n_head_kv=" << model->hparams.n_head_kv << ", "
-              << "n_rot=" << model->hparams.n_rot << ", "
-              << "n_ctx=" << model->hparams.n_ctx << std::endl;
+    std::cout << "[DenseCore] Model params: n_vocab=" << model->hparams.n_vocab
+              << ", n_embd=" << model->hparams.n_embd << ", n_layer=" << model->hparams.n_layer
+              << ", n_head=" << model->hparams.n_head << ", n_head_kv=" << model->hparams.n_head_kv
+              << ", n_rot=" << model->hparams.n_rot << ", n_ctx=" << model->hparams.n_ctx
+              << std::endl;
     std::cout << "[DenseCore] BOS=" << model->bos_token_id << ", EOS=" << model->eos_token_id
               << ", rope_freq=" << model->hparams.rope_freq_base
               << ", rope_scale=" << model->hparams.rope_freq_scale << std::endl;
@@ -761,8 +758,8 @@ TransformerModel* LoadGGUFModelNuma(const char* path, int numa_node, bool use_hu
     } else if (numa_node == -2) {
         mode = NumaMode::ROUND_ROBIN;
         mode_name = "ROUND-ROBIN";
-        std::cout << "[DenseCore] Using NUMA ROUND-ROBIN allocation "
-                  << "across " << num_nodes << " nodes" << std::endl;
+        std::cout << "[DenseCore] Using NUMA ROUND-ROBIN allocation across " << num_nodes
+                  << " nodes" << std::endl;
     } else {
         mode = NumaMode::PINNED;
         mode_name = "PINNED";

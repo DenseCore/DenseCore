@@ -1,5 +1,17 @@
 cmake_minimum_required(VERSION 3.14)
-project(DenseCore VERSION 1.0.0 LANGUAGES C CXX)
+
+# ==========================================================================
+# CMake 4.x + Ninja + OBJCXX Bug Workaround
+# ==========================================================================
+# CMake 4.x has a bug where CMAKE_OBJCXX_COMPILE_OBJECT is not set when
+# enable_language(OBJCXX) is called after project() with Ninja generator.
+# Workaround: Enable OBJCXX at project declaration time on Apple platforms.
+# ==========================================================================
+if(APPLE)
+    project(DenseCore VERSION 1.0.0 LANGUAGES C CXX OBJC OBJCXX)
+else()
+    project(DenseCore VERSION 1.0.0 LANGUAGES C CXX)
+endif()
 
 # ==========================================================================
 # Commercial / Open Source Toggle
@@ -124,7 +136,6 @@ set(SOURCES
     src/cpu_backend_opt.cpp
     # Kernels (optimized SIMD implementations)
     src/kernels/cpu_int4.cpp
-    src/kernels/cpu_int4_avx512.cpp
     src/kernels/cpu_amx.cpp
     # Quantization module
     src/quantizer.cpp
@@ -144,29 +155,58 @@ set(SOURCES
 )
 
 # ==========================================================================
+# Platform-Specific Source Additions (BEFORE add_library)
+# ==========================================================================
+# Must add platform-specific sources BEFORE add_library() is called.
+# CMake captures the source list at add_library() time.
+# ==========================================================================
+if(APPLE)
+    # Metal source files (Objective-C++)
+    set(METAL_SOURCES
+        src/metal_backend.mm
+        src/apple_silicon.mm
+        src/ane_backend.mm
+        src/hybrid_scheduler.mm
+    )
+    list(APPEND SOURCES ${METAL_SOURCES})
+    message(STATUS "[DenseCore] Added Metal/Apple sources: ${METAL_SOURCES}")
+endif()
+
+# ==========================================================================
 # SIMD Dispatch Strategy
 # ==========================================================================
 # x86: Uses __attribute__((target(...))) for function-level SIMD enabling.
-# ARM: Uses file-level compile flags as GCC/Clang ARM doesn't fully support
-#      target attributes for SVE. This is safe because the dispatcher code
-#      doesn't use SVE intrinsics directly.
+# ARM: Apple Silicon (M1/M2/M3) only supports NEON, not SVE.
+#      AWS Graviton3+ supports SVE, so we enable SVE only for non-Apple ARM64.
 # ==========================================================================
 if(NOT MSVC)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
-        # Enable SVE and DOTPROD for ARM kernels (safe: dispatcher is pure C++)
-        set_source_files_properties(
-            src/kernels/cpu_int4.cpp
-            PROPERTIES COMPILE_FLAGS
-            "-march=armv8.2-a+sve+dotprod+fp16"
-        )
-        message(STATUS "[DenseCore] cpu_int4.cpp: ARM (SVE/DotProd/FP16)")
+        if(APPLE)
+            # Apple Silicon: NEON + DOTPROD only (no SVE support)
+            set_source_files_properties(
+                src/kernels/cpu_int4.cpp
+                PROPERTIES COMPILE_FLAGS
+                "-march=armv8.2-a+dotprod+fp16"
+            )
+            message(STATUS "[DenseCore] cpu_int4.cpp: Apple Silicon (NEON/DotProd/FP16)")
+        else()
+            # Non-Apple ARM64 (AWS Graviton, Ampere): Enable SVE
+            set_source_files_properties(
+                src/kernels/cpu_int4.cpp
+                PROPERTIES COMPILE_FLAGS
+                "-march=armv8.2-a+sve+dotprod+fp16"
+            )
+            message(STATUS "[DenseCore] cpu_int4.cpp: ARM64 (SVE/DotProd/FP16)")
+        endif()
     endif()
 endif()
 
-# Create shared library
+# ==========================================================================
+# Create Shared Library (AFTER all source additions)
+# ==========================================================================
 add_library(densecore SHARED ${SOURCES})
 
-# Include directories - Define BEFORE linking
+# Include directories
 target_include_directories(densecore PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_BINARY_DIR}/include  # Generated version header
@@ -178,7 +218,6 @@ target_include_directories(densecore PUBLIC
 
 # Link against ggml
 target_link_libraries(densecore PRIVATE ggml)
-
 
 # Define DENSECORE_BUILD_SHARED for symbol export (Windows dllexport)
 target_compile_definitions(densecore PRIVATE DENSECORE_BUILD_SHARED)
@@ -207,25 +246,12 @@ target_compile_options(densecore PRIVATE
 if(APPLE)
     message(STATUS "Configuring for Apple platform - Using Accelerate framework")
 
-    # ==========================================================================
-    # Enable Objective-C++ for Metal backend
-    # ==========================================================================
-    enable_language(OBJCXX)
+    # Objective-C++ is enabled at project() declaration time
+    # (see CMake 4.x + Ninja workaround at top of file)
     set(CMAKE_OBJCXX_STANDARD 17)
     set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 
-    # Metal source files (Objective-C++)
-    set(METAL_SOURCES
-        src/metal_backend.mm
-        src/apple_silicon.mm
-        src/ane_backend.mm
-        src/hybrid_scheduler.mm
-    )
-
-    # Add Metal sources to the main source list
-    list(APPEND SOURCES ${METAL_SOURCES})
-
-    # Set Objective-C++ flags for .mm files
+    # Set Objective-C++ flags for .mm files (METAL_SOURCES already added above)
     set_source_files_properties(${METAL_SOURCES} PROPERTIES
         COMPILE_FLAGS "-fobjc-arc"
     )
@@ -285,18 +311,30 @@ if(APPLE)
 
     if(EXISTS ${METAL_SHADER_DIR})
         # Compile Metal shaders to metallib
+        # Note: metal -c cannot use -o with multiple input files,
+        # so we compile each .metal to .air separately, then link.
         set(METALLIB_OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/densecore.metallib)
+        set(AIR_FILES "")
+
+        foreach(SHADER ${METAL_SHADERS})
+            get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
+            set(AIR_FILE ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_NAME}.air)
+            list(APPEND AIR_FILES ${AIR_FILE})
+
+            add_custom_command(
+                OUTPUT ${AIR_FILE}
+                COMMAND xcrun -sdk macosx metal -c ${SHADER} -o ${AIR_FILE}
+                DEPENDS ${SHADER}
+                COMMENT "Compiling ${SHADER_NAME}.metal to AIR"
+                VERBATIM
+            )
+        endforeach()
 
         add_custom_command(
             OUTPUT ${METALLIB_OUTPUT}
-            COMMAND xcrun -sdk macosx metal
-                    -c ${METAL_SHADERS}
-                    -o ${CMAKE_CURRENT_BINARY_DIR}/densecore.air
-            COMMAND xcrun -sdk macosx metallib
-                    ${CMAKE_CURRENT_BINARY_DIR}/densecore.air
-                    -o ${METALLIB_OUTPUT}
-            DEPENDS ${METAL_SHADERS}
-            COMMENT "Compiling Metal shaders to metallib"
+            COMMAND xcrun -sdk macosx metallib ${AIR_FILES} -o ${METALLIB_OUTPUT}
+            DEPENDS ${AIR_FILES}
+            COMMENT "Linking Metal shaders into metallib"
             VERBATIM
         )
 
@@ -589,6 +627,7 @@ if(DENSECORE_BUILD_TESTS)
         ${GGML_DIR}/include
         ${GGML_DIR}/src
         ${GGML_DIR}/src/ggml-cpu
+        ${simde_SOURCE_DIR}  # SIMDe for simd_platform.h
     )
 
     # Link dependencies directly (do NOT link densecore shared lib to avoid symbol conflicts/hiding)
@@ -618,6 +657,15 @@ if(DENSECORE_BUILD_TESTS)
 
     if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
         target_compile_options(densecore_tests PRIVATE -mcpu=apple-m1)
+        # Link Apple frameworks required by Metal/CoreML/Accelerate code
+        target_link_libraries(densecore_tests PRIVATE
+            ${ACCELERATE_FRAMEWORK}
+            ${METAL_FRAMEWORK}
+            ${FOUNDATION_FRAMEWORK}
+            ${METALPERFORMANCESHADERS_FRAMEWORK}
+            ${COREML_FRAMEWORK}
+            ${IOKIT_FRAMEWORK}
+        )
     endif()
 
     include(GoogleTest)

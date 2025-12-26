@@ -134,8 +134,8 @@ public:
         const char* alloc_type_str =
             (alloc_type_ == BlockAllocationType::Numa) ? "NUMA" : "Aligned";
         std::cout << "[KVBlockAllocator] Initialized: " << num_blocks_ << " blocks × "
-                  << block_stride_ << " bytes = " << (arena_size_ / 1024 / 1024) << " MB"
-                  << " (" << alloc_type_str << ")" << std::endl;
+                  << block_stride_ << " bytes = " << (arena_size_ / 1024 / 1024) << " MB ("
+                  << alloc_type_str << ")" << std::endl;
     }
 
     /**

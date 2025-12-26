@@ -535,7 +535,7 @@ bool ANEBackend::ExecuteMatMul(const std::string& name, const float* input, floa
         }
 
         // Create feature provider
-        NSDictionary<NSString*, id<MLFeatureValue>>* features =
+        NSDictionary* features =
             @{op->inputName : [MLFeatureValue featureValueWithMultiArray:inputArray]};
         MLDictionaryFeatureProvider* provider =
             [[MLDictionaryFeatureProvider alloc] initWithDictionary:features error:&error];
@@ -751,7 +751,7 @@ bool ANEBackend::ExecuteTransformerLayer(const std::string& name, const float* i
         }
 
         // Create feature provider
-        NSDictionary<NSString*, id<MLFeatureValue>>* features = @{
+        NSDictionary* features = @{
             op->inputName : [MLFeatureValue featureValueWithMultiArray:hiddenStates],
             @"positions" : [MLFeatureValue featureValueWithMultiArray:posArray]
         };

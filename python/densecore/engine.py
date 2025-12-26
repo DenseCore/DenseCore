@@ -527,7 +527,7 @@ class DenseCore:
                 print(f"[DenseCore] transformers load failed: {e}")
                 print("[DenseCore] tokenizer disabled")
         except Exception as e:
-            warnings.warn(f"Failed to load tokenizer from {hf_repo_id}: {e}")
+            warnings.warn(f"Failed to load tokenizer from {hf_repo_id}: {e}", stacklevel=2)
 
     def _clean_bpe_token(self, token: str) -> str:
         """Clean BPE artifacts from token string."""
@@ -570,7 +570,7 @@ class DenseCore:
 
             error_msg = f"Error in callback handler for req {req_id}: {e}\n{traceback.format_exc()}"
             print(f"[DenseCore] {error_msg}")
-            warnings.warn(error_msg)
+            warnings.warn(error_msg, stacklevel=2)
 
         if finished:
             with self._lock:
@@ -648,7 +648,7 @@ class DenseCore:
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         **kwargs,
-    ) -> Union[str, "GenerateOutput"]:
+    ) -> Union[str, "GenerateOutput"]:  # noqa: F821 - forward reference
         """
         Generate text from a prompt.
 
@@ -1168,7 +1168,7 @@ class DenseCore:
                     if finished:
                         q.put("".join(tokens))
 
-                return handler
+                return handler  # noqa: B023 - handler is defined in factory function
 
             handler = make_handler(result_queue)
             req_id = self._register_request(handler)
@@ -1299,7 +1299,7 @@ class DenseCore:
         if hasattr(self, "_has_lora_api") and self._has_lora_api:
             ret = self._lib.UnloadLoraAdapter(self._handle, name.encode("utf-8"))
             if ret < 0:
-                warnings.warn(f"Failed to unload LoRA adapter in C++: error code {ret}")
+                warnings.warn(f"Failed to unload LoRA adapter in C++: error code {ret}", stacklevel=2)
 
         self._lora_manager.unload(name)
 
@@ -1330,7 +1330,7 @@ class DenseCore:
         if hasattr(self, "_has_lora_api") and self._has_lora_api:
             ret = self._lib.DeactivateLoraAdapters(self._handle)
             if ret < 0:
-                warnings.warn(f"Failed to deactivate LoRA adapters in C++: error code {ret}")
+                warnings.warn(f"Failed to deactivate LoRA adapters in C++: error code {ret}", stacklevel=2)
 
         self._lora_manager.deactivate()
 

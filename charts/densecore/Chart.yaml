@@ -1,18 +1,41 @@
 apiVersion: v2
 name: densecore
-description: High-performance CPU Inference Engine for LLMs (OpenAI-compatible)
+description: High-performance CPU Inference Engine for LLMs (OpenAI-compatible API)
+
 type: application
-version: 0.1.0
-appVersion: "2.0.0"
+
+# Chart version - incremented on chart changes
+version: 0.3.0
+
+# Application version - should match the DenseCore release
+appVersion: "0.3.0"
+
 keywords:
   - llm
   - inference
   - cpu
   - ai
   - huggingface
+  - gguf
+  - openai
+  - machine-learning
+
 home: https://github.com/Jake-Network/DenseCore
+
 sources:
   - https://github.com/Jake-Network/DenseCore
+
 maintainers:
-  - name: densecore
-    email: contact@densecore.io
+  - name: DenseCore Team
+    email: maintainers@densecore.dev
+
+icon: https://raw.githubusercontent.com/Jake-Network/DenseCore/main/docs/images/logo.png
+
+annotations:
+  category: AI/ML
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://github.com/Jake-Network/DenseCore/tree/main/docs
+    - name: Docker Hub
+      url: https://hub.docker.com/r/densecore/densecore
