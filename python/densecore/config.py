@@ -248,6 +248,7 @@ class GenerationConfig:
                 f"DenseCore only supports num_beams=1 (greedy/sampling). "
                 f"Requested num_beams={self.num_beams} will be ignored.",
                 UserWarning,
+                stacklevel=2,
             )
             self.num_beams = 1
 

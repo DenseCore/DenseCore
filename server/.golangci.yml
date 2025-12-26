@@ -17,35 +17,43 @@ linters:
     - noctx
     - gosec
 
-linters-settings:
-  gocyclo:
-    min-complexity: 30
+  settings:
+    gocyclo:
+      min-complexity: 30
 
-  dupl:
-    threshold: 100
+    dupl:
+      threshold: 100
 
-  goconst:
-    min-len: 3
-    min-occurrences: 3
+    goconst:
+      min-len: 3
+      min-occurrences: 3
 
-  misspell:
-    locale: US
+    misspell:
+      locale: US
 
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - performance
-    disabled-checks:
-      - commentedOutCode
-      - hugeParam
-      - paramTypeCombine
-      - dupImport
-      - emptyStringTest
-      - httpNoBody
-      - equalFold
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+      disabled-checks:
+        - commentedOutCode
+        - hugeParam
+        - paramTypeCombine
+        - dupImport
+        - emptyStringTest
+        - httpNoBody
+        - equalFold
 
-issues:
-  exclude-rules:
+run:
+  timeout: 5m
+
+exclusions:
+  # Paths to exclude from linting
+  paths:
+    - vendor
+    - third_party
+
+  rules:
     # Test files are less strict
     - path: _test\.go
       linters:
@@ -54,9 +62,3 @@ issues:
         - errcheck
         - gosec
         - gocritic
-
-run:
-  timeout: 5m
-  exclude-dirs:
-    - vendor
-    - third_party
