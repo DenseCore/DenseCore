@@ -156,6 +156,24 @@ set(SOURCES
 )
 
 # ==========================================================================
+# Platform-Specific Source Additions (BEFORE add_library)
+# ==========================================================================
+# Must add platform-specific sources BEFORE add_library() is called.
+# CMake captures the source list at add_library() time.
+# ==========================================================================
+if(APPLE)
+    # Metal source files (Objective-C++)
+    set(METAL_SOURCES
+        src/metal_backend.mm
+        src/apple_silicon.mm
+        src/ane_backend.mm
+        src/hybrid_scheduler.mm
+    )
+    list(APPEND SOURCES ${METAL_SOURCES})
+    message(STATUS "[DenseCore] Added Metal/Apple sources: ${METAL_SOURCES}")
+endif()
+
+# ==========================================================================
 # SIMD Dispatch Strategy
 # ==========================================================================
 # x86: Uses __attribute__((target(...))) for function-level SIMD enabling.
@@ -184,10 +202,12 @@ if(NOT MSVC)
     endif()
 endif()
 
-# Create shared library
+# ==========================================================================
+# Create Shared Library (AFTER all source additions)
+# ==========================================================================
 add_library(densecore SHARED ${SOURCES})
 
-# Include directories - Define BEFORE linking
+# Include directories
 target_include_directories(densecore PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_BINARY_DIR}/include  # Generated version header
@@ -199,7 +219,6 @@ target_include_directories(densecore PUBLIC
 
 # Link against ggml
 target_link_libraries(densecore PRIVATE ggml)
-
 
 # Define DENSECORE_BUILD_SHARED for symbol export (Windows dllexport)
 target_compile_definitions(densecore PRIVATE DENSECORE_BUILD_SHARED)
@@ -233,18 +252,7 @@ if(APPLE)
     set(CMAKE_OBJCXX_STANDARD 17)
     set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 
-    # Metal source files (Objective-C++)
-    set(METAL_SOURCES
-        src/metal_backend.mm
-        src/apple_silicon.mm
-        src/ane_backend.mm
-        src/hybrid_scheduler.mm
-    )
-
-    # Add Metal sources to the main source list
-    list(APPEND SOURCES ${METAL_SOURCES})
-
-    # Set Objective-C++ flags for .mm files
+    # Set Objective-C++ flags for .mm files (METAL_SOURCES already added above)
     set_source_files_properties(${METAL_SOURCES} PROPERTIES
         COMPILE_FLAGS "-fobjc-arc"
     )
