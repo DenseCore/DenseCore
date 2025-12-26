@@ -658,6 +658,15 @@ if(DENSECORE_BUILD_TESTS)
 
     if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
         target_compile_options(densecore_tests PRIVATE -mcpu=apple-m1)
+        # Link Apple frameworks required by Metal/CoreML/Accelerate code
+        target_link_libraries(densecore_tests PRIVATE
+            ${ACCELERATE_FRAMEWORK}
+            ${METAL_FRAMEWORK}
+            ${FOUNDATION_FRAMEWORK}
+            ${METALPERFORMANCESHADERS_FRAMEWORK}
+            ${COREML_FRAMEWORK}
+            ${IOKIT_FRAMEWORK}
+        )
     endif()
 
     include(GoogleTest)
