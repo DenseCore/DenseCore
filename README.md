@@ -64,6 +64,8 @@ AMD Zen4                     → AVX-512 VNNI > AVX2
   - Continuous Batching scheduler (vLLM-style)
   - Prometheus metrics, OpenTelemetry tracing
   - Helm charts, Docker multi-stage builds
+  - **Redis**: Distributed rate limiting & API key storage
+  - **KEDA**: Queue-based autoscaling
 - **Developer Friendly**
   - Python SDK with LangChain/LangGraph integration
   - OpenAI-compatible REST API
@@ -123,6 +125,7 @@ make -j$(nproc)
 - [Architecture](docs/ARCHITECTURE.md)
 - [API Reference](docs/API_REFERENCE.md)
 - [Deployment Guide](docs/DEPLOYMENT.md)
+- [Cloud-Native Guide](docs/CLOUD_NATIVE.md)
 - [Apple Silicon Guide](docs/APPLE_SILICON.md)
 - [Benchmarks](docs/BENCHMARKS.md)
 

@@ -31,6 +31,8 @@ const (
   Production-Ready with Authentication
 ==========================================
 `
+	// envTrue is the expected value for boolean environment variables
+	envTrue = "true"
 )
 
 func main() {
@@ -107,19 +109,45 @@ func main() {
 
 	// Initialize API key store
 	var apiKeyStore middleware.APIKeyStore
-	authEnabled := os.Getenv("AUTH_ENABLED") == "true"
+	authEnabled := os.Getenv("AUTH_ENABLED") == envTrue
 
 	if authEnabled {
 		slog.Info("authentication enabled")
 
 		// Try Redis key store first if configured
 		redisURL := os.Getenv("REDIS_URL")
-		redisKeystoreEnabled := os.Getenv("REDIS_KEYSTORE_ENABLED") == "true"
+		redisKeystoreEnabled := os.Getenv("REDIS_KEYSTORE_ENABLED") == envTrue
 
 		if redisURL != "" && redisKeystoreEnabled {
-			cacheTTL, _ := time.ParseDuration(getEnvOrDefault("REDIS_KEYSTORE_CACHE_TTL", "5m"))
-			cacheSize, _ := strconv.Atoi(getEnvOrDefault("REDIS_KEYSTORE_CACHE_SIZE", "1000"))
-			redisDB, _ := strconv.Atoi(getEnvOrDefault("REDIS_DB", "0"))
+			cacheTTLStr := getEnvOrDefault("REDIS_KEYSTORE_CACHE_TTL", "5m")
+			cacheTTL, err := time.ParseDuration(cacheTTLStr)
+			if err != nil {
+				slog.Warn("invalid REDIS_KEYSTORE_CACHE_TTL, using default",
+					slog.String("value", cacheTTLStr),
+					slog.String("default", "5m"),
+					slog.String("error", err.Error()))
+				cacheTTL = 5 * time.Minute
+			}
+
+			cacheSizeStr := getEnvOrDefault("REDIS_KEYSTORE_CACHE_SIZE", "1000")
+			cacheSize, err := strconv.Atoi(cacheSizeStr)
+			if err != nil {
+				slog.Warn("invalid REDIS_KEYSTORE_CACHE_SIZE, using default",
+					slog.String("value", cacheSizeStr),
+					slog.String("default", "1000"),
+					slog.String("error", err.Error()))
+				cacheSize = 1000
+			}
+
+			redisDBStr := getEnvOrDefault("REDIS_DB", "0")
+			redisDB, err := strconv.Atoi(redisDBStr)
+			if err != nil {
+				slog.Warn("invalid REDIS_DB, using default",
+					slog.String("value", redisDBStr),
+					slog.String("default", "0"),
+					slog.String("error", err.Error()))
+				redisDB = 0
+			}
 
 			redisKeyStore, err := middleware.NewRedisKeyStore(middleware.RedisKeyStoreConfig{
 				RedisURL:      redisURL,
@@ -161,10 +189,18 @@ func main() {
 	var rateLimiter middleware.RateLimiterInterface
 	if cfg.RateLimitEnabled {
 		redisURL := os.Getenv("REDIS_URL")
-		redisRateLimitEnabled := os.Getenv("REDIS_RATELIMIT_ENABLED") == "true"
+		redisRateLimitEnabled := os.Getenv("REDIS_RATELIMIT_ENABLED") == envTrue
 
 		if redisURL != "" && redisRateLimitEnabled {
-			redisDB, _ := strconv.Atoi(getEnvOrDefault("REDIS_DB", "0"))
+			redisDBStr := getEnvOrDefault("REDIS_DB", "0")
+			redisDB, err := strconv.Atoi(redisDBStr)
+			if err != nil {
+				slog.Warn("invalid REDIS_DB for rate limiter, using default",
+					slog.String("value", redisDBStr),
+					slog.String("default", "0"),
+					slog.String("error", err.Error()))
+				redisDB = 0
+			}
 
 			redisRateLimiter, err := middleware.NewRedisRateLimiter(middleware.RedisRateLimiterConfig{
 				RedisURL:          redisURL,
@@ -332,7 +368,7 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	authEnabled := os.Getenv("AUTH_ENABLED") == "true"
+	authEnabled := os.Getenv("AUTH_ENABLED") == envTrue
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -386,4 +422,3 @@ func getEnvOrDefault(key, defaultValue string) string {
 	}
 	return defaultValue
 }
-

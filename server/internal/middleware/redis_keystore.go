@@ -6,7 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -14,19 +14,35 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// deactivateKeyScript is the Lua script for atomic key deactivation.
+// SECURITY: Performs atomic read-modify-write to prevent race conditions.
+const deactivateKeyScript = `
+local data = redis.call('GET', KEYS[1])
+if not data then
+    return redis.error_reply("key not found")
+end
+
+local info = cjson.decode(data)
+info.Active = false
+local newData = cjson.encode(info)
+redis.call('SET', KEYS[1], newData)
+return 'OK'
+`
+
 // cachedKeyInfo wraps APIKeyInfo with cache metadata.
 type cachedKeyInfo struct {
-	Info      *APIKeyInfo
-	CachedAt  time.Time
+	Info     *APIKeyInfo
+	CachedAt time.Time
 }
 
 // RedisKeyStore stores API keys as SHA-256 hashes in Redis
 // with an LRU cache layer to reduce Redis load.
 type RedisKeyStore struct {
-	client    *redis.Client
-	cache     *lru.Cache[string, *cachedKeyInfo]
-	cacheTTL  time.Duration
-	keyPrefix string
+	client           *redis.Client
+	cache            *lru.Cache[string, *cachedKeyInfo]
+	cacheTTL         time.Duration
+	keyPrefix        string
+	deactivateScript *redis.Script
 
 	// Circuit breaker for Redis failures
 	mu          sync.RWMutex
@@ -63,7 +79,7 @@ func NewRedisKeyStore(cfg RedisKeyStoreConfig) (*RedisKeyStore, error) {
 	defer cancel()
 
 	if err := client.Ping(ctx).Err(); err != nil {
-		client.Close()
+		_ = client.Close() // Best-effort cleanup on connection failure
 		return nil, err
 	}
 
@@ -79,15 +95,16 @@ func NewRedisKeyStore(cfg RedisKeyStoreConfig) (*RedisKeyStore, error) {
 
 	cache, err := lru.New[string, *cachedKeyInfo](cacheSize)
 	if err != nil {
-		client.Close()
+		_ = client.Close() // Best-effort cleanup on cache creation failure
 		return nil, err
 	}
 
 	return &RedisKeyStore{
-		client:    client,
-		cache:     cache,
-		cacheTTL:  cacheTTL,
-		keyPrefix: "apikey:",
+		client:           client,
+		cache:            cache,
+		cacheTTL:         cacheTTL,
+		keyPrefix:        "apikey:",
+		deactivateScript: redis.NewScript(deactivateKeyScript),
 	}, nil
 }
 
@@ -98,12 +115,26 @@ func hashKey(key string) string {
 }
 
 // Validate checks if the key exists and is active.
-// Uses constant-time comparison to prevent timing attacks.
+// SECURITY: Uses constant-time comparison to prevent timing attacks.
+// Even for non-existent keys, we perform dummy operations to maintain
+// consistent timing and prevent key enumeration.
 func (s *RedisKeyStore) Validate(key string) bool {
+	keyHash := hashKey(key)
 	info := s.getKeyInfo(key)
+
 	if info == nil {
+		// Perform dummy comparison to maintain constant time even for non-existent keys
+		// This prevents attackers from distinguishing between "key not found" and "key found but invalid"
+		dummyHash := hashKey("dummy-key-for-timing-protection")
+		subtle.ConstantTimeCompare([]byte(keyHash), []byte(dummyHash))
 		return false
 	}
+
+	// Constant-time comparison of stored hash with computed hash
+	if subtle.ConstantTimeCompare([]byte(info.Key), []byte(keyHash)) != 1 {
+		return false
+	}
+
 	return info.Active
 }
 
@@ -140,7 +171,7 @@ func (s *RedisKeyStore) getKeyInfo(key string) *APIKeyInfo {
 
 	// Check circuit breaker
 	if s.isCircuitOpen() {
-		log.Printf("[KeyStore] Circuit open, cache miss for key")
+		slog.Warn("circuit open, cache miss for key", slog.String("component", "keystore"))
 		return nil
 	}
 
@@ -152,7 +183,7 @@ func (s *RedisKeyStore) getKeyInfo(key string) *APIKeyInfo {
 	if err != nil {
 		if err != redis.Nil {
 			s.recordFailure()
-			log.Printf("[KeyStore] Redis error: %v", err)
+			slog.Error("Redis GET failed", slog.String("component", "keystore"), slog.String("error", err.Error()))
 		}
 		return nil
 	}
@@ -161,7 +192,7 @@ func (s *RedisKeyStore) getKeyInfo(key string) *APIKeyInfo {
 
 	var info APIKeyInfo
 	if err := json.Unmarshal(data, &info); err != nil {
-		log.Printf("[KeyStore] Failed to unmarshal key info: %v", err)
+		slog.Error("failed to unmarshal key info", slog.String("component", "keystore"), slog.String("error", err.Error()))
 		return nil
 	}
 
@@ -201,7 +232,7 @@ func (s *RedisKeyStore) AddKey(key, userID, tier string) error {
 	// Invalidate cache
 	s.cache.Remove(keyHash)
 
-	log.Printf("[KeyStore] Added key for user: %s (tier: %s)", userID, tier)
+	slog.Info("added API key", slog.String("component", "keystore"), slog.String("user_id", userID), slog.String("tier", tier))
 	return nil
 }
 
@@ -222,31 +253,16 @@ func (s *RedisKeyStore) DeleteKey(key string) error {
 }
 
 // DeactivateKey marks a key as inactive without deleting it.
+// SECURITY: Uses atomic Lua script to prevent race conditions.
 func (s *RedisKeyStore) DeactivateKey(key string) error {
 	keyHash := hashKey(key)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Get current info
-	data, err := s.client.Get(ctx, s.keyPrefix+keyHash).Bytes()
+	// Use atomic Lua script to prevent race conditions
+	_, err := s.deactivateScript.Run(ctx, s.client, []string{s.keyPrefix + keyHash}).Result()
 	if err != nil {
-		return err
-	}
-
-	var info APIKeyInfo
-	if err := json.Unmarshal(data, &info); err != nil {
-		return err
-	}
-
-	info.Active = false
-
-	newData, err := json.Marshal(&info)
-	if err != nil {
-		return err
-	}
-
-	if err := s.client.Set(ctx, s.keyPrefix+keyHash, newData, 0).Err(); err != nil {
 		return err
 	}
 
@@ -281,7 +297,7 @@ func (s *RedisKeyStore) recordFailure() {
 	s.lastFailure = time.Now()
 
 	if s.failures >= 3 && !s.circuitOpen {
-		log.Printf("[KeyStore] Circuit breaker OPEN after %d failures", s.failures)
+		slog.Warn("circuit breaker OPEN", slog.String("component", "keystore"), slog.Int("failures", s.failures))
 		s.circuitOpen = true
 	}
 }
@@ -292,7 +308,7 @@ func (s *RedisKeyStore) recordSuccess() {
 	defer s.mu.Unlock()
 
 	if s.circuitOpen {
-		log.Println("[KeyStore] Circuit breaker CLOSED, Redis recovered")
+		slog.Info("circuit breaker CLOSED, Redis recovered", slog.String("component", "keystore"))
 	}
 	s.failures = 0
 	s.circuitOpen = false
@@ -309,10 +325,4 @@ func (s *RedisKeyStore) Close() error {
 // HealthCheck verifies Redis connectivity.
 func (s *RedisKeyStore) HealthCheck(ctx context.Context) error {
 	return s.client.Ping(ctx).Err()
-}
-
-// constantTimeCompare performs constant-time string comparison.
-// Used internally to prevent timing attacks on key validation.
-func constantTimeCompare(a, b string) bool {
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }

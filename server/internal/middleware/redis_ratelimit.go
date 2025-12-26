@@ -11,6 +11,8 @@ import (
 
 // tokenBucketScript is the Lua script for atomic token bucket operations.
 // Returns 1 if request is allowed, 0 if denied.
+//
+//nolint:gosec // G101 false positive: this is a Lua script for Redis, not credentials
 const tokenBucketScript = `
 local key = KEYS[1]
 local maxTokens = tonumber(ARGV[1])
@@ -90,7 +92,7 @@ func NewRedisRateLimiter(cfg RedisRateLimiterConfig) (*RedisRateLimiter, error) 
 	defer cancel()
 
 	if err := client.Ping(ctx).Err(); err != nil {
-		client.Close()
+		_ = client.Close() // Best-effort cleanup on connection failure
 		return nil, err
 	}
 
