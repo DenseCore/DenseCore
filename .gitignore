@@ -112,6 +112,7 @@ coverage.out
 
 # Server binary
 server/densecore-server
+server/densecore-cli
 
 # Python virtual environment
 .venv/

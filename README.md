@@ -94,10 +94,36 @@ for token in model.generate("The capital of France is", max_tokens=64, stream=Tr
 
 ## Installation
 
+### Homebrew (macOS/Linux)
+
+```bash
+brew tap Jake-Network/densecore
+brew install densecore
+
+# Start chatting immediately
+densecore run
+```
+
+### Python
+
 ```bash
 pip install densecore                # Basic
 pip install densecore[langchain]     # + LangChain support
 ```
+
+## CLI Usage
+
+The `densecore` CLI provides a beautiful terminal interface for local inference:
+
+```bash
+# Interactive chat with TUI (downloads model automatically)
+densecore run Qwen/Qwen2.5-0.5B-Instruct-GGUF
+
+# Production HTTP server
+densecore serve --model ./model.gguf --port 8080
+```
+
+See [CLI Documentation](docs/CLI.md) for full details.
 
 ## Deployment
 
@@ -122,6 +148,7 @@ make -j$(nproc)
 
 ## Documentation
 
+- [CLI Guide](docs/CLI.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [API Reference](docs/API_REFERENCE.md)
 - [Deployment Guide](docs/DEPLOYMENT.md)
