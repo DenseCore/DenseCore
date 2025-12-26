@@ -301,13 +301,13 @@ kernel void gemv_f32_batched(
     constant uint& B [[buffer(3)]],               // Batch size
     constant uint& M [[buffer(4)]],               // Output dimension
     constant uint& K [[buffer(5)]],               // Input dimension
-    uint2 gid [[thread_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint2 tgid [[threadgroup_position_in_grid]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint2 tg_dim [[threads_per_threadgroup]])
 {
     uint batch = tgid.y;
     uint row = tgid.x;
+    uint tg_size = tg_dim.x;
 
     if (batch >= B || row >= M) return;
 

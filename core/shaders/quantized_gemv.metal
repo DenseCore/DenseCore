@@ -356,8 +356,9 @@ kernel void gemv_q4_0_batched(
     constant uint& K [[buffer(5)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint2 tg_dim [[threads_per_threadgroup]])
 {
+    uint tg_size = tg_dim.x;
     uint batch_idx = tgid.y;
     uint row = tgid.x;
 

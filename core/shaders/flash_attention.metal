@@ -57,7 +57,9 @@ constant float NEG_INF = -1e9f;      // For masking
 //   id<MTLFunction> fn = [library newFunctionWithName:@"flash_attention_decode"
 //                                      constantValues:constants error:nil];
 // =============================================================================
-constant uint MAX_HEAD_DIM [[function_constant(0)]] = 128;
+// Note: For models with head_dim > 128, recompile with adjusted MAX_HEAD_DIM
+// or use MTLFunctionConstantValues at runtime (requires separate kernel variant)
+constant uint MAX_HEAD_DIM = 128;
 
 // =============================================================================
 // Helper Structures
@@ -315,8 +317,9 @@ kernel void flash_attention_decode(
     constant uint& n_kv_heads [[buffer(8)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint3 tg_dim [[threads_per_threadgroup]])
 {
+    uint tg_size = tg_dim.x;
     uint batch_idx = tgid.z;
     uint head_idx = tgid.x;
     uint kv_head_idx = head_idx / (n_heads / n_kv_heads);
