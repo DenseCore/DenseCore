@@ -1,5 +1,23 @@
 services:
   # ===========================================
+  # Redis for Distributed Rate Limiting & API Keys
+  # ===========================================
+  redis:
+    image: redis:7-alpine
+    container_name: densecore-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - densecore-network
+
+  # ===========================================
   # DenseCore LLM Inference Server
   # ===========================================
   densecore:
@@ -8,6 +26,9 @@ services:
       dockerfile: Dockerfile
     image: densecore/densecore:latest # Official Docker Hub image
     container_name: densecore-server
+    depends_on:
+      redis:
+        condition: service_healthy
     ports:
       - "8080:8080"
     volumes:
@@ -35,6 +56,13 @@ services:
       # Authentication (set to true for production)
       - AUTH_ENABLED=false
       # - API_KEYS=sk-prod-key:user1:enterprise,sk-dev-key:user2:free
+      # Redis (distributed rate limiting & API key store)
+      - REDIS_URL=redis://redis:6379
+      - REDIS_DB=0
+      - REDIS_RATELIMIT_ENABLED=true
+      - REDIS_KEYSTORE_ENABLED=true
+      - REDIS_KEYSTORE_CACHE_TTL=5m
+      - REDIS_KEYSTORE_CACHE_SIZE=1000
     healthcheck:
       test: [ "CMD", "wget", "-q", "--spider", "http://localhost:8080/health/live" ]
       interval: 30s
@@ -56,3 +84,6 @@ services:
 networks:
   densecore-network:
     driver: bridge
+
+volumes:
+  redis-data:
