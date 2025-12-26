@@ -2698,7 +2698,7 @@ inline void ComputeQKV_AVX512(float* q, float* k, float* v, const float* x, cons
 
 // Forward declare scalar implementations
 inline void AddRMSNorm_Scalar(float* x_out, const float* x, const float* residual,
-                              const float* rms_w, size_t n, float eps = 1e-5f);
+                              const float* rms_w, size_t n, float eps);
 
 inline void ComputeQKV_Scalar(float* q, float* k, float* v, const float* x, const float* w_q,
                               const float* w_k, const float* w_v, int n_embd, int dim_q, int dim_k,
@@ -2995,7 +2995,7 @@ inline void ComputeQKV_AVX2(float* q, float* k, float* v, const float* x, const 
 
 // Forward declare to allow wrapper usage
 inline void AddRMSNorm_Scalar(float* x_out, const float* x, const float* residual,
-                              const float* rms_w, size_t n, float eps = 1e-5f);
+                              const float* rms_w, size_t n, float eps);
 inline void ComputeQKV_Scalar(float* q, float* k, float* v, const float* x, const float* w_q,
                               const float* w_k, const float* w_v, int n_embd, int dim_q, int dim_k,
                               int dim_v, int ith, int nth);
@@ -3018,7 +3018,7 @@ inline void ComputeQKV_AVX2(float* q, float* k, float* v, const float* x, const 
 // =============================================================================
 
 inline void AddRMSNorm_Scalar(float* x_out, const float* x, const float* residual,
-                              const float* rms_w, size_t n, float eps) {
+                              const float* rms_w, size_t n, float eps = 1e-5f) {
     // Pass 1: Add and compute sum of squares
     float sos = 0.0f;
     for (size_t i = 0; i < n; i++) {
