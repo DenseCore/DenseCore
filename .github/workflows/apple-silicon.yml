@@ -37,9 +37,12 @@ jobs:
           submodules: recursive
 
       # [Optimization] Install Ninja & CCache
+      # [Fix] Pin CMake to 3.30 to avoid CMake 4.x + Ninja + OBJCXX bug
+      # (CMAKE_OBJCXX_COMPILE_OBJECT not set with CMake 4.x)
       - name: Install Build Tools
         run: |
-          brew install ninja ccache
+          brew install ninja ccache cmake@3
+          echo "$(brew --prefix cmake@3)/bin" >> $GITHUB_PATH
 
       - name: Setup Python
         uses: actions/setup-python@v5

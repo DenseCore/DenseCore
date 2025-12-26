@@ -1,5 +1,17 @@
 cmake_minimum_required(VERSION 3.14)
-project(DenseCore VERSION 1.0.0 LANGUAGES C CXX)
+
+# ==========================================================================
+# CMake 4.x + Ninja + OBJCXX Bug Workaround
+# ==========================================================================
+# CMake 4.x has a bug where CMAKE_OBJCXX_COMPILE_OBJECT is not set when
+# enable_language(OBJCXX) is called after project() with Ninja generator.
+# Workaround: Enable OBJCXX at project declaration time on Apple platforms.
+# ==========================================================================
+if(APPLE)
+    project(DenseCore VERSION 1.0.0 LANGUAGES C CXX OBJC OBJCXX)
+else()
+    project(DenseCore VERSION 1.0.0 LANGUAGES C CXX)
+endif()
 
 # ==========================================================================
 # Commercial / Open Source Toggle
@@ -207,10 +219,8 @@ target_compile_options(densecore PRIVATE
 if(APPLE)
     message(STATUS "Configuring for Apple platform - Using Accelerate framework")
 
-    # ==========================================================================
-    # Enable Objective-C++ for Metal backend
-    # ==========================================================================
-    enable_language(OBJCXX)
+    # Objective-C++ is enabled at project() declaration time
+    # (see CMake 4.x + Ninja workaround at top of file)
     set(CMAKE_OBJCXX_STANDARD 17)
     set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 
