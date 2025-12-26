@@ -119,3 +119,92 @@ config:
   auth:
     enabled: false
     # apiKeysSecret: Name of secret containing API_KEYS key
+
+# ============================================
+# Cloud-Native Features
+# ============================================
+
+# Pod Disruption Budget - ensures minimum availability during node maintenance
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # maxUnavailable: 1  # Alternative to minAvailable
+
+# ServiceMonitor for Prometheus Operator
+# Requires: Prometheus Operator installed in cluster
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  scrapeTimeout: 10s
+  labels: {}
+    # release: prometheus
+
+# Network Policy for pod isolation
+networkPolicy:
+  enabled: false
+  allowIngressController: true
+  ingressControllerNamespaceLabels:
+    name: ingress-nginx
+  additionalIngressRules: []
+  egressRules: []
+
+# KEDA ScaledObject for queue-based autoscaling
+# Scales based on pending/active requests instead of CPU (leading vs lagging indicator)
+# Requires: KEDA installed (helm install keda kedacore/keda -n keda)
+keda:
+  enabled: false
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  cooldownPeriod: 60
+  pollingInterval: 15
+  prometheusServerAddress: "http://prometheus-server.monitoring.svc.cluster.local:80"
+  pendingRequestsThreshold: "5"
+  activeRequestsThreshold: "8"
+  scaleDown:
+    stabilizationWindowSeconds: 120
+    percent: 25
+  scaleUp:
+    pods: 2
+
+# Topology spread for zone-aware scheduling
+topologySpreadConstraints: []
+  # - maxSkew: 1
+  #   topologyKey: topology.kubernetes.io/zone
+  #   whenUnsatisfiable: ScheduleAnyway
+  #   labelSelector:
+  #     matchLabels:
+  #       app.kubernetes.io/name: densecore
+
+# Graceful shutdown configuration
+terminationGracePeriodSeconds: 60
+
+# ============================================
+# Redis Configuration (Distributed State)
+# ============================================
+# Enables distributed rate limiting and API key storage
+# for multi-replica deployments
+redis:
+  enabled: false
+  # Connection URL (redis:// or rediss:// for TLS)
+  url: "redis://redis:6379"
+  # Password (recommended: use existingSecret instead)
+  password: ""
+  # Use existing secret for Redis password
+  existingSecret: ""
+  existingSecretKey: "redis-password"
+  # Redis database number
+  db: 0
+
+  # Rate Limiter settings
+  rateLimit:
+    enabled: true
+    # Circuit breaker settings
+    failureThreshold: 3
+    resetTimeout: "30s"
+
+  # API Key Store settings
+  keyStore:
+    enabled: true
+    # Local LRU cache settings
+    cacheTTL: "5m"
+    cacheSize: 1000

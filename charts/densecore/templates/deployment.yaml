@@ -131,6 +131,30 @@ spec:
                   name: {{ .Values.config.auth.apiKeysSecret }}
                   key: API_KEYS
             {{- end }}
+            {{- if .Values.redis.enabled }}
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            - name: REDIS_DB
+              value: {{ .Values.redis.db | quote }}
+            {{- if .Values.redis.password }}
+            - name: REDIS_PASSWORD
+              value: {{ .Values.redis.password | quote }}
+            {{- else if .Values.redis.existingSecret }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.redis.existingSecret }}
+                  key: {{ .Values.redis.existingSecretKey }}
+            {{- end }}
+            - name: REDIS_RATELIMIT_ENABLED
+              value: {{ .Values.redis.rateLimit.enabled | quote }}
+            - name: REDIS_KEYSTORE_ENABLED
+              value: {{ .Values.redis.keyStore.enabled | quote }}
+            - name: REDIS_KEYSTORE_CACHE_TTL
+              value: {{ .Values.redis.keyStore.cacheTTL | quote }}
+            - name: REDIS_KEYSTORE_CACHE_SIZE
+              value: {{ .Values.redis.keyStore.cacheSize | quote }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /health/live
@@ -157,6 +181,11 @@ spec:
             failureThreshold: 60
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          lifecycle:
+            preStop:
+              exec:
+                # Allow time for load balancer to drain connections
+                command: ["/bin/sh", "-c", "sleep 5"]
           volumeMounts:
             - name: model-volume
               mountPath: /models
@@ -185,3 +214,8 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 60 }}

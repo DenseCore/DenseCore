@@ -1,0 +1,48 @@
+{{- if .Values.keda.enabled }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "densecore.fullname" . }}
+  labels:
+    {{- include "densecore.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "densecore.fullname" . }}
+  minReplicaCount: {{ .Values.keda.minReplicaCount | default 1 }}
+  maxReplicaCount: {{ .Values.keda.maxReplicaCount | default 10 }}
+  cooldownPeriod: {{ .Values.keda.cooldownPeriod | default 60 }}
+  pollingInterval: {{ .Values.keda.pollingInterval | default 15 }}
+  advanced:
+    restoreToOriginalReplicaCount: false
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: {{ .Values.keda.scaleDown.stabilizationWindowSeconds | default 120 }}
+          policies:
+            - type: Percent
+              value: {{ .Values.keda.scaleDown.percent | default 25 }}
+              periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: {{ .Values.keda.scaleUp.pods | default 2 }}
+              periodSeconds: 30
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: {{ .Values.keda.prometheusServerAddress | quote }}
+        query: |
+          sum(densecore_pending_requests{app="{{ include "densecore.fullname" . }}"}) or vector(0)
+        threshold: {{ .Values.keda.pendingRequestsThreshold | default "5" | quote }}
+        metricName: densecore_pending_requests
+    - type: prometheus
+      metadata:
+        serverAddress: {{ .Values.keda.prometheusServerAddress | quote }}
+        query: |
+          sum(densecore_active_requests{app="{{ include "densecore.fullname" . }}"}) or vector(0)
+        threshold: {{ .Values.keda.activeRequestsThreshold | default "8" | quote }}
+        metricName: densecore_active_requests
+{{- end }}

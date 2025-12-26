@@ -1,0 +1,23 @@
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "densecore.fullname" . }}
+  labels:
+    {{- include "densecore.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "densecore.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval | default "15s" }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout | default "10s" }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+{{- end }}
