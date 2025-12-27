@@ -97,7 +97,10 @@ endif()
 # Configure ggml options before adding subdirectory
 set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(GGML_NATIVE ON CACHE BOOL "" FORCE)
+# Note: Do NOT use FORCE for GGML_NATIVE - allow command-line override for cross-compilation
+if(NOT DEFINED GGML_NATIVE)
+    set(GGML_NATIVE ON CACHE BOOL "Optimize for native CPU")
+endif()
 set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 
 # Add ggml as subdirectory
