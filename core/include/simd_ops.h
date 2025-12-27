@@ -64,6 +64,19 @@
 #endif
 #endif
 
+// =============================================================================
+// FMA Detection Macro
+// =============================================================================
+// FMA instructions (_mm256_fmadd_ps, etc.) require the -mfma flag on GCC/Clang
+// which sets the __FMA__ macro. AVX2 alone is NOT sufficient for FMA.
+// This macro provides a clear guard for FMA-dependent code paths.
+// =============================================================================
+#if defined(__FMA__) || (defined(_MSC_VER) && defined(__AVX2__))
+#define DENSECORE_HAS_FMA 1
+#else
+#define DENSECORE_HAS_FMA 0
+#endif
+
 // FP16 support from ggml
 extern "C" {
 #include "ggml.h"
@@ -713,13 +726,23 @@ inline void AddF32(float* dst, const float* a, const float* b, size_t n) {
  * Dot product of float32 arrays
  */
 inline float DotF32(const float* a, const float* b, size_t n) {
-#if defined(__AVX2__)
+#if defined(__AVX2__) && DENSECORE_HAS_FMA
+    // AVX2 + FMA path (Intel Haswell+, AMD Zen+)
     __m256 sum = _mm256_setzero_ps();
     size_t i = 0;
     for (; i + 8 <= n; i += 8) {
         __m256 va = _mm256_loadu_ps(a + i);
         __m256 vb = _mm256_loadu_ps(b + i);
         sum = _mm256_fmadd_ps(va, vb, sum);
+    }
+#elif defined(__AVX2__)
+    // AVX2 without FMA (rare: some AMD Piledriver CPUs)
+    __m256 sum = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(va, vb));
     }
     // Horizontal sum
     __m128 hi = _mm256_extractf128_ps(sum, 1);
@@ -1820,7 +1843,7 @@ inline void GemmInt4Fp32_AVX512(float* C, const float* A, const uint8_t* W_int4,
 
 #endif  // __AVX512F__
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) && DENSECORE_HAS_FMA
 
 /**
  * @brief High-performance AVX2 GEMM kernel: C = A * W^T (INT4 weights)
@@ -2029,7 +2052,7 @@ inline void GemmInt4Fp32_AVX2(float* C, const float* A, const uint8_t* W_int4, c
     }
 }
 
-#endif  // __AVX2__
+#endif  // __AVX2__ && DENSECORE_HAS_FMA
 
 // =============================================================================
 // FlashAttention AVX-512 Micro-Kernels (Cache-Optimized)
@@ -2093,7 +2116,7 @@ inline __m512 _mm512_fast_exp_ps(__m512 x) {
  */
 inline void ComputeQK_AVX512(const float* Q, const float* K, float* S, int q_len, int kv_len,
                              int head_dim, float scale) {
-    const __m512 scale_vec = _mm512_set1_ps(scale);
+    [[maybe_unused]] const __m512 scale_vec = _mm512_set1_ps(scale);
 
     for (int qi = 0; qi < q_len; qi++) {
         const float* q_row = Q + qi * head_dim;
@@ -2580,7 +2603,7 @@ inline void ComputeQKV_AVX512(float* q, float* k, float* v, const float* x, cons
     // ==========================================================================
     // Map virtual start/end to K-local indices
     const int k_virt_start = dim_q;
-    const int k_virt_end = dim_q + dim_k;
+    [[maybe_unused]] const int k_virt_end = dim_q + dim_k;
     const int k_start = std::max(0, start_col - k_virt_start);
     const int k_end = std::min(dim_k, end_col - k_virt_start);
 
@@ -2727,7 +2750,7 @@ inline void ComputeQKV_AVX512(float* q, float* k, float* v, const float* x, cons
 // AVX2 Fused Kernels
 // =============================================================================
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) && DENSECORE_HAS_FMA
 
 /**
  * @brief Fused Add + RMSNorm in one pass (AVX2 optimized)
@@ -3011,7 +3034,7 @@ inline void ComputeQKV_AVX2(float* q, float* k, float* v, const float* x, const 
     ComputeQKV_Scalar(q, k, v, x, w_q, w_k, w_v, n_embd, dim_q, dim_k, dim_v, ith, nth);
 }
 
-#endif  // __AVX2__
+#endif  // __AVX2__ && DENSECORE_HAS_FMA
 
 // =============================================================================
 // Scalar Implementation (Always Available)
@@ -3170,9 +3193,9 @@ inline void GemvParallel(float* output, const float* x, const float* weight, int
     if (k_start >= K)
         return;
 
-    static const SimdLevel level = DetectSimdLevel();
+    [[maybe_unused]] static const SimdLevel level = DetectSimdLevel();
 
-#if defined(__AVX2__) || defined(__AVX512F__)
+#if (defined(__AVX2__) || defined(__AVX512F__)) && DENSECORE_HAS_FMA
     // AVX2/AVX512 path with 2x unrolling
     constexpr int UNROLL = 2;
 

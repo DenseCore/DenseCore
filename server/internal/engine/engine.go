@@ -80,9 +80,8 @@ func NewDenseEngine(mainModelPath, draftModelPath string, threads int) (*DenseEn
 		defer C.free(unsafe.Pointer(cDraftPath))
 	}
 
-	// InitEngine(model_path, reserved, threads, numa_node_id, pinning_policy)
-	// numa_node_id=-1 (auto), pinning_policy=0 (SCATTER - default)
-	handle := C.InitEngine(cMainPath, cDraftPath, C.int(threads), C.int(-1), C.int(0))
+	// InitEngine(model_path, reserved, threads)
+	handle := C.InitEngine(cMainPath, cDraftPath, C.int(threads))
 	if handle == nil {
 		return nil, fmt.Errorf("failed to initialize DenseCore engine")
 	}
