@@ -19,8 +19,10 @@ from pathlib import Path
 from typing import (
     Any,
     Callable,
+    Dict,
     List,
     Optional,
+    Type,
     TypeVar,
     Union,
 )
@@ -59,7 +61,7 @@ from .lora import LoRAManager
 
 # Dedicated thread pool for C++ inference submissions
 # Lazily initialized to avoid overhead if only sync methods are used
-_INFERENCE_EXECUTOR: ThreadPoolExecutor | None = None
+_INFERENCE_EXECUTOR: Optional[ThreadPoolExecutor] = None
 
 
 def _get_inference_executor() -> ThreadPoolExecutor:
@@ -133,7 +135,7 @@ class EngineNotInitializedError(DenseCoreError):
 
 
 # Error code to exception mapping
-_ERROR_CODE_MAP: dict[int, type[DenseCoreError]] = {
+_ERROR_CODE_MAP: Dict[int, Type[DenseCoreError]] = {
     -1: DenseCoreRuntimeError,  # Generic error
     -2: InvalidRequestError,  # Invalid parameters
     -3: ContextLimitExceededError,  # Context overflow
@@ -331,8 +333,8 @@ class DenseCore:
     ):
         self._handle = None
         self._closed = True
-        self._requests: dict[int, Any] = {}
-        self._active_ctypes_refs: dict[int, list] = {}  # Prevent GC of ctypes objects
+        self._requests: Dict[int, Any] = {}
+        self._active_ctypes_refs: Dict[int, List[Any]] = {}  # Prevent GC of ctypes objects
         self._req_id_counter = 0
         self._lock = threading.Lock()
         self._verbose = verbose

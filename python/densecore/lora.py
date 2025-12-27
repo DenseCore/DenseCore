@@ -35,7 +35,7 @@ Example:
 import os
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
     from .engine import DenseCore
@@ -162,7 +162,7 @@ def is_lora_adapter_repo(repo_id: str, token: Optional[str] = None) -> bool:
 def list_lora_files(
     repo_id: str,
     token: Optional[str] = None,
-) -> list[dict[str, Any]]:
+) -> List[Dict[str, Any]]:
     """
     List LoRA adapter files in a repository.
 
@@ -336,7 +336,7 @@ class LoRAManager:
     """
 
     def __init__(self, engine: Optional["DenseCore"] = None) -> None:
-        self.adapters: dict[str, LoRAConfig] = {}
+        self.adapters: Dict[str, LoRAConfig] = {}
         self.active_adapter: Optional[str] = None
         self._engine = engine  # Optional engine reference for C++ sync
 
@@ -401,7 +401,7 @@ class LoRAManager:
             return self.adapters[self.active_adapter]
         return None
 
-    def list_adapters(self) -> list[str]:
+    def list_adapters(self) -> List[str]:
         """List all loaded adapter names."""
         return list(self.adapters.keys())
 

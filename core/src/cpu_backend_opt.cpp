@@ -16,7 +16,13 @@
 // =========================================================================
 // Intel AMX Implementation (x86_64)
 // =========================================================================
+// AMX is only available on Intel Sapphire Rapids and newer CPUs.
+// The code is compiled only when the compiler supports AMX intrinsics.
+// =========================================================================
 #if defined(__x86_64__) || defined(_M_X64)
+
+#if defined(__AMX_TILE__) && defined(__AMX_BF16__)
+// AMX is supported by the compiler
 
 #define XFEATURE_XTILEDATA 18
 #define ARCH_REQ_XCOMP_PERM 0x1023
@@ -50,7 +56,7 @@ static void ConfigTiles(int rows, int col_bytes, int K_bytes) {
     // TMM1: Src1 (M x K)
     // TMM2: Src2 (K x N)
 
-    tile_config cfg = {0};
+    tile_config cfg = {};
     cfg.palette_id = 1;
     cfg.start_row = 0;
 
@@ -72,7 +78,6 @@ static void ConfigTiles(int rows, int col_bytes, int K_bytes) {
 }
 
 void densecore::CpuBackend::MatMulAMX(const TensorView& A, const TensorView& B, TensorView& C) {
-#if defined(__AMX_TILE__) && defined(__AMX_BF16__)
     // 1. Request OS Permission (once)
     static bool amx_ready = RequestAMXPermission();
     if (!amx_ready)
@@ -103,12 +108,17 @@ void densecore::CpuBackend::MatMulAMX(const TensorView& A, const TensorView& B, 
     _tile_stored(0, C.data, C.strides[0]);
 
     _tile_release();
+}
+
 #else
+// AMX not supported by compiler - provide stub
+void densecore::CpuBackend::MatMulAMX(const TensorView& A, const TensorView& B, TensorView& C) {
     (void)A;
     (void)B;
     (void)C;
-#endif
+    // AMX not available - caller should use fallback kernel
 }
+#endif  // __AMX_TILE__ && __AMX_BF16__
 
 #else
 // Non-x86 Stub
