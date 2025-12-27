@@ -342,9 +342,13 @@ inline SimdLevel DetectSimdLevel() {
     // NOTE: __builtin_cpu_init() is called automatically on modern compilers
 
     // Check from highest to lowest capability
+    // NOTE: "amx-tile" support in __builtin_cpu_supports requires GCC 11+ or Clang 12+
+#if (defined(__GNUC__) && __GNUC__ >= 11) || (defined(__clang__) && __clang_major__ >= 12)
     if (__builtin_cpu_supports("amx-tile") && __builtin_cpu_supports("avx512f")) {
         return SimdLevel::AMX;
-    } else if (__builtin_cpu_supports("avx512f")) {
+    } else
+#endif
+        if (__builtin_cpu_supports("avx512f")) {
         return SimdLevel::AVX512;
     } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
         return SimdLevel::AVX2;
@@ -735,6 +739,18 @@ inline float DotF32(const float* a, const float* b, size_t n) {
         __m256 vb = _mm256_loadu_ps(b + i);
         sum = _mm256_fmadd_ps(va, vb, sum);
     }
+    // Horizontal sum
+    __m128 hi = _mm256_extractf128_ps(sum, 1);
+    __m128 lo = _mm256_castps256_ps128(sum);
+    __m128 sum128 = _mm_add_ps(lo, hi);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    float result = _mm_cvtss_f32(sum128);
+    // Remainder
+    for (; i < n; i++) {
+        result += a[i] * b[i];
+    }
+    return result;
 #elif defined(__AVX2__)
     // AVX2 without FMA (rare: some AMD Piledriver CPUs)
     __m256 sum = _mm256_setzero_ps();
