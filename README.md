@@ -129,7 +129,12 @@ See [CLI Documentation](docs/CLI.md) for full details.
 
 **Docker:**
 ```bash
-docker run -p 8080:8080 densecore/densecore:latest
+# With HuggingFace model (auto-download)
+docker run -p 8080:8080 -e MODEL=Qwen/Qwen3-0.6B-GGUF densecore/densecore:latest
+
+# With local model file
+docker run -p 8080:8080 -v ./model.gguf:/app/models/model.gguf \
+  -e MODEL=/app/models/model.gguf densecore/densecore:latest
 ```
 
 **Kubernetes:**
