@@ -104,8 +104,23 @@ int GetEmbeddingDimension(DenseCoreHandle handle) {
     return -1;
 }
 
-DENSECORE_API DenseCoreHandle InitEngine(const char* model_path, const char* /*reserved*/,
-                                         int threads, int numa_node_id, int pinning_policy) {
+/**
+ * @brief Initialize engine with default NUMA settings (simplified API)
+ *
+ * This is a convenience wrapper that calls InitEngineEx with:
+ * - numa_node_id = -1 (auto-detect)
+ * - pinning_policy = 0 (SCATTER)
+ */
+DENSECORE_API DenseCoreHandle InitEngine(const char* model_path, const char* reserved,
+                                         int threads) {
+    return InitEngineEx(model_path, reserved, threads, -1, 0);
+}
+
+/**
+ * @brief Initialize engine with NUMA and thread pinning control (extended API)
+ */
+DENSECORE_API DenseCoreHandle InitEngineEx(const char* model_path, const char* /*reserved*/,
+                                           int threads, int numa_node_id, int pinning_policy) {
     try {
         // =========================================================================
         // INITIALIZATION DELAY CONFIGURATION (Large Model Support)
