@@ -78,7 +78,7 @@ jobs:
           CIBW_SKIP: "*-musllinux_*"
           # Install build dependencies before building
           CIBW_BEFORE_ALL_LINUX: |
-            yum install -y cmake gcc-c++ make || apt-get update && apt-get install -y cmake g++ make
+            if command -v yum &> /dev/null; then yum install -y cmake gcc-c++ make; elif command -v apt-get &> /dev/null; then apt-get update && apt-get install -y cmake g++ make; fi
           CIBW_BEFORE_ALL_MACOS: |
             brew install cmake
           CIBW_BEFORE_BUILD: "pip install cmake ninja setuptools wheel"
