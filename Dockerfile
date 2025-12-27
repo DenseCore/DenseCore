@@ -170,7 +170,8 @@ ENV PORT=8080 \
     RATE_LIMIT_ENABLED=true \
     RATE_LIMIT_RPS=100 \
     LOG_FORMAT=json \
-    THREADS=0
+    THREADS=0 \
+    MODEL=""
 
 # Expose port
 EXPOSE 8080

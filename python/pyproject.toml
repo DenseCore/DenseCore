@@ -44,7 +44,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "huggingface-hub>=0.20.0,<1.0.0",
+    "huggingface-hub>=0.20.0,<0.26.0",
     "numpy>=2.0.2",
     "typing-extensions>=4.0.0;python_version<'3.10'",
 ]

@@ -63,5 +63,17 @@ echo "[entrypoint] CPU limit detected: ${CPU_LIMIT} cores"
 echo "[entrypoint] OMP_NUM_THREADS=${OMP_NUM_THREADS}, GOMAXPROCS=${GOMAXPROCS}"
 echo "[entrypoint] OMP_PROC_BIND=${OMP_PROC_BIND}, OMP_PLACES=${OMP_PLACES}"
 
-# Execute the main binary with any passed arguments
-exec /app/densecore-server "$@"
+# Build command arguments
+CMD_ARGS=("serve")
+
+# Add model path if specified via environment variable
+if [[ -n "${MODEL:-}" ]]; then
+    echo "[entrypoint] MODEL=${MODEL}"
+    CMD_ARGS+=("--model" "${MODEL}")
+fi
+
+# Add any additional arguments passed to the container
+CMD_ARGS+=("$@")
+
+# Execute the main binary
+exec /app/densecore-server "${CMD_ARGS[@]}"
