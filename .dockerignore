@@ -46,4 +46,7 @@ k8s/
 # Documentation
 docs/
 examples/
-scripts/
+
+# Scripts (except entrypoint.sh which is needed for Docker)
+scripts/*
+!scripts/entrypoint.sh
