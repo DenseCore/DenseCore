@@ -276,12 +276,11 @@ void GemvInt4_AVX512(float* output, const float* input, const uint8_t* weights, 
 // SAFETY: Uses __attribute__((target(...))) instead of file-level flags.
 // =============================================================================
 
-#if defined(__GNUC__) || defined(__clang__)
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(_M_X64))
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
 #endif
-void GemvInt4_AVX512_VNNI(float *output, const float *input,
-                          const uint8_t *weights, const float *scales,
-                          const float *zeros, int K, int N, int group_size,
+void GemvInt4_AVX512_VNNI(float* output, const float* input, const uint8_t* weights,
+                          const float* scales, const float* zeros, int K, int N, int group_size,
                           int n_start, int n_end) {
 #if defined(__x86_64__) || defined(_M_X64)
     const int num_full_groups = K / group_size;
@@ -1266,27 +1265,14 @@ void GemvInt4_SVE_DotProd(float* output, const float* input, const uint8_t* weig
         return;
     }
 
-    // Quantize entire input vector ONCE before the N loop using SVE
-    for (int k = 0; k < K;) {
-        // Generate predicate for remaining elements
-        svbool_t pg = svwhilelt_b32(static_cast<uint64_t>(k), static_cast<uint64_t>(K));
-
-        // Load floats with predicate
-        svfloat32_t a = svld1_f32(pg, input + k);
-
-        // Scale and convert to INT32
-        svfloat32_t scaled = svmul_f32_z(pg, a, svdup_f32(input_scale));
-        svint32_t a_i32 = svcvt_s32_f32_z(pg, scaled);
-
-        // Saturating narrow: i32 -> i16 -> i8
-        svint16_t a_i16 = svqxtnb_s32(a_i32);
-        svint8_t a_s8 = svqxtnb_s16(a_i16);
-
-        // Store with predicate
-        svbool_t pg8 = svwhilelt_b8(static_cast<uint64_t>(k), static_cast<uint64_t>(K));
-        svst1_s8(pg8, quantized_input + k, a_s8);
-
-        k += svcntw();  // Advance by number of 32-bit elements
+    // Quantize entire input vector ONCE before the N loop
+    // Using scalar loop for SVE1 compatibility (SVE2's svqxtnb not available)
+    // This is O(K) preprocessing, not in the hot N*K loop, so scalar is fine
+    for (int k = 0; k < K; k++) {
+        float scaled = input[k] * input_scale;
+        int32_t clamped = static_cast<int32_t>(scaled);
+        clamped = clamped > 127 ? 127 : (clamped < -127 ? -127 : clamped);
+        quantized_input[k] = static_cast<int8_t>(clamped);
     }
 
     // ==========================================================================
